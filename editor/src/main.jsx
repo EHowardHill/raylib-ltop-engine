@@ -152,9 +152,13 @@ function RoomEditor({ room, scan, onSaved }) {
     const [size, setSize] = useState({ w: room.mapWidth, h: room.mapHeight });
     const [def, setDef] = useState(room.default || {});
     const [enc, setEnc] = useState({ instant: [], interactive: [], ...(room.encounters || {}) });
-    const [layers, setLayers] = useState({ decor: room.decor.slice(), colliders: room.colliders.slice() });
+    const [layers, setLayers] = useState({
+        decor: room.decor.slice(),
+        colliders: room.colliders.slice(),
+        upper: (room.upper || []).slice()
+    });
     const [layer, setLayer] = useState('decor');
-    const [vis, setVis] = useState({ decor: true, colliders: true });
+    const [vis, setVis] = useState({ decor: true, colliders: true, upper: true });
     const [gid, setGid] = useState(1);
     const [tool, setTool] = useState('paint');
     const [showGrid, setShowGrid] = useState(true);
@@ -245,6 +249,8 @@ function RoomEditor({ room, scan, onSaved }) {
 
         if (vis.decor) drawLayer(layers.decor, false);
         if (vis.colliders) drawLayer(layers.colliders, true);
+        // Upper layer paints last: over the hero when walking under it.
+        if (vis.upper) drawLayer(layers.upper, false);
 
         if (showGrid && zoom >= 0.5) {
             ctx.strokeStyle = 'rgba(255,255,255,0.10)';
@@ -468,7 +474,11 @@ function RoomEditor({ room, scan, onSaved }) {
                     out[y * w + x] = values[y * W + x] || 0;
             return out;
         };
-        setLayers(prev => ({ decor: remap(prev.decor), colliders: remap(prev.colliders) }));
+        setLayers(prev => ({
+            decor: remap(prev.decor),
+            colliders: remap(prev.colliders),
+            upper: remap(prev.upper || new Array(w * h).fill(0))
+        }));
         const clampLoc = loc => [Math.min(loc[0] || 0, w - 1), Math.min(loc[1] || 0, h - 1)];
         if (def.spawn) patchDef('spawn', clampLoc(def.spawn));
         setEnc(prev => ({
@@ -483,11 +493,14 @@ function RoomEditor({ room, scan, onSaved }) {
         await api('/api/save', {
             path: 'resources/rooms/' + room.file,
             content: JSON.stringify({
+                // Preserve keys the editor doesn't edit (enemies, objects...).
+                ...(room.raw || {}),
                 width: W, height: H,
                 default: def,
                 encounters: enc,
                 decor: layers.decor,
-                colliders: layers.colliders
+                colliders: layers.colliders,
+                upper: layers.upper
             }, null, 4)
         });
         setDirty(false);
@@ -529,7 +542,7 @@ function RoomEditor({ room, scan, onSaved }) {
                                 onClick={() => setTool(key)}>{label}</button>)}
                     </div>
                     <div className="toolbar">
-                        {['decor', 'colliders'].map(l =>
+                        {['decor', 'colliders', 'upper'].map(l =>
                             <span key={l} className="layerToggle">
                                 <button className={'tool' + (layer === l ? ' active' : '')}
                                     onClick={() => setLayer(l)}>{l}</button>
@@ -795,13 +808,23 @@ function DialogueTab({ scan, refresh }) {
 }
 
 function DialogueEditor({ dialogue, onSaved }) {
-    const [lines, setLines] = useState((dialogue.data.lines || []).map(l => l.text != null ? l.text : ''));
+    const rawLines = dialogue.data.lines || [];
+    const [lines, setLines] = useState(rawLines.map(l => (l && l.text != null) ? l.text : String(l ?? '')));
     const [status, setStatus] = useState('');
 
     const save = async () => {
+        // Keep script fields (label/if/unless/set/clear/sfx/music/goto/warp/
+        // choice) on lines the editor doesn't edit; only text is replaced.
+        const merged = lines.map((text, i) => ({
+            ...(typeof rawLines[i] === 'object' && rawLines[i] ? rawLines[i] : {}),
+            text: text != null ? text : ''
+        }));
         await api('/api/save', {
             path: 'resources/dialogue/' + dialogue.file,
-            content: JSON.stringify({ lines: lines.map(text => ({ text })) }, null, 4)
+            content: JSON.stringify({
+                ...(dialogue.data || {}),
+                lines: merged
+            }, null, 4)
         });
         setStatus('Saved');
         onSaved();

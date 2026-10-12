@@ -1,0 +1,24 @@
+{
+    "width": 4,
+    "color": [224, 140, 48],
+    "stand": {
+        "down": [0],
+        "right": [1],
+        "left": [2],
+        "up": [3]
+    },
+    "move": {
+        "down": [0, 4],
+        "right": [1, 5],
+        "left": [2, 6],
+        "up": [3, 7]
+    },
+    "stats": {
+        "hp": 1,
+        "speed": 30,
+        "damage": 1,
+        "behavior": "octorok",
+        "sight": 0,
+        "shoot_period": 2
+    }
+}

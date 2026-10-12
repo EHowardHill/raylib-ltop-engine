@@ -1,0 +1,70 @@
+{
+    "tiles": {
+        "43": {
+            "pit": true
+        },
+        "44": {
+            "damage": 1
+        },
+        "45": {
+            "cuttable": true,
+            "cut_result": 46
+        },
+        "59": {
+            "water": "deep"
+        },
+        "60": {
+            "water": "shallow"
+        },
+        "61": {
+            "ice": true
+        },
+        "62": {
+            "push": [
+                48,
+                0
+            ]
+        },
+        "63": {
+            "push": [
+                -48,
+                0
+            ]
+        },
+        "64": {
+            "push": [
+                0,
+                48
+            ]
+        },
+        "65": {
+            "push": [
+                0,
+                -48
+            ]
+        },
+        "66": {
+            "water": "shallow",
+            "push": [
+                0,
+                32
+            ]
+        },
+        "67": {
+            "ledge": "down"
+        },
+        "68": {
+            "ledge": "up"
+        },
+        "69": {
+            "ledge": "left"
+        },
+        "70": {
+            "ledge": "right"
+        },
+        "72": {
+            "bombable": true,
+            "bomb_result": 0
+        }
+    }
+}

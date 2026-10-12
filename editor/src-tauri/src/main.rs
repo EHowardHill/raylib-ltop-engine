@@ -313,6 +313,10 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
             "encounters": data.get("encounters").filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!({})),
             "decor": layer("decor"),
             "colliders": layer("colliders"),
+            "upper": layer("upper"),
+            // Full parsed room JSON, so editor saves can preserve keys the
+            // UI doesn't edit (enemies, objects, ...).
+            "raw": data,
         }));
     }
 

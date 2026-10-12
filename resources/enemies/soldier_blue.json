@@ -1,0 +1,23 @@
+{
+    "width": 4,
+    "color": [64, 96, 224],
+    "stand": {
+        "down": [0],
+        "right": [1],
+        "left": [2],
+        "up": [3]
+    },
+    "move": {
+        "down": [0, 4],
+        "right": [1, 5],
+        "left": [2, 6],
+        "up": [3, 7]
+    },
+    "stats": {
+        "hp": 3,
+        "speed": 60,
+        "damage": 2,
+        "behavior": "soldier",
+        "sight": 200
+    }
+}

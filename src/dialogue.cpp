@@ -1,5 +1,7 @@
 #include "dialogue.h"
+#include "assets.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static const int MAX_ROWS = 8;
@@ -15,9 +17,73 @@ static const float TEXT_PAD_X = 6.0f;
 static const float TEXT_PAD_Y = 5.0f;
 static const float CHARS_PER_SECOND = 30.0f;
 
+// Lazy sfx cache for scripted cues (name -> loaded Sound).
+static const int MAX_SCRIPT_SFX = 16;
+struct ScriptSfx
+{
+    char name[96];
+    Sound sound;
+    bool used;
+};
+static ScriptSfx scriptSfx[MAX_SCRIPT_SFX] = {};
+
+static Sound loadScriptSfx(const char* name)
+{
+    for (int i = 0; i < MAX_SCRIPT_SFX; i++)
+    {
+        if (scriptSfx[i].used && strcmp(scriptSfx[i].name, name) == 0)
+            return scriptSfx[i].sound;
+    }
+    for (int i = 0; i < MAX_SCRIPT_SFX; i++)
+    {
+        if (scriptSfx[i].used) continue;
+        char path[128];
+        snprintf(path, sizeof(path), "assets/audio/%s", name);
+        scriptSfx[i].sound = LoadSound(path);
+        scriptSfx[i].used = true;
+        snprintf(scriptSfx[i].name, sizeof(scriptSfx[i].name), "%s", name);
+        return scriptSfx[i].sound;
+    }
+    // Cache full: reuse slot 0 (playing a wrong cue beats crashing).
+    return scriptSfx[0].sound;
+}
+
+static void unloadScriptSfx()
+{
+    for (int i = 0; i < MAX_SCRIPT_SFX; i++)
+    {
+        if (scriptSfx[i].used)
+        {
+            UnloadSound(scriptSfx[i].sound);
+            scriptSfx[i].used = false;
+            scriptSfx[i].name[0] = '\0';
+        }
+    }
+}
+
+// Cursor up/down for the choice list (keyboard + gamepad dpad).
+static bool cursorUpPressed()
+{
+    if (IsKeyPressed(KEY_UP)) return true;
+    for (int i = 0; i < 4; i++)
+        if (IsGamepadAvailable(i) && IsGamepadButtonPressed(i, GAMEPAD_BUTTON_LEFT_FACE_UP)) return true;
+    return false;
+}
+
+static bool cursorDownPressed()
+{
+    if (IsKeyPressed(KEY_DOWN)) return true;
+    for (int i = 0; i < 4; i++)
+        if (IsGamepadAvailable(i) && IsGamepadButtonPressed(i, GAMEPAD_BUTTON_LEFT_FACE_DOWN)) return true;
+    return false;
+}
+
 DialogueBox::DialogueBox()
     : font(), border(), letterSfx(), finishSfx(),
-      current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0)
+      current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0),
+      choiceActive(false), choiceCursor(0),
+      musicRequest(), musicPending(false),
+      warpRoom(-1), warpTileX(0), warpTileY(0), warpPending(false)
 {
     for (int i = 0; i < MAX_ROWS; i++) rows[i].offset = 0;
 }
@@ -37,7 +103,10 @@ void DialogueBox::shutdown()
     UnloadTexture(border);
     UnloadSound(letterSfx);
     UnloadSound(finishSfx);
+    unloadScriptSfx();
     current = 0;
+    musicPending = false;
+    warpPending = false;
 }
 
 float DialogueBox::scale() const
@@ -59,28 +128,61 @@ float DialogueBox::boxWidthVirtual() const
     return boxWidth;
 }
 
+void DialogueBox::applyFlags(const int* set, int setCount, const int* clear, int clearCount)
+{
+    if (WORLD_FLAG_COUNT <= 0) return;
+    for (int i = 0; i < setCount; i++)
+        if (set[i] >= 0 && set[i] < WORLD_FLAG_COUNT) gWorldFlags[set[i]] = true;
+    for (int i = 0; i < clearCount; i++)
+        if (clear[i] >= 0 && clear[i] < WORLD_FLAG_COUNT) gWorldFlags[clear[i]] = false;
+}
+
 void DialogueBox::open(const Dialogue& dialogue)
 {
     current = &dialogue;
     lineIndex = 0;
+    choiceActive = false;
+    choiceCursor = 0;
+    musicPending = false;
+    warpPending = false;
     startLine();
 }
 
 void DialogueBox::startLine()
 {
     reveal = 0.0f;
-    if (!current || lineIndex < 0 || lineIndex >= current->lineCount)
+    rowCount = 0;
+    totalChars = 0;
+    if (!current) return;
+
+    // Skip lines whose conditions fail (skipped lines execute nothing).
+    while (lineIndex >= 0 && lineIndex < current->lineCount)
     {
-        totalChars = 0;
-        rowCount = 0;
+        const DialogueLine& line = current->lines[lineIndex];
+        if (line.ifFlag >= 0 && !gWorldFlags[line.ifFlag]) { lineIndex++; continue; }
+        if (line.unlessFlag >= 0 && gWorldFlags[line.unlessFlag]) { lineIndex++; continue; }
+
+        // Shown-effects: world flags, sfx cue, music switch.
+        applyFlags(line.setFlags, line.setCount, line.clearFlags, line.clearCount);
+        if (line.sfx) PlaySound(loadScriptSfx(line.sfx));
+        if (line.music)
+        {
+            snprintf(musicRequest, sizeof(musicRequest), "%s", line.music);
+            musicPending = true;
+        }
+
+        choiceActive = false;
+        choiceCursor = 0;
+
+        const char* text = line.text ? line.text : "";
+        float patch = (float)(border.width / 3);
+        float textWidth = boxWidthVirtual() - 2.0f * (patch + TEXT_PAD_X);
+        wrapLine(text, textWidth);
         return;
     }
-    const char* text = current->lines[lineIndex];
-    if (!text) text = "";
 
-    float patch = (float)(border.width / 3);
-    float textWidth = boxWidthVirtual() - 2.0f * (patch + TEXT_PAD_X);
-    wrapLine(text, textWidth);
+    // Ran off the end: the dialogue closes.
+    current = 0;
 }
 
 void DialogueBox::wrapLine(const char* text, float maxWidth)
@@ -137,12 +239,38 @@ void DialogueBox::wrapLine(const char* text, float maxWidth)
     }
 }
 
+void DialogueBox::advanceLine(bool useGoto)
+{
+    if (!current) return;
+    const DialogueLine& line = current->lines[lineIndex];
+
+    // A warp line ends the dialogue and queues the warp.
+    if (line.warpRoom >= 0)
+    {
+        warpRoom = line.warpRoom;
+        warpTileX = line.warpTileX;
+        warpTileY = line.warpTileY;
+        warpPending = true;
+        current = 0;
+        return;
+    }
+
+    if (useGoto && line.gotoLine >= 0) lineIndex = line.gotoLine;
+    else lineIndex++;
+    startLine();
+}
+
 void DialogueBox::update()
 {
     if (!current) return;
 
-    const char* line = (lineIndex < current->lineCount) ? current->lines[lineIndex] : "";
-    if (!line) line = "";
+    if (lineIndex < 0 || lineIndex >= current->lineCount)
+    {
+        current = 0;
+        return;
+    }
+    const DialogueLine& line = current->lines[lineIndex];
+    const char* text = line.text ? line.text : "";
 
     if (reveal < (float)totalChars)
     {
@@ -151,8 +279,38 @@ void DialogueBox::update()
         if (reveal > (float)totalChars) reveal = (float)totalChars;
 
         int now = (int)reveal;
-        if (now > previous && line[now - 1] != ' ') PlaySound(letterSfx);
+        if (now > previous && text[now - 1] != ' ') PlaySound(letterSfx);
         if (reveal >= (float)totalChars) PlaySound(finishSfx);
+    }
+
+    if (choiceActive)
+    {
+        // Cursor over the option list; action selects.
+        if (cursorUpPressed())
+        {
+            choiceCursor--;
+            if (choiceCursor < 0) choiceCursor = line.choiceCount - 1;
+        }
+        if (cursorDownPressed())
+        {
+            choiceCursor++;
+            if (choiceCursor >= line.choiceCount) choiceCursor = 0;
+        }
+
+        if (actionPressed() && line.choices)
+        {
+            const DialogueChoice& choice = line.choices[choiceCursor];
+            applyFlags(choice.setFlags, choice.setCount, choice.clearFlags, choice.clearCount);
+            if (choice.sfx) PlaySound(loadScriptSfx(choice.sfx));
+            choiceActive = false;
+
+            // The chosen option decides where the dialogue goes (the line's
+            // own goto is skipped while branching).
+            if (choice.gotoLine >= 0) lineIndex = choice.gotoLine;
+            else lineIndex++;
+            startLine();
+        }
+        return;
     }
 
     if (actionPressed())
@@ -162,11 +320,68 @@ void DialogueBox::update()
             reveal = (float)totalChars;
             PlaySound(finishSfx);
         }
+        else if (line.choiceCount > 0 && line.choices)
+        {
+            // First press opens the choice list.
+            choiceActive = true;
+            choiceCursor = 0;
+        }
         else
         {
-            lineIndex++;
-            if (lineIndex >= current->lineCount) current = 0;
-            else startLine();
+            advanceLine(true);
+        }
+    }
+}
+
+const char* DialogueBox::takeMusicRequest()
+{
+    if (!musicPending) return 0;
+    musicPending = false;
+    return musicRequest;
+}
+
+bool DialogueBox::takeWarpRequest(int& room, int& tileX, int& tileY)
+{
+    if (!warpPending) return false;
+    warpPending = false;
+    room = warpRoom;
+    tileX = warpTileX;
+    tileY = warpTileY;
+    return true;
+}
+
+void DialogueBox::drawChoices(Rectangle box) const
+{
+    if (!current || !choiceActive) return;
+    const DialogueLine& line = current->lines[lineIndex];
+    if (line.choiceCount <= 0 || !line.choices) return;
+
+    float sc = scale();
+    float textSize = fontSize();
+    float spacing = sc;
+    int patch = border.width / 3;
+    if (patch < 1) patch = 1;
+
+    // Options stack in the bottom-right corner of the box (LttP style).
+    float top = (box.y + box.height - (float)patch - TEXT_PAD_Y
+                 - (float)(line.choiceCount * LINE_HEIGHT)) * sc;
+    float right = (box.x + box.width - (float)patch - TEXT_PAD_X) * sc;
+    float cursorX = right - 14.0f * sc;
+
+    for (int i = 0; i < line.choiceCount; i++)
+    {
+        const char* option = line.choices[i].text ? line.choices[i].text : "";
+        float width = MeasureTextEx(font, option, textSize, spacing).x;
+        Vector2 pos = { right - width, top + (float)(i * LINE_HEIGHT) * sc };
+        DrawTextEx(font, option, pos, textSize, spacing, RAYWHITE);
+
+        if (i == choiceCursor)
+        {
+            float cy = pos.y + textSize * 0.5f;
+            Vector2 a = { cursorX, cy - 5.0f * sc };
+            Vector2 b = { cursorX, cy + 5.0f * sc };
+            Vector2 c2 = { cursorX + 8.0f * sc, cy };
+            DrawTriangle(a, b, c2, RAYWHITE);
         }
     }
 }
@@ -218,4 +433,23 @@ void DialogueBox::draw() const
         Vector2 pos = { left, top + (float)(j * LINE_HEIGHT) * sc };
         DrawTextEx(font, tmp, pos, textSize, spacing, RAYWHITE);
     }
+
+    // Waiting-state prompt: a blinking arrow once the line is fully typed
+    // (skipped when the choice list takes over the box).
+    if (reveal >= (float)totalChars && !choiceActive
+        && lineIndex >= 0 && lineIndex < current->lineCount
+        && current->lines[lineIndex].choiceCount <= 0
+        && ((int)(GetTime() * 3.0f) % 2 == 0))
+    {
+        int patchArrow = border.width / 3;
+        if (patchArrow < 1) patchArrow = 1;
+        float ax = (box.x + box.width - (float)patchArrow - TEXT_PAD_X - 2.0f) * sc;
+        float ay = (box.y + box.height - (float)patchArrow - TEXT_PAD_Y + 1.0f) * sc;
+        Vector2 a = { ax, ay - 3.0f * sc };
+        Vector2 b = { ax + 6.0f * sc, ay - 3.0f * sc };
+        Vector2 c = { ax + 3.0f * sc, ay + 3.0f * sc };
+        DrawTriangle(a, b, c, RAYWHITE);
+    }
+
+    drawChoices(box);
 }

@@ -1,0 +1,15 @@
+{
+    "lines": [
+        {
+            "text": "A told me about the pond south of here. The fish are spectacular."
+        },
+        {
+            "text": "Bomb the cracked wall east of the trees and see what happens!",
+            "if": "demo_met"
+        },
+        {
+            "text": "Stay a while. The gate puzzle keeps the little ones busy.",
+            "unless": "demo_agreed"
+        }
+    ]
+}
