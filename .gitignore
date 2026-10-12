@@ -11,4 +11,7 @@ include_auto/
 src_auto/
 __pycache__/
 editor/node_modules/
+editor/dist/
+editor/src-tauri/target/
+editor/src-tauri/gen/
 assets/

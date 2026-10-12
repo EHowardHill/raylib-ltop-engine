@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate include_auto/assets.h and src_auto/assets.cpp from the .json
-files (and Tiled .tmx/.tsx data) in resources/, so the Raylib binary never
-parses json at runtime. Also creates the dialogue box border bitmap if the
-resources folder does not contain one yet."""
+files in resources/, so the Raylib binary never parses json at runtime.
+Rooms store their tile layers directly in json (edited with the web editor);
+the tileset is derived from the tile png's dimensions. Also creates the
+dialogue box border bitmap if the resources folder does not contain one yet."""
 
 import json
 import math
@@ -11,7 +12,6 @@ import re
 import struct
 import sys
 import zlib
-import xml.etree.ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RES = os.path.join(ROOT, "resources")
@@ -126,48 +126,52 @@ def load_characters():
 
 
 def load_tileset():
+    """The tileset is a single png in resources/tiles: a 32x32 tile grid.
+    All metadata (columns, tile count) is derived from its dimensions, so no
+    Tiled .tsx file is needed."""
     directory = res("tiles")
     if not os.path.isdir(directory):
         return None
     for filename in sorted(os.listdir(directory)):
-        if not filename.endswith(".tsx"):
+        if not filename.endswith(".png"):
             continue
-        root = ET.parse(os.path.join(directory, filename)).getroot()
-        image = root.find("image")
-        source = image.attrib.get("source", "") if image is not None else ""
+        image_path = os.path.join(directory, filename)
+        image_width, image_height = png_size(image_path)
+        columns = image_width // TILE
         return {
-            "image": "assets/tiles/" + source.replace("\\", "/"),
-            "firstGid": int(root.attrib.get("firstgid", 1)),
-            "columns": int(root.attrib.get("columns") or 0),
-            "tileCount": int(root.attrib.get("tilecount") or 0),
-            "tileWidth": int(root.attrib.get("tilewidth") or TILE),
-            "tileHeight": int(root.attrib.get("tileheight") or TILE),
+            "image": "assets/tiles/" + filename,
+            "firstGid": 1,
+            "columns": columns,
+            "tileCount": columns * (image_height // TILE),
+            "tileWidth": TILE,
+            "tileHeight": TILE,
         }
     return None
 
 
-def parse_tmx(path):
-    root = ET.parse(path).getroot()
-    map_width = int(root.attrib.get("width", 0))
-    map_height = int(root.attrib.get("height", 0))
-
-    first_gid = 1
-    tileset = root.find("tileset")
-    if tileset is not None:
-        first_gid = int(tileset.get("firstgid", 1))
+def load_room_layers(stem, filename, data):
+    """Read the tile layers stored in the room json. Tile ids are 0-based
+    frame indices + 1 (0 = empty). Warns about legacy .tmx leftovers."""
+    if "width" not in data or "height" not in data:
+        warn("room '%s' has no width/height (legacy format?), skipping" % stem)
+        return None
+    map_width = int(data["width"])
+    map_height = int(data["height"])
+    expected = map_width * map_height
 
     layers = {}
-    for layer in root.iter("layer"):
-        name = layer.attrib.get("name", "")
-        data = layer.find("data")
-        if data is None or data.attrib.get("encoding") != "csv":
-            warn("layer '%s' in %s is not csv-encoded, skipping" % (name, os.path.basename(path)))
-            continue
-        values = [int(v) for v in data.text.split(",") if v.strip()]
-        if len(values) != map_width * map_height:
-            warn("layer '%s' in %s has %d tiles, expected %d" % (name, os.path.basename(path), len(values), map_width * map_height))
-            continue
-        layers[name] = [(0 if v == 0 else max(0, v - first_gid + 1)) for v in values]
+    for name in ("decor", "colliders"):
+        values = data.get(name) or []
+        values = [int(v) for v in values]
+        if len(values) != expected:
+            warn("room '%s' layer '%s' has %d tiles, expected %d"
+                 % (stem, name, len(values), expected))
+            return None
+        layers[name] = values
+
+    tmx_path = res("rooms", stem + ".tmx")
+    if os.path.exists(tmx_path):
+        warn("room '%s' has a legacy .tmx file that is now ignored (delete it)" % stem)
 
     return map_width, map_height, layers
 
@@ -184,14 +188,10 @@ def load_rooms(dialogue_index, character_index):
         with open(os.path.join(directory, filename), "r", encoding="utf-8") as handle:
             data = json.load(handle)
 
-        tmx_path = res("rooms", stem + ".tmx")
-        if not os.path.exists(tmx_path):
-            warn("room '%s' has no matching .tmx, skipping" % stem)
+        parsed = load_room_layers(stem, filename, data)
+        if parsed is None:
             continue
-        map_width, map_height, layers = parse_tmx(tmx_path)
-        if "decor" not in layers or "colliders" not in layers:
-            warn("room '%s' is missing a decor or colliders layer, skipping" % stem)
-            continue
+        map_width, map_height, layers = parsed
 
         default = data.get("default") or {}
         hero_name = default.get("hero") or ""
@@ -409,14 +409,14 @@ def create_border_bitmap(path):
 def sync_runtime_assets():
     """Mirror resources/ into assets/ (what ships with the binary).
 
-    Data files (.json/.tmx/.tsx) are excluded: they are baked into the
-    generated C++ at build time, so the binary never reads them.
+    Data files (.json) are excluded: they are baked into the generated C++
+    at build time, so the binary never reads them.
     """
     import shutil
     if os.path.isdir(ASSETS):
         shutil.rmtree(ASSETS)
     shutil.copytree(RES, ASSETS,
-                    ignore=shutil.ignore_patterns("*.json", "*.tmx", "*.tsx", ".DS_Store"))
+                    ignore=shutil.ignore_patterns("*.json", ".DS_Store"))
     count = sum(len(files) for _, _, files in os.walk(ASSETS))
     print("synced %d runtime files to assets/" % count)
 

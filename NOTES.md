@@ -12,7 +12,7 @@ At no point should the Raylib binary import or parse .json. The purpose of `scri
 
 Some fields may be optional - be sensitive to not breaking if these fields are missing.
 
-Both build scripts run the generator, which also mirrors the runtime files from `resources/` into `assets/` (excluding `.json`, `.tmx`, `.tsx`, which are baked into the binary). The binary loads **only** from `assets/` at runtime; `resources/` is the editable source of truth and is never read by the game.
+Both build scripts run the generator, which also mirrors the runtime files from `resources/` into `assets/` (excluding `.json`, which is baked into the binary). The binary loads **only** from `assets/` at runtime; `resources/` is the editable source of truth and is never read by the game.
 
 ## Global
 
@@ -56,13 +56,15 @@ Sound:
 
 ## Rooms
 
-Rooms are based on Tiled maps.
-- Rooms are stored in `resources/rooms`, as a .json and a .tmx file (same stem; a room without its .tmx is skipped at build time).
-- All base tiles are stored in resources/tiles, as a .png and a .tsx file.
+Rooms are edited entirely in the web editor — no external map tool.
+- Rooms are stored in `resources/rooms` as a single .json file per room.
+- All base tiles are stored in `resources/tiles` as a single .png (a grid of 32x32 tiles; the tileset's columns and tile count are derived from the image dimensions at build time).
 
-Each tiled map has the following layers:
-- "colliders": these are tiles that characters cannot cross over. They are rendered just like decor.
-- "decor": these are background tiles that characters can walk underneath.
+Each room .json contains:
+- "width" and "height": the map size, in tiles.
+- "decor": a flat array of width*height tile ids. These are background tiles that characters can walk underneath.
+- "colliders": a flat array of width*height tile ids. These are tiles that characters cannot cross over. They are rendered just like decor (on top of it).
+- Tile ids are 0-based frame indices into the tileset sheet, **plus 1**; 0 means empty.
 
 Within the .json file:
 - we have "default"
@@ -71,6 +73,7 @@ Within "default":
 - "hero": Which character is the player character.
 - "spawn": If there is no spawn location, place the hero character at this X and Y location. (Tile coordinates.)
 - "music": Play the music from `resources/music/` + the filename provided. Do not restart if the same file is already playing.
+  - Caution: music loads synchronously through raylib's tracker parser. A corrupt module file hangs the game before the first frame (no window, no error). Test new music files by running the game before committing them.
 - "walk_sfx": When the hero is walking, use the sound cue from `resources/audio/` + the filename provided.
 
 Within "encounters":
@@ -86,6 +89,8 @@ Both "instant" and "interactive" have the following attributes:
 ## Characters
 
 Character sprites are in resources/characters. They are PNG files, accompanied by .json configuration files.
+
+The web editor is the intended way to fill these in: it shows the sheet with a grid and frame indices, lets you click tiles to build each stand/move animation per direction, previews the animation at the engine's frame rates (stand 2 fps, move 12 fps), and keeps the raw index lists editable as text.
 
 .json configuration files have the following attributes:
 
@@ -106,4 +111,4 @@ The virtual "camera" follows the hero around. However, the camera never leaves t
 
 ## Editor
 
-`editor/` contains a web application (React + a zero-dependency Node server) for editing `resources/` and running the build. Run with `node editor/server.js` (or `cd editor && npm start`), then open http://localhost:5173. It reads/writes only `resources/` and runs `./build-mac.sh` (Mac only) for its Build button. See `editor/README.md`.
+`editor/` contains the resource editor as a Tauri desktop app (React + Vite frontend, Rust backend) for editing `resources/` and running the build. Run with `cd editor && npm run tauri:dev` (or `npm run tauri:build` for a bundled app); it reads/writes only `resources/` and runs `./build-mac.sh` (Mac only) for its Build button. It locates the project via the `LTOP_EDITOR_PROJECT` env var, a persisted folder choice, or by walking up from the executable, and otherwise asks for the repo folder in the UI. See `editor/README.md`.

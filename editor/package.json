@@ -2,9 +2,25 @@
   "name": "ltop-editor",
   "version": "0.1.0",
   "private": true,
-  "description": "Web-based resource editor for the raylib LttP engine",
-  "main": "server.js",
+  "description": "Tauri resource editor for the raylib LttP engine",
   "scripts": {
-    "start": "node server.js"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "icon": "tauri icon"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-react": "^5",
+    "vite": "^7"
   }
 }
