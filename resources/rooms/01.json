@@ -1,0 +1,33 @@
+{
+    "default": {
+        "hero": "link",
+        "spawn": [
+            4,
+            5
+        ],
+        "music": "zel1laby.xm",
+        "walk_sfx": "walk_grass.wav"
+    },
+    "encounters": {
+        "instant": [
+            {
+                "location": [
+                    5,
+                    5
+                ],
+                "dialogue": "01.json",
+                "repeat": false
+            }
+        ],
+        "interactive": [
+            {
+                "location": [
+                    6,
+                    6
+                ],
+                "dialogue": "02.json",
+                "repeat": true
+            }
+        ]
+    }
+}

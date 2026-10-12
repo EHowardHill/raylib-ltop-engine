@@ -1,0 +1,14 @@
+.DS_Store
+build/
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
+.venv/
+main
+include_auto/
+src_auto/
+__pycache__/
+editor/node_modules/
+assets/

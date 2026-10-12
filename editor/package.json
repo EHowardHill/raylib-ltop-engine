@@ -1,0 +1,10 @@
+{
+  "name": "ltop-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Web-based resource editor for the raylib LttP engine",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
