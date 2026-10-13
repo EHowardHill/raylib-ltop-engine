@@ -1,0 +1,6 @@
+{
+    "label": "FLIPPERS",
+    "passive": {
+        "swim": true
+    }
+}

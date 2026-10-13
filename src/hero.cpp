@@ -36,6 +36,17 @@ static const float SPLASH_HOP = 14.0f;     // hop arc height, px
 // Shallow water wading.
 static const float WADE_SPEED_SCALE = 0.55f;
 
+// Raised shield (held button): a guarded walk is a slow walk.
+static const float GUARD_SPEED_SCALE = 0.55f;
+
+// Deep-water swimming (flippers): each stroke is a speed kick that glides
+// against water drag; holding a direction re-strokes once the glide slows.
+static const float SWIM_STROKE_SPEED = 150.0f;  // px/s kick per stroke
+static const float SWIM_DRAG = 130.0f;          // px/s^2 water drag
+static const float SWIM_RESTROKE = 36.0f;       // px/s: slow enough to kick again
+static const float SWIM_BOB_FREQ = 5.0f;        // float bob, Hz
+static const float SWIM_BOB_AMP = 1.5f;         // float bob, px
+
 // Ice: input accelerates a momentum vector, friction is a slow decay.
 static const float ICE_ACCEL = 420.0f;     // px/s^2
 static const float ICE_FRICTION = 90.0f;  // px/s^2 decay while coasting
@@ -50,6 +61,27 @@ static const float HOP_TRAVEL = 2.0f * TILE_SIZE;
 // Hoisting a liftable object: brief pause, then the carrying mode takes
 // over (the object rides overhead; main positions it).
 const float Hero::LIFT_DURATION = 0.30f;
+
+// Grab-and-pull: one tile of dragged travel, a strained backward glide.
+// Matches the object-slide duration in main so the pair stays in step.
+static const float PULL_DURATION = 0.22f;
+
+// Hammer (use-action item): windup, then the quake lands, then recover.
+const float Hero::HAMMER_WINDUP = 0.18f;
+const float Hero::HAMMER_DURATION = 0.42f;
+static const float HAMMER_REACH = 30.0f;
+
+// Shovel (use-action item): a stab into the tile ahead.
+const float Hero::DIG_WINDUP = 0.18f;
+const float Hero::DIG_DURATION = 0.40f;
+
+// Hookshot yank: the reel-in glide toward a latched target (constant
+// speed; the duration derives from the distance).
+static const float HOOK_PULL_SPEED = 420.0f;  // px/s
+
+// Magic powder: windup, then the puff, then a recover beat.
+const float Hero::SPRINKLE_WINDUP = 0.14f;
+const float Hero::SPRINKLE_DURATION = 0.34f;
 
 static const float SPIN_CHARGE = 0.45f;   // held time before a release spins
 static const float SPIN_DURATION = 0.50f;
@@ -70,22 +102,29 @@ static const char* CRASH_SFX = "assets/audio/ram.wav";
 static const char* DIE_SFX = "assets/audio/link dies.wav";
 static const char* SPLASH_SFX = "assets/audio/fall in water.wav";
 static const char* WADE_SFX = "assets/audio/walk water.wav";
+static const char* SWIM_SFX = "assets/audio/swim.wav";
 static const char* LAND_SFX = "assets/audio/land.wav";
 static const char* LIFT_SFX = "assets/audio/lift.wav";
 
 Hero::Hero()
     : cfg(0), sheet(), swordSheet(), swordSfx(), hurtSfx(), fallSfx(),
       spinChargeSfx(), spinSfx(), dashSfx(), crashSfx(), dieSfx(),
-      splashSfx(), wadeSfx(), landSfx(), liftSfx(), sfxLoaded(false),
+      splashSfx(), wadeSfx(), swimSfx(), landSfx(), liftSfx(), sfxLoaded(false),
       x(0.0f), y(0.0f), facing(DIR_DOWN), moving(false),
       animTime(0.0f), stepDist(0.0f), state_(HERO_IDLE), stateTime(0.0f),
       invulnTime(0.0f), health_(START_HEARTS * 2), maxHealth_(START_HEARTS * 2),
       knockX(0.0f), knockY(0.0f), swordHeldTime(0.0f), chargeCuePlayed(false),
       dashX(0.0f), dashY(0.0f), swing_(0), safeTileX(-1), safeTileY(-1),
       velX(0.0f), velY(0.0f), splashX(0.0f), splashY(0.0f), wading_(false),
+      canSwim_(false), strokeTime(0.0f), riding_(false),
+      protected_(false), cloaked_(false),
       inputX(0.0f), inputY(0.0f),
       hopStartX(0.0f), hopStartY(0.0f), hopTargetX(0.0f), hopTargetY(0.0f),
-      hopLanded(false), carrying_(false)
+      hopLanded(false), carrying_(false), guarding_(false),
+      pullActive(false), pullT(0.0f),
+      pullFromX(0.0f), pullFromY(0.0f), pullToX(0.0f), pullToY(0.0f),
+      hookPullActive(false), hookPullT(0.0f), hookPullDuration(0.0f),
+      hookFromX(0.0f), hookFromY(0.0f), hookToX(0.0f), hookToY(0.0f)
 {
 }
 
@@ -109,6 +148,7 @@ void Hero::load(const CharacterConfig& config)
     dieSfx = LoadSound(DIE_SFX);
     splashSfx = LoadSound(SPLASH_SFX);
     wadeSfx = LoadSound(WADE_SFX);
+    swimSfx = LoadSound(SWIM_SFX);
     landSfx = LoadSound(LAND_SFX);
     liftSfx = LoadSound(LIFT_SFX);
     sfxLoaded = true;
@@ -130,6 +170,7 @@ void Hero::unload()
         UnloadSound(dieSfx);
         UnloadSound(splashSfx);
         UnloadSound(wadeSfx);
+        UnloadSound(swimSfx);
         UnloadSound(landSfx);
         UnloadSound(liftSfx);
         sfxLoaded = false;
@@ -149,6 +190,7 @@ void Hero::place(int tileX, int tileY)
     velY = 0.0f;
     wading_ = false;
     carrying_ = false;
+    riding_ = false;
     setState(HERO_IDLE);
     animTime = 0.0f;
     stepDist = 0.0f;
@@ -159,6 +201,8 @@ void Hero::setState(HeroState next)
 {
     state_ = next;
     stateTime = 0.0f;
+    // The shield only stays raised while the hero is free to move.
+    if (next != HERO_IDLE && next != HERO_WALK) guarding_ = false;
 }
 
 void Hero::tileUnder(int& tileX, int& tileY) const
@@ -171,6 +215,34 @@ Vector2 Hero::center() const
 {
     Vector2 c = { x + TILE_SIZE * 0.5f, y + TILE_SIZE * 0.5f };
     return c;
+}
+
+// Held movement direction, keyboard + dpad/stick (cardinal, normalized
+// to unit steps; diagonals keep both axes and the callers scale them).
+static void readMoveInput(float& dx, float& dy)
+{
+    dx = 0.0f;
+    dy = 0.0f;
+    if (IsKeyDown(KEY_LEFT)) dx -= 1.0f;
+    if (IsKeyDown(KEY_RIGHT)) dx += 1.0f;
+    if (IsKeyDown(KEY_UP)) dy -= 1.0f;
+    if (IsKeyDown(KEY_DOWN)) dy += 1.0f;
+
+    for (int i = 0; i < 4; i++)
+    {
+        if (!IsGamepadAvailable(i)) continue;
+        float ax = GetGamepadAxisMovement(i, GAMEPAD_AXIS_LEFT_X);
+        float ay = GetGamepadAxisMovement(i, GAMEPAD_AXIS_LEFT_Y);
+        if (ax < -0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_LEFT)) dx -= 1.0f;
+        if (ax > 0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_RIGHT)) dx += 1.0f;
+        if (ay < -0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_UP)) dy -= 1.0f;
+        if (ay > 0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_DOWN)) dy += 1.0f;
+    }
+
+    if (dx < 0.0f) dx = -1.0f;
+    if (dx > 0.0f) dx = 1.0f;
+    if (dy < 0.0f) dy = -1.0f;
+    if (dy > 0.0f) dy = 1.0f;
 }
 
 bool Hero::slideWithCollision(const Room& room, float dx, float dy)
@@ -253,6 +325,19 @@ void Hero::startSplash()
     if (sfxLoaded) PlaySound(splashSfx);
 }
 
+void Hero::startSwim()
+{
+    setState(HERO_SWIM);
+    moving = false;
+    velX = 0.0f;
+    velY = 0.0f;
+    wading_ = false;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
+    strokeTime = 0.0f;
+    if (sfxLoaded) PlaySound(splashSfx);
+}
+
 void Hero::startLift()
 {
     setState(HERO_LIFT);
@@ -262,6 +347,91 @@ void Hero::startLift()
     swordHeldTime = 0.0f;
     chargeCuePlayed = false;
     if (sfxLoaded) PlaySound(liftSfx);
+}
+
+void Hero::startGrab()
+{
+    setState(HERO_GRAB);
+    moving = false;
+    velX = 0.0f;
+    velY = 0.0f;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
+    pullActive = false;
+    pullT = 0.0f;
+}
+
+void Hero::startPull(float dx, float dy)
+{
+    // One-tile backward glide away from the grabbed object (the object
+    // slides the same delta in step, driven by main).
+    pullActive = true;
+    pullT = 0.0f;
+    pullFromX = x;
+    pullFromY = y;
+    pullToX = x + dx * TILE_SIZE;
+    pullToY = y + dy * TILE_SIZE;
+    moving = true;
+}
+
+void Hero::startHammer()
+{
+    setState(HERO_HAMMER);
+    swing_++;  // pound hits dedupe by the action id, like sword swings
+    moving = false;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
+}
+
+void Hero::startDig()
+{
+    setState(HERO_DIG);
+    swing_++;  // one dig turn per action id (main dedupes on it)
+    moving = false;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
+}
+
+void Hero::startHookshot()
+{
+    setState(HERO_HOOKSHOT);
+    moving = false;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
+    hookPullActive = false;
+    hookPullT = 0.0f;
+}
+
+void Hero::startHookPull(float targetX, float targetY)
+{
+    // Yank: reel the hero in to the latched target, gliding free of
+    // collision (and of tile hazards — the hookshot crosses pits/water).
+    float dist = sqrtf((targetX - x) * (targetX - x) + (targetY - y) * (targetY - y));
+    hookPullActive = true;
+    hookPullT = 0.0f;
+    hookPullDuration = dist / HOOK_PULL_SPEED;
+    if (hookPullDuration < 0.05f) hookPullDuration = 0.05f;
+    hookFromX = x;
+    hookFromY = y;
+    hookToX = targetX;
+    hookToY = targetY;
+    moving = true;
+}
+
+void Hero::endHookshot()
+{
+    // The chain resolved (retracted home); only a non-pulling hookshot
+    // state resolves — a yank in progress lands first.
+    if (state_ == HERO_HOOKSHOT && !hookPullActive) setState(HERO_IDLE);
+}
+
+void Hero::startSprinkle()
+{
+    setState(HERO_SPRINKLE);
+    swing_++;  // one sprinkle per action id (main dedupes on it)
+    moving = false;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
 }
 
 void Hero::startHop(float dx, float dy, const Room& room)
@@ -360,7 +530,7 @@ void Hero::setHealth(int halfHearts, int maxHalfHearts)
 void Hero::hurt(int halfHearts, Vector2 knockDir)
 {
     if (invulnTime > 0.0f || state_ == HERO_FALL || state_ == HERO_SPLASH
-        || state_ == HERO_HOP || state_ == HERO_DEAD) return;
+        || state_ == HERO_HOP || state_ == HERO_DEAD || protected_) return;
 
     health_ -= halfHearts;
     if (health_ < 0) health_ = 0;
@@ -391,6 +561,20 @@ Rectangle Hero::attackBox() const
         return Rectangle{ x + TILE_SIZE * 0.5f - SPIN_RADIUS,
                          y + TILE_SIZE * 0.5f - SPIN_RADIUS,
                          SPIN_RADIUS * 2.0f, SPIN_RADIUS * 2.0f };
+    }
+    if (state_ == HERO_HAMMER)
+    {
+        // The pound lands only after the windup: no hitbox while the
+        // mallet is still raised. A touch wider than the sword arc.
+        if (stateTime < HAMMER_WINDUP) return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
+        switch (facing)
+        {
+        case DIR_DOWN:  return Rectangle{ x + 2.0f, y + TILE_SIZE, TILE_SIZE - 4.0f, HAMMER_REACH };
+        case DIR_UP:    return Rectangle{ x + 2.0f, y - HAMMER_REACH, TILE_SIZE - 4.0f, HAMMER_REACH };
+        case DIR_RIGHT: return Rectangle{ x + TILE_SIZE, y + 2.0f, HAMMER_REACH, TILE_SIZE - 4.0f };
+        case DIR_LEFT: return Rectangle{ x - HAMMER_REACH, y + 2.0f, HAMMER_REACH, TILE_SIZE - 4.0f };
+        default: return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
+        }
     }
     if (state_ != HERO_ATTACK) return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -542,35 +726,155 @@ void Hero::update(const Room& room, float dt)
         }
         break;
 
+    case HERO_GRAB:
+        // Holding a grabbable object: the pull in progress glides the
+        // hero one tile backward (main slides the object in step, having
+        // checked both paths). Otherwise the hero digs in facing the
+        // object — main reads inputDir() for the pull; letting go of the
+        // action button releases the grab.
+        if (pullActive)
+        {
+            pullT += dt;
+            float t = pullT / PULL_DURATION;
+            if (t >= 1.0f)
+            {
+                x = pullToX;
+                y = pullToY;
+                pullActive = false;
+                moving = false;
+            }
+            else
+            {
+                x = pullFromX + (pullToX - pullFromX) * t;
+                y = pullFromY + (pullToY - pullFromY) * t;
+            }
+        }
+        else
+        {
+            readMoveInput(inputX, inputY);
+            if (!bindingHeld(BINDING_ACTION)) setState(HERO_IDLE);
+        }
+        break;
+
+    case HERO_HAMMER:
+        // Windup, then the pound (main lands the quake effects once
+        // HAMMER_WINDUP elapses), then a recover beat.
+        if (stateTime >= HAMMER_DURATION) setState(HERO_IDLE);
+        break;
+
+    case HERO_DIG:
+        // Windup, then the dig (main turns the tile ahead over once
+        // DIG_WINDUP elapses), then a recover beat.
+        if (stateTime >= DIG_DURATION) setState(HERO_IDLE);
+        break;
+
+    case HERO_HOOKSHOT:
+        // Locked while the chain flies (main owns the head); a latch yank
+        // glides the hero to the target, free of collision and hazards.
+        if (hookPullActive)
+        {
+            hookPullT += dt;
+            float t = hookPullT / hookPullDuration;
+            if (t >= 1.0f)
+            {
+                x = hookToX;
+                y = hookToY;
+                hookPullActive = false;
+                moving = false;
+                setState(HERO_IDLE);
+            }
+            else
+            {
+                x = hookFromX + (hookToX - hookFromX) * t;
+                y = hookFromY + (hookToY - hookFromY) * t;
+            }
+        }
+        break;
+
+    case HERO_SPRINKLE:
+        // Windup, then the puff (main resolves the powder), then recover.
+        if (stateTime >= SPRINKLE_DURATION) setState(HERO_IDLE);
+        break;
+
+    case HERO_SWIM:
+    {
+        // Stroke-glide swimming (flippers): a direction press kicks a
+        // stroke, the glide decays with water drag, and holding the
+        // direction re-strokes once the glide slows. The hero stays in
+        // the water until it glides onto a tile that isn't deep — the
+        // bank — then stands up (wading or walking from there).
+        float dx = 0.0f;
+        float dy = 0.0f;
+        readMoveInput(dx, dy);
+        inputX = dx;
+        inputY = dy;
+
+        float speed = sqrtf(velX * velX + velY * velY);
+        if ((dx != 0.0f || dy != 0.0f) && speed < SWIM_RESTROKE)
+        {
+            float len = sqrtf(dx * dx + dy * dy);
+            velX = dx / len * SWIM_STROKE_SPEED;
+            velY = dy / len * SWIM_STROKE_SPEED;
+            faceVector(dx, dy);
+            strokeTime = 0.0f;
+            if (sfxLoaded) PlaySound(swimSfx);
+        }
+
+        // Water drag on the glide.
+        speed = sqrtf(velX * velX + velY * velY);
+        if (speed > 0.0f)
+        {
+            float drop = SWIM_DRAG * dt;
+            if (speed <= drop)
+            {
+                velX = 0.0f;
+                velY = 0.0f;
+            }
+            else
+            {
+                velX *= (speed - drop) / speed;
+                velY *= (speed - drop) / speed;
+            }
+        }
+
+        float beforeX = x;
+        float beforeY = y;
+        slideWithCollision(room, velX * dt, velY * dt);
+        if (fabsf(x - beforeX) < 0.0001f) velX = 0.0f;
+        if (fabsf(y - beforeY) < 0.0001f) velY = 0.0f;
+        strokeTime += dt;
+
+        moving = sqrtf(velX * velX + velY * velY) > 8.0f;
+
+        // Bank check: only deep water keeps the hero swimming.
+        int tileX = 0;
+        int tileY = 0;
+        tileUnder(tileX, tileY);
+        TileMeta meta = room.tileMetaAt(tileX, tileY);
+        if (!(meta.flags & TILE_FLAG_WATER_DEEP))
+        {
+            setState(HERO_IDLE);
+            moving = false;
+            velX = 0.0f;
+            velY = 0.0f;
+        }
+        break;
+    }
+
     case HERO_IDLE:
     case HERO_WALK:
     default:
     {
         float dx = 0.0f;
         float dy = 0.0f;
-
-        if (IsKeyDown(KEY_LEFT)) dx -= 1.0f;
-        if (IsKeyDown(KEY_RIGHT)) dx += 1.0f;
-        if (IsKeyDown(KEY_UP)) dy -= 1.0f;
-        if (IsKeyDown(KEY_DOWN)) dy += 1.0f;
-
-        for (int i = 0; i < 4; i++)
-        {
-            if (!IsGamepadAvailable(i)) continue;
-            float ax = GetGamepadAxisMovement(i, GAMEPAD_AXIS_LEFT_X);
-            float ay = GetGamepadAxisMovement(i, GAMEPAD_AXIS_LEFT_Y);
-            if (ax < -0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_LEFT)) dx -= 1.0f;
-            if (ax > 0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_RIGHT)) dx += 1.0f;
-            if (ay < -0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_UP)) dy -= 1.0f;
-            if (ay > 0.25f || IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_DOWN)) dy += 1.0f;
-        }
-
-        if (dx < 0.0f) dx = -1.0f;
-        if (dx > 0.0f) dx = 1.0f;
-        if (dy < 0.0f) dy = -1.0f;
-        if (dy > 0.0f) dy = 1.0f;
+        readMoveInput(dx, dy);
         inputX = dx;
         inputY = dy;
+
+        // Active shield (held button): raised while free to move, the
+        // walk slows and the projectile block arc widens (main reads
+        // guarding() when it resolves rocks).
+        guarding_ = !carrying_ && bindingHeld(BINDING_SHIELD);
 
         // Carrying locks out the offensive actions: the action button
         // (main) throws the held object instead.
@@ -671,12 +975,13 @@ void Hero::update(const Room& room, float dt)
         else
         {
             // Direct movement, diagonals at the same overall speed, wading
-            // slower than dry land. A single step accumulator keeps the
-            // walk sfx from doubling up.
+            // and the raised shield slower than dry land. A single step
+            // accumulator keeps the walk sfx from doubling up.
             velX = 0.0f;
             velY = 0.0f;
             const float diagonalScale = (dx != 0.0f && dy != 0.0f) ? 0.70710678f : 1.0f;
-            const float speedScale = wading_ ? WADE_SPEED_SCALE : 1.0f;
+            float speedScale = wading_ ? WADE_SPEED_SCALE : 1.0f;
+            if (guarding_) speedScale *= GUARD_SPEED_SCALE;
             slideWithCollision(room,
                                dx * WALK_SPEED * speedScale * dt * diagonalScale,
                                dy * WALK_SPEED * speedScale * dt * diagonalScale);
@@ -725,12 +1030,19 @@ void Hero::update(const Room& room, float dt)
 
         // Tile hazards are checked against the tile under the hero's feet,
         // recomputed after the move (it may have crossed a tile boundary).
+        // Riding a moving platform, the platform is the ground underfoot —
+        // water below never gets a chance to splash.
         tileUnder(tileX, tileY);
         meta = room.tileMetaAt(tileX, tileY);
 
-        if (meta.flags & TILE_FLAG_WATER_DEEP)
+        if (riding_)
         {
-            startSplash();
+            // No hazards and no safe-tile bookkeeping while carried along.
+        }
+        else if (meta.flags & TILE_FLAG_WATER_DEEP)
+        {
+            if (canSwim_) startSwim();
+            else startSplash();
         }
         else if (meta.flags & TILE_FLAG_PIT)
         {
@@ -750,7 +1062,47 @@ void Hero::update(const Room& room, float dt)
     }
 }
 
-void Hero::drawFrame(int frame, float scaleX, float scaleY) const
+// Reflection squash: how tall the mirrored copy is vs. the sprite.
+static const float REFLECT_SQUASH = 0.62f;
+
+void Hero::drawReflection() const
+{
+    // Only the plain standing/walking hero reflects; the special-state
+    // sprites (falling, splashing, hopping, swimming, dying) don't.
+    if (!cfg) return;
+    if (state_ == HERO_FALL || state_ == HERO_SPLASH || state_ == HERO_HOP
+        || state_ == HERO_SWIM || state_ == HERO_DEAD)
+        return;
+
+    const DirectionalFrames* frames = (state_ == HERO_WALK || state_ == HERO_DASH)
+                                          ? &cfg->move[facing] : &cfg->stand[facing];
+    if (frames->count <= 0)
+        frames = (state_ == HERO_WALK || state_ == HERO_DASH)
+                     ? &cfg->stand[facing] : &cfg->move[facing];
+    if (frames->count <= 0) return;
+
+    float fps = (state_ == HERO_WALK || state_ == HERO_DASH) ? MOVE_ANIM_FPS : STAND_ANIM_FPS;
+    int index = (int)(animTime * fps);
+    if (index < 0) index = 0;
+    int frame = frames->frames[index % frames->count];
+
+    int columns = cfg->sheetColumns;
+    if (columns <= 0) columns = 1;
+    if (frame < 0) frame = 0;
+    if (frame >= cfg->frameCount && cfg->frameCount > 0) frame = cfg->frameCount - 1;
+
+    // Flipped (negative source height) below the feet, squashed, tinted
+    // like the water it stands in.
+    Rectangle src = { (float)((frame % columns) * TILE_SIZE),
+                     (float)((frame / columns) * TILE_SIZE),
+                     (float)TILE_SIZE, -(float)TILE_SIZE };
+    Rectangle dest = { x, y + (float)TILE_SIZE,
+                       (float)TILE_SIZE, (float)TILE_SIZE * REFLECT_SQUASH };
+    Vector2 origin = { 0.0f, 0.0f };
+    DrawTexturePro(sheet, src, dest, origin, 0.0f, Color{ 175, 200, 240, 100 });
+}
+
+void Hero::drawFrame(int frame, float scaleX, float scaleY, float yOff) const
 {
     if (!cfg) return;
 
@@ -766,7 +1118,7 @@ void Hero::drawFrame(int frame, float scaleX, float scaleY) const
     float w = (float)TILE_SIZE * scaleX;
     float h = (float)TILE_SIZE * scaleY;
     Rectangle dest = { x + (float)TILE_SIZE * 0.5f - w * 0.5f,
-                       y + (float)TILE_SIZE * 0.5f - h * 0.5f, w, h };
+                       y + (float)TILE_SIZE * 0.5f - h * 0.5f + yOff, w, h };
     Vector2 origin = { 0.0f, 0.0f };
     DrawTexturePro(sheet, src, dest, origin, 0.0f, WHITE);
 }
@@ -774,6 +1126,10 @@ void Hero::drawFrame(int frame, float scaleX, float scaleY) const
 void Hero::draw() const
 {
     if (!cfg) return;
+
+    // Cloak (magic cape): a ghostly blink — mostly there, barely solid.
+    if (cloaked_ && ((int)(GetTime() * 9.0f) % 4 == 3))
+        return;
 
     // Invincibility flicker: skip every other blink while i-frames last.
     if (invulnTime > 0.0f && state_ != HERO_FALL && state_ != HERO_SPLASH
@@ -906,6 +1262,129 @@ void Hero::draw() const
         return;
     }
 
+    if (state_ == HERO_SWIM)
+    {
+        // Floating on the surface: a slow bob plus ripple rings that mark
+        // each stroke (no blob shadow — main skips it while swimming).
+        int frame = 0;
+        const DirectionalFrames* frames = &cfg->move[facing];
+        if (frames->count <= 0) frames = &cfg->stand[facing];
+        if (frames->count <= 0) return;
+        float fps = moving ? MOVE_ANIM_FPS : STAND_ANIM_FPS;
+        frame = frames->frames[(int)(animTime * fps) % frames->count];
+
+        float bob = sinf(animTime * SWIM_BOB_FREQ * PI) * SWIM_BOB_AMP;
+        Vector2 c = { x + TILE_SIZE * 0.5f, y + TILE_SIZE * 0.72f };
+        for (int ring = 0; ring < 2; ring++)
+        {
+            float rt = strokeTime - ring * 0.14f;
+            if (rt < 0.0f || rt > 0.7f) continue;
+            float radius = 4.0f + rt * 24.0f;
+            unsigned char alpha = (unsigned char)((1.0f - rt / 0.7f) * 150.0f);
+            DrawCircleLines((int)c.x, (int)c.y, radius,
+                            Color{ 150, 190, 255, alpha });
+        }
+        drawFrame(frame, 1.0f, 1.0f, bob);
+        return;
+    }
+
+    if (state_ == HERO_HAMMER)
+    {
+        // Mallet placeholder (code-drawn, like the shield plate): raised
+        // overhead through the windup, slammed in front at the pound,
+        // with an expanding quake ring at the impact point.
+        float cx = x + TILE_SIZE * 0.5f;
+        float cy = y + TILE_SIZE * 0.5f;
+        float fdx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+        float fdy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+        float impactX = cx + fdx * 22.0f;
+        float impactY = cy + fdy * 22.0f;
+
+        if (stateTime < HAMMER_WINDUP)
+        {
+            // Raised: handle up from the hands, head above the hero.
+            float raise = stateTime / HAMMER_WINDUP;
+            float headY = y - 8.0f - raise * 4.0f;
+            DrawLine((int)cx, (int)(cy - 4.0f), (int)cx, (int)(headY + 4.0f),
+                     Color{ 120, 84, 52, 255 });
+            DrawRectangle((int)(cx - 8.0f), (int)headY, 16, 8,
+                          Color{ 148, 148, 160, 255 });
+            DrawRectangle((int)(cx - 8.0f), (int)headY, 16, 3,
+                          Color{ 196, 200, 210, 255 });
+        }
+        else
+        {
+            // Slammed at the impact point; the quake ring spreads.
+            DrawLine((int)cx, (int)cy, (int)(impactX - fdx * 5.0f),
+                     (int)(impactY - fdy * 5.0f), Color{ 120, 84, 52, 255 });
+            if (fdy != 0.0f)
+            {
+                DrawRectangle((int)(impactX - 8.0f), (int)impactY, 16, 8,
+                              Color{ 148, 148, 160, 255 });
+                DrawRectangle((int)(impactX - 8.0f), (int)impactY, 16, 3,
+                              Color{ 196, 200, 210, 255 });
+            }
+            else
+            {
+                DrawRectangle((int)impactX, (int)(impactY - 8.0f), 8, 16,
+                              Color{ 148, 148, 160, 255 });
+                DrawRectangle((int)impactX, (int)(impactY - 8.0f), 3, 16,
+                              Color{ 196, 200, 210, 255 });
+            }
+            float rt = (stateTime - HAMMER_WINDUP) / (HAMMER_DURATION - HAMMER_WINDUP);
+            if (rt > 1.0f) rt = 1.0f;
+            float radius = 4.0f + rt * 24.0f;
+            unsigned char alpha = (unsigned char)((1.0f - rt) * 170.0f);
+            DrawCircleLines((int)impactX, (int)impactY, radius,
+                            Color{ 205, 205, 215, alpha });
+        }
+    }
+
+    if (state_ == HERO_DIG)
+    {
+        // Shovel placeholder (code-drawn, like the mallet): held up over
+        // the windup, then stabbed into the ground ahead with a dirt burst.
+        float cx = x + TILE_SIZE * 0.5f;
+        float cy = y + TILE_SIZE * 0.5f;
+        float fdx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+        float fdy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+        float tipX = cx + fdx * 20.0f;
+        float tipY = cy + fdy * 20.0f;
+
+        if (stateTime < DIG_WINDUP)
+        {
+            // Held up: handle over the shoulder, blade above the hero.
+            float raise = stateTime / DIG_WINDUP;
+            float bladeY = y - 6.0f - raise * 3.0f;
+            DrawLine((int)cx, (int)(cy - 6.0f), (int)cx, (int)(bladeY + 6.0f),
+                     Color{ 120, 84, 52, 255 });
+            DrawRectangle((int)(cx - 6.0f), (int)bladeY, 12, 7,
+                          Color{ 176, 168, 152, 255 });
+            DrawRectangle((int)(cx - 6.0f), (int)bladeY, 12, 2,
+                          Color{ 214, 210, 198, 255 });
+        }
+        else
+        {
+            // Stabbed into the tile ahead; dirt sprays at the tip.
+            DrawLine((int)cx, (int)cy, (int)(tipX - fdx * 4.0f),
+                     (int)(tipY - fdy * 4.0f), Color{ 120, 84, 52, 255 });
+            if (fdy != 0.0f)
+            {
+                DrawRectangle((int)(tipX - 6.0f), (int)tipY, 12, 7,
+                              Color{ 176, 168, 152, 255 });
+                DrawRectangle((int)(tipX - 6.0f), (int)tipY, 12, 2,
+                              Color{ 214, 210, 198, 255 });
+            }
+            else
+            {
+                DrawRectangle((int)tipX, (int)(tipY - 6.0f), 7, 12,
+                              Color{ 176, 168, 152, 255 });
+                DrawRectangle((int)tipX, (int)(tipY - 6.0f), 2, 12,
+                              Color{ 214, 210, 198, 255 });
+            }
+        }
+    }
+
     if (state_ == HERO_SPIN && swordSheet.id != 0)
     {
         // Spin: the slash arc whirls around the hero (two rotations).
@@ -952,4 +1431,26 @@ void Hero::draw() const
     index = frames->frames[index % frames->count];
 
     drawFrame(index, 1.0f, 1.0f);
+
+    // Raised shield pose: a plate held toward the facing edge (code-drawn
+    // placeholder; a game's hero art can carry a real shield frame later).
+    if (guarding_)
+    {
+        float cx;
+        float cy;
+        bool vertical;
+        switch (facing)
+        {
+        case DIR_DOWN: cx = x + 24.0f; cy = y + 21.0f; vertical = true; break;
+        case DIR_UP:   cx = x + 9.0f;  cy = y + 8.0f;  vertical = true; break;
+        case DIR_RIGHT: cx = x + 26.0f; cy = y + 16.0f; vertical = false; break;
+        default:       cx = x + 6.0f;  cy = y + 16.0f; vertical = false; break;
+        }
+        float rx = vertical ? 5.0f : 7.0f;
+        float ry = vertical ? 7.0f : 5.0f;
+        DrawEllipse((int)cx, (int)cy, rx + 1.0f, ry + 1.0f, Color{ 70, 74, 96, 255 });
+        DrawEllipse((int)cx, (int)cy, rx, ry, Color{ 168, 176, 200, 255 });
+        DrawEllipse((int)(cx - 1.0f), (int)(cy - 1.0f), rx * 0.45f, ry * 0.45f,
+                    Color{ 214, 222, 240, 255 });
+    }
 }

@@ -1,0 +1,9 @@
+{
+    "label": "QUAKE",
+    "use": {
+        "kind": "medallion",
+        "cost": {
+            "magic": 8
+        }
+    }
+}

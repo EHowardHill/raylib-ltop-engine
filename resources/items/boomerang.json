@@ -3,5 +3,9 @@
     "use": {
         "kind": "boomerang",
         "sfx": "boomerang.wav"
+    },
+    "upgrade": {
+        "flag": "magic_boomerang",
+        "speed": 280
     }
 }

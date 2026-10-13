@@ -1,0 +1,10 @@
+{
+    "label": "BOMBOS",
+    "use": {
+        "kind": "medallion",
+        "element": "fire",
+        "cost": {
+            "magic": 8
+        }
+    }
+}

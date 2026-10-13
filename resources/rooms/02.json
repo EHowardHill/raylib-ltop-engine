@@ -443,6 +443,101 @@
                 12,
                 9
             ]
+        },
+        {
+            "type": "statue",
+            "location": [
+                6,
+                8
+            ]
+        },
+        {
+            "type": "rock",
+            "location": [
+                9,
+                4
+            ]
+        },
+        {
+            "type": "big_rock",
+            "location": [
+                7,
+                4
+            ]
+        },
+        {
+            "type": "lever",
+            "location": [
+                6,
+                6
+            ],
+            "link": 4
+        },
+        {
+            "type": "barrier",
+            "location": [
+                10,
+                8
+            ],
+            "link": 4
+        },
+        {
+            "type": "chest",
+            "location": [
+                14,
+                2
+            ],
+            "kind": "normal",
+            "grant": {
+                "kind": "flag",
+                "flag": "silver_arrows"
+            }
+        },
+        {
+            "type": "platform",
+            "location": [
+                3,
+                9
+            ],
+            "path": [
+                [
+                    3,
+                    9
+                ],
+                [
+                    12,
+                    9
+                ]
+            ]
+        },
+        {
+            "type": "hook_post",
+            "location": [
+                13,
+                4
+            ]
+        },
+        {
+            "type": "shrine",
+            "location": [
+                2,
+                6
+            ],
+            "flag": "shrine_awakened"
+        },
+        {
+            "type": "warp",
+            "location": [
+                2,
+                2
+            ],
+            "warp": {
+                "room": "04.json",
+                "tile": [
+                    8,
+                    10
+                ]
+            }
         }
     ],
     "dark": true,

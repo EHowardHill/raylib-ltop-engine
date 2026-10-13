@@ -90,7 +90,7 @@ def load_dialogues(flags):
        "music": "<file>"|"", "goto": "<label>",
        "warp": {"room": "<room>", "tile": [x, y]},
        "choice": [{"text": ..., "set": [...], "clear": [...], "sfx": ...,
-                   "goto": ...}, ...]}"""
+                   "give": <item>, "cost": <rupees>, "goto": ...}, ...]}"""
     dialogues = []
     directory = res("dialogue")
     if not os.path.isdir(directory):
@@ -137,11 +137,19 @@ def load_dialogues(flags):
             for opt in entry.get("choice") or []:
                 if not isinstance(opt, dict):
                     opt = {"text": str(opt)}
+                cost = opt.get("cost") or 0
+                try:
+                    cost = max(0, int(cost))
+                except (TypeError, ValueError):
+                    warn("dialogue '%s' choice has a bad cost %r" % (filename, opt.get("cost")))
+                    cost = 0
                 choices.append({
                     "text": str(opt.get("text") or ""),
                     "set": flag_list(opt.get("set"), "set"),
                     "clear": flag_list(opt.get("clear"), "clear"),
                     "sfx": str(opt["sfx"]) if opt.get("sfx") else None,
+                    "give": item(opt.get("give"), "give"),
+                    "cost": cost,
                     "goto": opt.get("goto"),
                 })
 
@@ -278,8 +286,14 @@ def load_game():
 # --- Items (resources/items/<name>.json) -------------------------------------
 
 # Item use-action vocabulary, interpreted by the engine (ITEM_USE_*).
-ITEM_USE_KINDS = {"none": 0, "boomerang": 1, "arrow": 2, "bomb": 3, "bolt": 4}
+ITEM_USE_KINDS = {"none": 0, "boomerang": 1, "arrow": 2, "bomb": 3, "bolt": 4,
+                  "hammer": 5, "shovel": 6, "hookshot": 7, "medallion": 8,
+                  "byrna": 9, "cape": 10, "somaria": 11, "powder": 12,
+                  "flute": 13}
 ELEMENTS = {"none": 0, "fire": 1, "ice": 2}
+
+# Room weather vocabulary (engine WEATHER_* constants).
+WEATHER_KINDS = {"": 0, "rain": 1, "storm": 2, "fog": 3}
 
 
 def load_items():
@@ -289,7 +303,10 @@ def load_items():
              "cost": {"magic": N} or {"ammo": "arrow"|"bomb", "amount": N,
                                        "rupee_fallback": bool},
              "sfx": <audio file>},
-     "passive": {"light": <radius px>}}
+     "passive": {"light": <radius px>, "swim": <bool flippers>,
+                "lift": <bool gloves>, "compass": <bool dungeon compass>},
+     "upgrade": {"flag": <world flag>, "speed": N, "damage": N},
+     "spawn": <object type name (somaria-style block use-actions)>}
     Ids are assigned in sorted-filename order and emitted as ITEM_<NAME>
     constants. All behavior is composed from the engine's use-action
     vocabulary; the useEquippedItem switch is gone."""
@@ -347,6 +364,28 @@ def load_items():
                  % (name, passive))
             passive = {}
         light = max(0, int(passive.get("light") or 0))
+        swim = bool(passive.get("swim", False))
+        lift = bool(passive.get("lift", False))
+        compass = bool(passive.get("compass", False))
+
+        # World-flag upgrade (silver arrows, magical boomerang): while the
+        # flag is set, the use-action runs with the upgraded stats. The
+        # flag name resolves to an index once the flag registry is built.
+        upgrade = data.get("upgrade") or {}
+        if not isinstance(upgrade, dict):
+            warn("item '%s' has a bad 'upgrade' %r (expected an object)"
+                 % (name, upgrade))
+            upgrade = {}
+        upgrade_flag = str(upgrade.get("flag") or "")
+        upgrade_speed = max(0, int(upgrade.get("speed") or 0))
+        upgrade_damage = max(0, int(upgrade.get("damage") or 0))
+        if upgrade_flag and not (upgrade_speed or upgrade_damage):
+            warn("item '%s' upgrade '%s' sets no speed/damage"
+                 % (name, upgrade_flag))
+
+        # Spawned object (Somaria-style use-actions): the object type the
+        # use conjures/removes; resolves once object types are loaded.
+        spawn_object_name = str(data.get("spawn") or "")
 
         items.append({
             "name": name,
@@ -359,9 +398,16 @@ def load_items():
             "arrowRupeeFallback": arrow_fallback,
             "sfx": sfx,
             "light": light,
+            "swim": swim,
+            "lift": lift,
+            "compass": compass,
+            "upgradeFlagName": upgrade_flag,
+            "upgradeSpeed": upgrade_speed,
+            "upgradeDamage": upgrade_damage,
+            "spawnObjectName": spawn_object_name,
         })
-    if len(items) > 16:
-        warn("%d items exceed the inventory slots (16); the extras are"
+    if len(items) > 20:
+        warn("%d items exceed the inventory slots (20); the extras are"
              " unreachable" % len(items))
     return items
 
@@ -393,14 +439,21 @@ OBJINT_NAMES = {
     "leaves": 0x8000,      # smashes into leaves instead of shards
     "two_frame": 0x10000,  # two-frame sheet (frame 2 once opened)
     "hides": 0x20000,      # hides an enemy (aux1) until lifted
+    "pullable": 0x40000,   # grabbable + pullable (grab via action, pull away)
+    "hammer_smash": 0x80000,  # hammer pounds shatter it
+    "heavy": 0x100000,     # liftable only with a lift passive item (gloves)
+    "lever": 0x200000,     # pull-handle (aux2 = barrier link group it toggles)
+    "platform": 0x400000,  # moving platform ("path" = tile waypoints, looped)
+    "hookable": 0x800000,  # hookshot latch: the chain grabs it and reels the hero in
+    "powder": 0x1000000,   # magic powder awakens it (aux2 = story flag to set)
 }
 
 # Baseline type set, used when the game ships no types.json (a fresh game
 # folder is playable from day one).
 DEFAULT_OBJECT_TYPES = [
-    {"name": "pot", "interactions": ["solid", "liftable", "dash_smash", "hides"]},
+    {"name": "pot", "interactions": ["solid", "liftable", "dash_smash", "hammer_smash", "hides"]},
     {"name": "bush", "interactions": ["solid", "liftable", "dash_smash", "cut", "leaves"]},
-    {"name": "block", "interactions": ["solid", "pushable", "sinks", "weight"]},
+    {"name": "block", "interactions": ["solid", "pushable", "pullable", "sinks", "weight"]},
     {"name": "switch", "interactions": ["floor", "switch"]},
     {"name": "barrier", "interactions": ["solid", "barrier"]},
     {"name": "sign", "interactions": ["solid", "readable"]},
@@ -408,6 +461,15 @@ DEFAULT_OBJECT_TYPES = [
     {"name": "torch", "interactions": ["solid", "torch"]},
     {"name": "warp", "interactions": ["floor", "warp"]},
     {"name": "crystal", "interactions": ["solid", "crystal"]},
+    {"name": "rock", "interactions": ["solid", "hammer_smash"]},
+    {"name": "big_rock", "interactions": ["solid", "liftable", "heavy"]},
+    {"name": "statue", "interactions": ["solid", "pushable", "pullable", "sinks", "weight"]},
+    {"name": "lever", "interactions": ["solid", "pullable", "lever"]},
+    {"name": "platform", "interactions": ["floor", "platform"]},
+    {"name": "hook_post", "interactions": ["solid", "hookable"]},
+    {"name": "somaria_block", "interactions": ["solid", "pushable", "sinks",
+                                               "weight"]},
+    {"name": "shrine", "interactions": ["solid", "powder"]},
 ]
 
 
@@ -440,8 +502,8 @@ def load_object_types():
             "image": str(entry.get("image") or (str(entry["name"]) + ".png")),
             "interactionsMask": mask,
         })
-    if len(types) > 16:
-        warn("%d object types exceed the engine pool (16)" % len(types))
+    if len(types) > 32:
+        warn("%d object types exceed the engine pool (32)" % len(types))
     OBJECT_TYPES = types
     return types
 
@@ -494,6 +556,8 @@ GRANT_KIND_DEFS = [
      "text": "Your magic power was restored!"},
     {"name": "heart_container", "effect": 5, "pickup": 7,
      "text": "You got a heart container! Your life force grew!"},
+    {"name": "flag", "effect": 8, "pickup": -1,
+     "text": "A legend unfolds... Something has changed!"},
     {"name": "key", "effect": 6, "pickup": -1,
      "text": "You got a small key!"},
     {"name": "big_key", "effect": 7, "pickup": -1,
@@ -509,7 +573,7 @@ BARRIER_COLORS = {"linked": 0, "blue": 1, "red": 2}
 # Placed pickups (room "pickups" list) and per-enemy drop tables: kinds map
 # to the engine's pickups-sheet frames (PICKUP_*).
 PICKUP_KINDS = {"heart": 0, "rupee": 1, "rupee5": 2, "arrow": 4,
-                "bomb": 5, "magic": 6}
+                "bomb": 5, "magic": 6, "fairy": 8, "key": 9}
 
 
 # --- Game code manifest (resources/code/) ------------------------------------
@@ -555,7 +619,8 @@ def enemy_components(name, stats, manifest):
     comps = {
         "charge_sight": 0.0, "charge_scale": 0.0, "charge_stun": False,
         "shoot_period": 0, "walk_segment": 0.0, "turn_in_place": False,
-        "phases": [], "boss": False, "custom": None,
+        "phases": [], "boss": False, "mini_boss": False,
+        "strike_immune": False, "custom": None,
     }
     behavior = str(stats.get("behavior") or "")
     sight = int(stats.get("sight") or 0)
@@ -604,6 +669,13 @@ def enemy_components(name, stats, manifest):
         if "turn_chance" in mover: comps["turn_in_place"] = bool(mover["turn_chance"])
     if "boss" in explicit:
         comps["boss"] = bool(explicit["boss"])
+    if "mini_boss" in explicit:
+        # Mid-fight: seals the room + health bar while alive, room-local death.
+        comps["mini_boss"] = bool(explicit["mini_boss"])
+    if "strike_immune" in explicit:
+        # Reflectable-magic bosses: direct hero strikes bounce off;
+        # only projectile hits (deflected volleys) land.
+        comps["strike_immune"] = bool(explicit["strike_immune"])
     phases = explicit.get("phases")
     if isinstance(phases, list) and phases:
         table = []
@@ -708,6 +780,8 @@ def load_enemies(manifest):
             "turnInPlace": comps["turn_in_place"],
             "phases": comps["phases"],
             "boss": comps["boss"],
+            "miniBoss": comps["mini_boss"],
+            "strikeImmune": comps["strike_immune"],
             "custom": comps["custom"],
             "drops": drops,
             "color": [int(max(0, min(255, c))) for c in color],
@@ -747,13 +821,14 @@ def load_tile_meta(tileset):
     Format: {"tiles": {"<id>": {"pit": true, "damage": 1, "cuttable": true,
     "cut_result": <tile id>, "water": "deep"|"shallow", "ice": true,
     "push": [dx, dy], "ledge": "down"|"right"|"left"|"up",
-    "bombable": true, "bomb_result": <tile id>, "heal": true}}}
+    "bombable": true, "bomb_result": <tile id>, "dig": true, "heal": true}}}
     Tile ids are 1-based frame indices, matching the ids used in room layers.
     "damage" is measured in half-hearts. "cut_result" is the tile id left
     behind when the tile is cut (0 = empty). "push" is a conveyor/current/wind
     drift in px/s applied to whoever stands on the tile. "ledge" marks a
-    one-way vault-over ledge facing that direction. "bombable" marks cracked
+    one-way vault-over ledge facing that direction.     "bombable" marks cracked
     walls/floors; "bomb_result" (0 = empty, default) is what blasts leave.
+    "dig" marks soft soil the shovel can turn over (drops + buried items).
     "heal" marks fairy-fountain water: standing on it slowly refills hearts
     and magic.
     """
@@ -838,6 +913,9 @@ def load_tile_meta(tileset):
             entry["flags"] |= 128
             if props.get("bomb_result") is not None:
                 entry["bombResult"] = min(255, max(0, int(props["bomb_result"])))
+        if props.get("dig"):
+            # Soft soil: the shovel turns it over (drops + buried items).
+            entry["flags"] |= 256
         if props.get("heal"):
             entry["heal"] = 1
     return meta
@@ -888,7 +966,8 @@ def load_room_layers(stem, filename, data, tile_count=0):
     return map_width, map_height, layers
 
 
-def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
+def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
+               flags=None, tile_count=0):
     rooms = []
     directory = res("rooms")
     if not os.path.isdir(directory):
@@ -929,6 +1008,7 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             return encounters
 
         enemies = []
+        room_has_boss = False
         for entry in data.get("enemies") or []:
             if not isinstance(entry, dict):
                 continue
@@ -940,6 +1020,9 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             location = entry.get("location") or [0, 0]
             enemies.append({"x": int(location[0]), "y": int(location[1]),
                             "enemy": index})
+            if enemy_defs is not None and index < len(enemy_defs) \
+                    and enemy_defs[index].get("boss"):
+                room_has_boss = True
 
         objects = []
         for entry in data.get("objects") or []:
@@ -955,17 +1038,18 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             aux1 = -1
             aux2 = 0
             aux3 = 0
+            obj_path = []
             warp_room_raw = None
             # Aux packing is driven by the type's interactions (engine
             # vocabulary), never by type name: a new type that composes the
             # same interactions consumes the same extras.
             if mask & OBJINT_NAMES["switch"]:
                 mode = entry.get("mode") or "hold"
-                if mode not in ("hold", "latch"):
-                    warn("room '%s' switch has unknown mode '%s' (hold/latch); using hold"
-                         % (stem, mode))
+                if mode not in ("hold", "latch", "timed"):
+                    warn("room '%s' switch has unknown mode '%s' "
+                         "(hold/latch/timed); using hold" % (stem, mode))
                     mode = "hold"
-                aux1 = 1 if mode == "latch" else 0
+                aux1 = {"hold": 0, "latch": 1, "timed": 2}[mode]
                 try:
                     aux2 = int(entry.get("link") or 0)
                 except (TypeError, ValueError):
@@ -994,6 +1078,28 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
                     aux2 = int(entry.get("link") or 0)
                 except (TypeError, ValueError):
                     warn("room '%s' torch has a bad link id %r" % (stem, entry.get("link")))
+            if mask & OBJINT_NAMES["powder"]:
+                # Shrine-style: the powder sprinkle sets a story flag
+                # ("flag": <world flag name>, through the shared registry).
+                flag_name = entry.get("flag") or ""
+                if flags is not None and flag_name:
+                    aux2 = flags.index(flag_name)
+                else:
+                    aux2 = -1
+            if mask & OBJINT_NAMES["lever"]:
+                try:
+                    aux2 = int(entry.get("link") or 0)
+                except (TypeError, ValueError):
+                    warn("room '%s' lever has a bad link id %r" % (stem, entry.get("link")))
+            if mask & OBJINT_NAMES["platform"]:
+                # "path": tile waypoints glided in a loop ([x, y], ...).
+                for point in entry.get("path") or []:
+                    if (isinstance(point, (list, tuple)) and len(point) >= 2
+                            and all(isinstance(v, (int, float)) for v in point[:2])):
+                        obj_path.extend([int(point[0]), int(point[1])])
+                    else:
+                        warn("room '%s' platform path point %r is not [x, y]"
+                             % (stem, point))
             if mask & OBJINT_NAMES["hides"]:
                 # "hides": enemy name — lifting the object reveals an ambush.
                 hides_name = entry.get("hides")
@@ -1033,8 +1139,19 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
                         if aux3 < 0:
                             warn("room '%s' chest grants unknown item '%s'"
                                  % (stem, item_name))
+                    if grant_kind == "flag":
+                        # Story-flag grant (e.g. unlocking item upgrades):
+                        # param = flag index from the shared registry.
+                        flag_name = grant.get("flag") or ""
+                        if flags is not None and flag_name:
+                            aux3 = flags.index(flag_name)
+                        else:
+                            warn("room '%s' chest grants a flag without a"
+                                 " registry" % stem)
+                            aux3 = -1
             objects.append({"x": int(location[0]), "y": int(location[1]),
                             "type": index, "aux1": aux1, "aux2": aux2, "aux3": aux3,
+                            "path": obj_path,
                             "warpRoomRaw": warp_room_raw})
 
         # Placed pickups ("hearts in grass", buried rupees): spawned fresh
@@ -1051,6 +1168,24 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             location = entry.get("location") or [0, 0]
             pickup_spawns.append({"x": int(location[0]), "y": int(location[1]),
                                  "kind": PICKUP_KINDS[kind_name]})
+
+        # Buried treasure ("buried"): invisible until the shovel turns the
+        # tile over; spawned once per visit (dug spots stay empty).
+        buried_spawns = []
+        for entry in data.get("buried") or []:
+            if not isinstance(entry, dict):
+                continue
+            kind_name = entry.get("kind") or ""
+            if kind_name not in PICKUP_KINDS:
+                warn("room '%s' buried item has unknown kind '%s' %s"
+                     % (stem, kind_name, sorted(PICKUP_KINDS)))
+                continue
+            location = entry.get("location") or [0, 0]
+            buried_spawns.append({"x": int(location[0]), "y": int(location[1]),
+                                 "kind": PICKUP_KINDS[kind_name]})
+        if len(buried_spawns) > 16:
+            warn("room '%s' buries %d items; the dig registry holds 16"
+                 % (stem, len(buried_spawns)))
 
         npc_spawns = []
         for entry in data.get("npcs") or []:
@@ -1097,6 +1232,31 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
                 continue
             doors[edge] = DOOR_KINDS[kind]
 
+        # Weather (engine WEATHER_* vocabulary) + ambient tint:
+        # "weather": "rain"|"storm"|"fog"; "tint": [r, g, b] multiply
+        # (255 each = neutral); "night": true is a blue-dim preset.
+        weather_name = str(data.get("weather") or "").lower()
+        if weather_name not in WEATHER_KINDS:
+            warn("room '%s' has unknown weather %r %s"
+                 % (stem, weather_name, sorted(WEATHER_KINDS)))
+            weather_kind = 0
+        else:
+            weather_kind = WEATHER_KINDS[weather_name]
+        tint_r, tint_g, tint_b = 255, 255, 255
+        tint = data.get("tint")
+        if tint is not None:
+            try:
+                tint_r = int(max(0, min(255, tint[0])))
+                tint_g = int(max(0, min(255, tint[1])))
+                tint_b = int(max(0, min(255, tint[2])))
+            except (TypeError, ValueError, IndexError):
+                warn("room '%s' has a bad tint %r (expected [r, g, b])"
+                     % (stem, tint))
+        if data.get("night"):
+            tint_r = min(tint_r, 118)
+            tint_g = min(tint_g, 126)
+            tint_b = min(tint_b, 185)
+
         rooms.append({
             "name": filename,
             "hero": character_index.get(hero_name, -1),
@@ -1105,13 +1265,27 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             "spawnY": int(spawn[1]) if has_spawn else 0,
             "music": default.get("music") or None,
             "walkSfx": default.get("walk_sfx") or None,
+            "ambient": default.get("ambient") or None,
             "instant": encounter_list("instant"),
             "interactive": encounter_list("interactive"),
             "enemySpawns": enemies,
             "objectSpawns": objects,
             "pickupSpawns": pickup_spawns,
+            "buriedSpawns": buried_spawns,
+            "hasBoss": room_has_boss,
+            "hasChest": any(OBJECT_TYPES[o["type"]]["interactionsMask"]
+                            & OBJINT_NAMES["chest"]
+                            for o in objects) if objects else False,
+            # Boss defeat banks a story flag ("boss_defeated_<stem>") so
+            # dialogue can branch on the victory — same flag registry.
+            "bossFlag": (flags.index("boss_defeated_%s" % stem)
+                         if (room_has_boss and flags is not None) else -1),
             "npcSpawns": npc_spawns,
             "dark": bool(data.get("dark", False)),
+            "weather": weather_kind,
+            "tintR": tint_r,
+            "tintG": tint_g,
+            "tintB": tint_b,
             "doorN": doors.get("north", -1),
             "doorS": doors.get("south", -1),
             "doorE": doors.get("east", -1),
@@ -1206,13 +1380,15 @@ def emit_dialogues(c, dialogues):
                     emit_array(c, "int", cbase + "_SET", choice["set"], per_line=12)
                 if choice["clear"]:
                     emit_array(c, "int", cbase + "_CLEAR", choice["clear"], per_line=12)
-                choice_refs.append("    { %s, %d, %s, %d, %s, %d, %s },"
+                choice_refs.append("    { %s, %d, %s, %d, %s, %d, %s, %d, %d },"
                                    % (cstr(choice["text"]), choice["gotoLine"],
                                       (cbase + "_SET") if choice["set"] else "0",
                                       len(choice["set"]),
                                       (cbase + "_CLEAR") if choice["clear"] else "0",
                                       len(choice["clear"]),
-                                      cstr(choice["sfx"]) if choice["sfx"] else "0"))
+                                      cstr(choice["sfx"]) if choice["sfx"] else "0",
+                                      choice.get("give", -1),
+                                      choice.get("cost", 0)))
 
             if line["choices"]:
                 c.append("static const DialogueChoice %s_CHOICES[] = {" % lbase)
@@ -1331,7 +1507,7 @@ def emit_enemies(c, enemies):
             "%d, %s, %s, "
             "%s, %d, "
             "%s, %s, "
-            "%s, %d"
+            "%s, %s, %s, %d"
             % (enemy["hp"], enemy["speed"], enemy["damage"],
                cfloat(enemy["chargeSight"]), cfloat(enemy["chargeScale"]),
                "true" if enemy["chargeStun"] else "false",
@@ -1340,6 +1516,8 @@ def emit_enemies(c, enemies):
                (base + "_PHASES") if enemy["phases"] else "0",
                len(enemy["phases"]),
                "true" if enemy["boss"] else "false",
+               "true" if enemy["miniBoss"] else "false",
+               "true" if enemy["strikeImmune"] else "false",
                cstr(enemy["custom"]) if enemy["custom"] else "0",
                (base + "_DROPS") if enemy["drops"] else "0",
                len(enemy["drops"]))
@@ -1371,14 +1549,20 @@ def emit_items(c, items):
     per-item switch is gone."""
     c.append("const ItemConfig ITEMS[] = {")
     for item in items:
-        c.append("    { %s, %s, %d, %d, %d, %d, %d, %s, %s, %s, %d },"
+        c.append("    { %s, %s, %d, %d, %d, %d, %d, %s, %s, %s, %d, %s, %s, %s, %d, %d, %d, %d },"
                  % (cstr(item["name"]), cstr(item["label"]),
                     item["useKind"], item["element"],
                     item["magicCost"], item["bombCost"], item["arrowCost"],
                     "true" if item["arrowRupeeFallback"] else "false",
                     cstr(item["sfx"]) if item["sfx"] else "0",
                     "true" if item["light"] > 0 else "false",
-                    item["light"]))
+                    item["light"],
+                    "true" if item["swim"] else "false",
+                    "true" if item["lift"] else "false",
+                    "true" if item["compass"] else "false",
+                    item["upgradeFlagIdx"],
+                    item["upgradeSpeed"], item["upgradeDamage"],
+                    item["spawnObjectIdx"]))
     c.append("};")
     c.append("const int ITEM_COUNT = %d;" % len(items))
     c.append("")
@@ -1481,12 +1665,21 @@ def emit_rooms(c, rooms):
             c.append("")
 
         if room["objectSpawns"]:
+            # Platform rails bake as per-object short arrays (x,y pairs),
+            # like NPC paths.
+            for oi, o in enumerate(room["objectSpawns"]):
+                if o.get("path"):
+                    emit_array(c, "short", "%s_OBJ%d_PATH" % (base, oi), o["path"],
+                               per_line=12)
             name = "%s_OBJECTS" % base
             c.append("static const ObjectSpawn %s[%d] = {" % (name, len(room["objectSpawns"])))
-            entries = ", ".join("{ %d, %d, %d, %d, %d, %d }"
-                                % (o["x"], o["y"], o["type"], o["aux1"], o["aux2"],
-                                   o.get("aux3", 0))
-                                for o in room["objectSpawns"])
+            entries = ", ".join(
+                "{ %d, %d, %d, %d, %d, %d, %s, %d }"
+                % (o["x"], o["y"], o["type"], o["aux1"], o["aux2"],
+                   o.get("aux3", 0),
+                   ("%s_OBJ%d_PATH" % (base, oi)) if o.get("path") else "0",
+                   len(o.get("path") or []) // 2)
+                for oi, o in enumerate(room["objectSpawns"]))
             c.append("    %s," % entries)
             c.append("};")
             c.append("")
@@ -1496,6 +1689,15 @@ def emit_rooms(c, rooms):
             c.append("static const PickupSpawn %s[%d] = {" % (name, len(room["pickupSpawns"])))
             entries = ", ".join("{ %d, %d, %d }" % (p["x"], p["y"], p["kind"])
                                 for p in room["pickupSpawns"])
+            c.append("    %s," % entries)
+            c.append("};")
+            c.append("")
+
+        if room["buriedSpawns"]:
+            name = "%s_BURIED" % base
+            c.append("static const PickupSpawn %s[%d] = {" % (name, len(room["buriedSpawns"])))
+            entries = ", ".join("{ %d, %d, %d }" % (p["x"], p["y"], p["kind"])
+                                for p in room["buriedSpawns"])
             c.append("    %s," % entries)
             c.append("};")
             c.append("")
@@ -1545,6 +1747,9 @@ def emit_rooms(c, rooms):
         pickup_ref = "0"
         if room["pickupSpawns"]:
             pickup_ref = "%s_PICKUPS" % base
+        buried_ref = "0"
+        if room["buriedSpawns"]:
+            buried_ref = "%s_BURIED" % base
 
         # Field list built programmatically: no positional format string to
         # keep in sync with the RoomConfig member order.
@@ -1556,13 +1761,20 @@ def emit_rooms(c, rooms):
             str(room["spawnY"]),
             cstr(room["music"]) if room["music"] else "0",
             cstr(room["walkSfx"]) if room["walkSfx"] else "0",
+            cstr(room["ambient"]) if room["ambient"] else "0",
             instant_ref, str(len(room["instant"])),
             interactive_ref, str(len(room["interactive"])),
             enemy_ref, str(len(room["enemySpawns"])),
             object_ref, str(len(room["objectSpawns"])),
             npc_ref, str(len(room["npcSpawns"])),
             pickup_ref, str(len(room["pickupSpawns"])),
+            buried_ref, str(len(room["buriedSpawns"])),
+            "true" if room["hasBoss"] else "false",
+            "true" if room["hasChest"] else "false",
+            str(room["bossFlag"]),
             "true" if room["dark"] else "false",
+            str(room["weather"]),
+            str(room["tintR"]), str(room["tintG"]), str(room["tintB"]),
             str(room["doorN"]), str(room["doorS"]),
             str(room["doorE"]), str(room["doorW"]),
             str(room["mapWidth"]), str(room["mapHeight"]),
@@ -2098,9 +2310,206 @@ def create_object_bitmap(path, kind):
             return gem
         return clear
 
+    def rock(x, y):
+        # rounded boulder: gray stone with a highlight facet
+        dx = x - 15.5
+        dy = y - 19.0
+        blob = (dx * dx) / (11.0 * 11.0) + (dy * dy) / (9.0 * 9.0)
+        base = (134, 128, 118, 255)
+        dark = (84, 80, 74, 255)
+        light = (176, 172, 162, 255)
+        if blob < 0.85:
+            pixel = base
+            if dx + dy < -6.0:
+                pixel = light
+            if (x + y * 2) % 17 < 2:
+                pixel = dark
+            return pixel
+        if blob < 1.05:
+            return dark
+        return clear
+
+    def big_rock(x, y):
+        # a chunk of mountain: same boulder, bigger and darker
+        dx = x - 15.5
+        dy = y - 17.5
+        blob = (dx * dx) / (14.0 * 14.0) + (dy * dy) / (12.0 * 12.0)
+        base = (110, 104, 96, 255)
+        dark = (64, 60, 56, 255)
+        light = (150, 146, 138, 255)
+        if blob < 0.9:
+            pixel = base
+            if dx + dy < -8.0:
+                pixel = light
+            if (x * 2 + y * 3) % 19 < 2:
+                pixel = dark
+            return pixel
+        if blob < 1.08:
+            return dark
+        return clear
+
+    def platform(x, y):
+        # wooden raft: a planked deck with darker seams and worn edges
+        wood = (158, 116, 66, 255)
+        wood_dark = (104, 74, 40, 255)
+        wood_light = (196, 152, 96, 255)
+        if x < 3 or y < 9 or x > 28 or y > 29:
+            return clear
+        if y in (9, 28) or x in (3, 28):
+            return wood_dark
+        if x in (7, 8) or x in (15, 16) or x in (23, 24):
+            return wood_dark  # plank seams
+        if y in (13, 14) or y in (19, 20) or y in (24, 25):
+            return wood_light  # worn highlights
+        if (x + y * 7) % 29 == 0:
+            return wood_dark
+        return wood
+
+    def hook_post(x, y):
+        # a stone pillar with a steel catch-ring the hookshot latches
+        stone = (142, 140, 152, 255)
+        stone_dark = (92, 90, 104, 255)
+        stone_light = (182, 180, 192, 255)
+        steel = (176, 182, 196, 255)
+        steel_dark = (110, 116, 132, 255)
+        # pillar
+        if 10 <= y <= 29 and 12 <= x <= 19:
+            if y == 29 or x in (12, 19):
+                return stone_dark
+            if x in (13, 14):
+                return stone_light
+            if (x * 3 + y * 5) % 17 < 2:
+                return stone_dark
+            return stone
+        # catch-ring above the pillar
+        dx = x - 15.5
+        dy = y - 7.5
+        rr = dx * dx + dy * dy
+        if 16 <= rr <= 26:
+            return steel
+        if 20 <= rr <= 24 and (x + y) % 3 == 0:
+            return steel_dark  # ring shadow
+        return clear
+
+    def somaria_block(x, y):
+        # a rune-crested block: the Somaria conjures it on clear ground
+        base = (170, 92, 96, 255)
+        dark = (112, 52, 62, 255)
+        light = (222, 140, 140, 255)
+        rune = (255, 230, 190, 255)
+        if x < 3 or y < 4 or x > 28 or y > 28:
+            return clear
+        if x in (3, 4) and y in range(4, 28):
+            return light
+        if y in (4, 5) or x in (27, 28) or y in (27, 28) or x == 3 or y == 4:
+            return dark
+        # the Somaria cross, glowing on the face
+        cx = x - 15.5
+        cy = y - 15.5
+        if (abs(cx) <= 1 and abs(cy) <= 7) or (abs(cy) <= 1 and abs(cx) <= 7):
+            if abs(cx) > 5 or abs(cy) > 5:
+                return dark
+            return rune
+        if (x + y * 5) % 17 < 2:
+            return dark
+        return base
+
+    def shrine(x, y):
+        # a stone altar with an offering bowl — magic powder wakes it
+        stone = (150, 148, 158, 255)
+        stone_dark = (98, 96, 108, 255)
+        stone_light = (188, 186, 196, 255)
+        bowl = (196, 178, 130, 255)
+        # stepped altar base
+        if 24 <= y <= 28 and 9 <= x <= 22:
+            if y in (24, 25) and 11 <= x <= 20:
+                return stone_light
+            if y == 28 or x in (9, 22):
+                return stone_dark
+            return stone
+        # altar column
+        if 14 <= y <= 23 and 12 <= x <= 19:
+            if x in (12, 13):
+                return stone_light
+            if x in (18, 19) or y == 23:
+                return stone_dark
+            if (x * 3 + y * 5) % 19 < 2:
+                return stone_dark
+            return stone
+        # offering bowl
+        dx = x - 15.5
+        dy = y - 11.0
+        if dx * dx / (6.5 * 6.5) + dy * dy / (3.0 * 3.0) < 1.0:
+            return stone_dark
+        if dx * dx / (4.5 * 4.5) + dy * dy / (1.8 * 1.8) < 1.0:
+            return bowl
+        return clear
+
+    def lever(x, y):
+        # wall-mounted pull handle: a plate with a lever leaning left
+        # (the engine mirrors the frame when the lever is pulled)
+        plate = (126, 118, 134, 255)
+        plate_dark = (84, 78, 92, 255)
+        plate_light = (166, 158, 174, 255)
+        handle = (196, 150, 62, 255)
+        handle_dark = (128, 92, 30, 255)
+        # plate
+        if 12 <= x <= 19 and 10 <= y <= 23:
+            if x in (12, 13):
+                return plate_light
+            if x in (18, 19) or y in (22, 23):
+                return plate_dark
+            if (x + y * 3) % 13 == 0:
+                return plate_dark
+            return plate
+        # handle pivots from the plate center, leaning left-up
+        dx = x - 16.0
+        dy = y - 16.5
+        along = dx * 0.94 + dy * 0.34  # along the leaning handle axis
+        across = -dx * 0.34 + dy * 0.94
+        if along < -12.5 or along > -1.0:
+            return clear
+        if abs(across) > 1.8:
+            return clear
+        if along > -11.0 and abs(across) < 1.2:
+            return handle  # grip
+        return handle_dark
+
+    def statue(x, y):        # stone guardian: pedestal, torso column, hooded head
+        stone = (150, 148, 158, 255)
+        stone_dark = (98, 96, 108, 255)
+        stone_light = (188, 186, 196, 255)
+        # pedestal
+        if 26 <= y <= 28 and 8 <= x <= 23:
+            return stone_dark if y == 28 or x in (8, 23) else stone
+        # torso column
+        if 12 <= y <= 25 and 11 <= x <= 20:
+            if x in (11, 12) and y < 24:
+                return stone_light
+            if x in (19, 20) or y == 25:
+                return stone_dark
+            if (x * 3 + y * 5) % 21 < 2:
+                return stone_dark
+            return stone
+        # hooded head
+        dx = x - 15.5
+        dy = y - 8.0
+        if dx * dx / (5.5 * 5.5) + dy * dy / (6.0 * 6.0) < 1.0:
+            if dx + dy > 3.5:
+                return stone_dark
+            return stone
+        # eye slits
+        if 6 <= y <= 7 and 13 <= x <= 18 and (x in (13, 14) or x in (17, 18)):
+            return stone_dark
+        return clear
+
     render = {"pot": pot, "bush": bush, "block": block,
               "switch": switch, "barrier": barrier, "sign": sign,
-              "torch": torch, "warp": warp, "crystal": crystal}.get(kind)
+              "torch": torch, "warp": warp, "crystal": crystal,
+              "rock": rock, "big_rock": big_rock, "statue": statue,
+              "lever": lever, "platform": platform,
+              "hook_post": hook_post, "somaria_block": somaria_block,
+              "shrine": shrine}.get(kind)
     if render is None:
         return False
     rows = []
@@ -2459,10 +2868,41 @@ def create_default_sfx(directory):
             out.append(math.sin(phase) * (1.0 - t * 0.7))
         return out
 
+    def synth_birds():
+        # ~6s of chirps over near-silence: an ambient loop placeholder.
+        rng = random.Random(27)
+        total = int(rate * 6.0)
+        out = [0.0] * total
+        for _ in range(14):
+            start = rng.randrange(0, total - int(rate * 0.3))
+            base = 1800.0 + rng.random() * 1400.0
+            length = int(rate * (0.06 + rng.random() * 0.12))
+            phase = 0.0
+            for i in range(length):
+                t = i / length
+                freq = base * (1.0 + 0.35 * math.sin(2 * math.pi * 5.0 * t))
+                phase += 2.0 * math.pi * freq / rate
+                out[start + i] += (math.sin(phase) * (1.0 - t)
+                                   * (0.25 + 0.2 * rng.random()))
+        return out
+
+    def synth_rain():
+        # 6s of lowpassed noise: a rain loop placeholder.
+        rng = random.Random(51)
+        total = int(rate * 6.0)
+        out = []
+        last = 0.0
+        for _ in range(total):
+            last = 0.92 * last + 0.08 * (rng.random() * 2.0 - 1.0)
+            out.append(last * 0.7)
+        return out
+
     created = []
     for name, samples in (("sword.wav", synth_sword()),
                           ("hurt.wav", synth_hurt()),
-                          ("fall.wav", synth_fall())):
+                          ("fall.wav", synth_fall()),
+                          ("birds.wav", synth_birds()),
+                          ("rain.wav", synth_rain())):
         path = os.path.join(directory, name)
         if os.path.exists(path):
             continue
@@ -2497,9 +2937,26 @@ def generate():
     object_types = load_object_types()
     OBJECT_INDEX.update({entry["name"]: i for i, entry in enumerate(object_types)})
 
+    # Somaria-style spawn references resolve to object type indices.
+    for item in items:
+        name = item.pop("spawnObjectName")
+        if not name:
+            item["spawnObjectIdx"] = -1
+            continue
+        item["spawnObjectIdx"] = OBJECT_INDEX.get(name, -1)
+        if item["spawnObjectIdx"] < 0:
+            warn("item '%s' spawns unknown object type '%s'"
+                 % (item["name"], name))
+
     flags = FlagRegistry()
     dialogues = load_dialogues(flags)
     dialogue_index = {d["name"]: i for i, d in enumerate(dialogues)}
+
+    # Item upgrade flags (silver arrows, magical boomerang) register into
+    # the same world-flag registry the dialogues fill.
+    for item in items:
+        item["upgradeFlagIdx"] = (flags.index(item.pop("upgradeFlagName"))
+                                  if item["upgradeFlagName"] else -1)
 
     # Placeholder sheets for characters that don't ship art (NPCs), before
     # the configs load (frame counts derive from the image).
@@ -2527,7 +2984,8 @@ def generate():
     tile_meta = load_tile_meta(tileset)
 
     rooms = load_rooms(dialogue_index, character_index, enemy_index,
-                       tileset["tileCount"] if tileset else 0)
+                       enemy_defs=enemies, flags=flags,
+                       tile_count=tileset["tileCount"] if tileset else 0)
 
     # Fixed-pool budget validation (the engine uses fixed-size arrays so
     # the console builds stay predictable; warn at bake instead of letting

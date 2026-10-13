@@ -17,8 +17,14 @@ enum HeroState
     HERO_HURT,
     HERO_FALL,
     HERO_SPLASH,   // walked into deep water: flinch, splash, bounce back
+    HERO_SWIM,     // deep water with flippers: stroke-glide swimming
     HERO_HOP,      // vaulted over a ledge tile: arc + landing dust
     HERO_LIFT,     // hoisting a liftable object overhead (resolves to carrying)
+    HERO_GRAB,     // holding a grabbable object (statue/block): pull to drag
+    HERO_HAMMER,   // hammer pound: windup, quake in the facing, recover
+    HERO_DIG,      // shovel: windup, turn over the tile ahead, recover
+    HERO_HOOKSHOT, // firing the chained hook: locked while it flies, yanked on latch
+    HERO_SPRINKLE, // magic powder: flick into the facing (main resolves the puff)
     HERO_DEAD,
     HERO_STATE_COUNT
 };
@@ -33,6 +39,9 @@ public:
     void place(int tileX, int tileY);
     void update(const Room& room, float dt);
     void draw() const;
+    // Shallow-water reflection: a flipped, translucent copy of the sprite
+    // mirrored below the feet (drawn by the y-sort pass before the hero).
+    void drawReflection() const;
 
     void tileUnder(int& tileX, int& tileY) const;
     Vector2 center() const;
@@ -53,6 +62,9 @@ public:
     // Shield passively blocks projectiles arriving from the faced direction
     // while the hero is free to move (walk/idle).
     bool shielding() const { return state_ == HERO_IDLE || state_ == HERO_WALK; }
+    // Active shield (held button): raised while free to move, slowing the
+    // walk and blocking a wider arc of projectiles.
+    bool guarding() const { return guarding_; }
     // Sword reach hitbox for the current swing frame (or the 360-degree spin
     // radius during a spin), or a zero rect otherwise. Enemies check this
     // while the swing is live.
@@ -74,6 +86,56 @@ public:
     // Hoist pause when picking a liftable object up off the ground.
     static const float LIFT_DURATION;
     void startLift();
+    // Grabbing a pullable object: the action button grabs it while the
+    // hero faces it (main pairs the grabbed object index); pressing away
+    // drags it one tile (main checks both paths before starting the
+    // pull). Releasing the action button lets go.
+    bool grabbing() const { return state_ == HERO_GRAB; }
+    bool pulling() const { return state_ == HERO_GRAB && pullActive; }
+    void startGrab();
+    void startPull(float dx, float dy);
+    // Hammer (use-action item): windup, then the pound (main lands the
+    // quake effects at HAMMER_WINDUP), then recover. attackBox() is live
+    // for the whole swing; hits dedupe by swing id like sword swings.
+    static const float HAMMER_WINDUP;
+    static const float HAMMER_DURATION;
+    void startHammer();
+    bool hammering() const { return state_ == HERO_HAMMER; }
+
+    // Shovel (use-action item): windup, then the dig (main turns over the
+    // tile ahead at DIG_WINDUP — drops + buried treasure), then recover.
+    static const float DIG_WINDUP;
+    static const float DIG_DURATION;
+    void startDig();
+    bool digging() const { return state_ == HERO_DIG; }
+
+    // Hookshot (use-action item): the hero stands locked while the chain
+    // flies (main owns the head); latching onto a hook target yanks the
+    // hero across — a collision-free glide over pits and water.
+    void startHookshot();
+    // Magic powder (use-action item): windup, then the puff in the facing
+    // (main resolves stuns/torches/shrines at SPRINKLE_WINDUP).
+    static const float SPRINKLE_WINDUP;
+    static const float SPRINKLE_DURATION;
+    void startSprinkle();
+    bool sprinkling() const { return state_ == HERO_SPRINKLE; }
+    void startHookPull(float targetX, float targetY);
+    void endHookshot();  // the chain resolved (main calls it)
+    bool hookshotting() const { return state_ == HERO_HOOKSHOT; }
+    bool hookPulling() const { return state_ == HERO_HOOKSHOT && hookPullActive; }
+    // Riding a moving platform (main computes the overlap each frame):
+    // tile hazards are suppressed — the platform is the ground underfoot.
+    void setRiding(bool riding) { riding_ = riding; }
+    bool riding() const { return riding_; }
+
+    // Protection (Byrna aura, magic cape): incoming damage is ignored
+    // while set — main recomputes it every frame from the item states.
+    void setProtected(bool isProtected) { protected_ = isProtected; }
+
+    // Cloak (magic cape): the hero blinks ghostly while set (main recomputes).
+    void setCloaked(bool isCloaked) { cloaked_ = isCloaked; }
+    bool cloaked() const { return cloaked_; }
+
     // Restore health (half-hearts), clamped at max.
     void heal(int halfHearts);
     // Heart container pickup: raises the max (half-hearts) and fills it.
@@ -89,18 +151,24 @@ public:
     // True while the hero is wading in shallow water (footstep sfx swap).
     bool wading() const { return wading_; }
 
+    // Swimming (deep water with flippers, as a passive item grants).
+    bool swimming() const { return state_ == HERO_SWIM; }
+    void setCanSwim(bool canSwim) { canSwim_ = canSwim; }
+    bool canSwim() const { return canSwim_; }
+
 private:
     void setState(HeroState next);
     void faceVector(float dx, float dy);
     void startFall();
     void startSplash();
+    void startSwim();
     void startHop(float dx, float dy, const Room& room);
     void startDeath();
     void startSpin();
     void startDash(float dx, float dy);
     bool slideWithCollision(const Room& room, float dx, float dy);
     void updateFootsteps(const Room& room, float movedDist, const Sound* overrideSfx = 0);
-    void drawFrame(int frame, float scaleX, float scaleY) const;
+    void drawFrame(int frame, float scaleX, float scaleY, float yOff = 0.0f) const;
 
     const CharacterConfig* cfg;
     Texture2D sheet;
@@ -115,6 +183,7 @@ private:
     Sound dieSfx;
     Sound splashSfx;
     Sound wadeSfx;
+    Sound swimSfx;
     Sound landSfx;
     Sound liftSfx;
     bool sfxLoaded;
@@ -146,6 +215,16 @@ private:
     float splashX;
     float splashY;
     bool wading_;
+    // Deep-water swimming (granted by a passive item): stroke impulses
+    // glide against water drag; ripples mark each stroke.
+    bool canSwim_;
+    float strokeTime;
+    // Riding a moving platform (see setRiding).
+    bool riding_;
+    // Protection (Byrna aura / magic cape): incoming damage ignored.
+    bool protected_;
+    // Cloak (magic cape): ghostly blink while set.
+    bool cloaked_;
     // Current input direction (see inputDir()).
     float inputX;
     float inputY;
@@ -157,4 +236,23 @@ private:
     bool hopLanded;
     // Carrying mode (see carrying()).
     bool carrying_;
+    // Raised shield (held button, idle/walk only): wider block arc + slow.
+    bool guarding_;
+    // Grab-and-pull (see grabbing()): one-tile backward glide while the
+    // grabbed object slides along in step (main drives the object).
+    bool pullActive;
+    float pullT;
+    float pullFromX;
+    float pullFromY;
+    float pullToX;
+    float pullToY;
+    // Hookshot yank (see startHookPull()): collision-free glide to the
+    // latched target; hazards are skipped until it lands.
+    bool hookPullActive;
+    float hookPullT;
+    float hookPullDuration;
+    float hookFromX;
+    float hookFromY;
+    float hookToX;
+    float hookToY;
 };

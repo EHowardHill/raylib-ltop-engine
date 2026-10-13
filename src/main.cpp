@@ -159,10 +159,16 @@ struct Projectile
     float dx;
     float dy;
     float speed;
-    int damage;  // half-hearts (rocks)
+    int damage;      // half-hearts (rocks, to the hero)
+    int enemyDamage;  // hits per strike on enemies (arrows; silver = 2)
 };
 static Projectile projectiles[8] = {};
 static int nextBeamSwingId = -1000;  // unique negative ids for beam hits
+
+// Buried treasure ("buried" room list): dug up once per visit (the shovel
+// turns the tile over; a dug spot stays empty until the room reloads).
+static const int MAX_BURIED = 16;
+static bool buriedDug[MAX_BURIED] = {};
 
 // Boomerang (the item button): flies out, homing return, stuns enemies and
 // fetches pickups. One in the air at a time.
@@ -183,8 +189,31 @@ struct Boomerang
     float dirY;
     bool returning;
     float time;
+    float speed;  // px/s outbound (the magical boomerang flies faster)
+    float range;  // px of outbound travel before the homing return
 };
 static Boomerang boomer = {};
+
+// Hookshot (the item): a chained hook on a wire. It flies out in the
+// facing; hooks latch onto hookable objects and reel the hero across
+// (over pits and water), everything else bounces the chain home. It
+// stuns enemies and collects pickups it touches on the way.
+struct Hookshot
+{
+    bool active;
+    bool retracting;   // chain returning to the hero
+    bool latched;      // reeling the hero in toward the latch point
+    float x;           // head center
+    float y;
+    float startX;      // hero's position at the throw
+    float startY;
+    float dirX;
+    float dirY;
+};
+static Hookshot hook = {};
+static Sound sndHookshot = {};
+static const float HOOK_SPEED = 420.0f;   // px/s chain flight
+static const float HOOK_RANGE = 176.0f;   // px of chain before recoil
 
 // World objects (pots, bushes): liftable, throwable, solid on the ground.
 // Rooms spawn their sets on entry; smashed objects return on room reload.
@@ -223,13 +252,20 @@ struct WorldObject
     float slideToX;
     float slideToY;
     float slideT;
+    // Moving platform (OBJINT_PLATFORM): tile waypoints glided in a loop.
+    const short* path;
+    int pathCount;
+    int pathIndex;   // waypoint the platform glides toward (x,y pairs)
+    float pathT;     // 0..1 progress of the current leg
+    float modeTimer;  // timed switches: seconds left once the weight leaves
     bool switchActive;    // switches: currently pressed/latched
     bool opened;           // chests: lid open (permanent until reload/save)
 };
 static WorldObject objects[MAX_OBJECTS] = {};
-static Texture2D objectSheets[16] = {};
+static Texture2D objectSheets[32] = {};
 static int carriedIndex = -1;   // objects[] index riding overhead
 static int liftingIndex = -1;   // objects[] index mid-hoist
+static int grabbedIndex = -1;   // objects[] index held in a grab (pullable)
 static int nextThrowId = -2000; // unique negative ids, like beam hits
 static Sound sndThrow = {};
 static Sound sndBreak = {};
@@ -238,6 +274,8 @@ static Sound sndMoveObject = {};
 static Sound sndButton = {};
 static Sound sndDoorOpen = {};
 static Sound sndDoorClose = {};
+static Sound sndHammerPound = {};
+static Sound sndDig = {};
 
 static Rectangle objectBox(const WorldObject& o);
 
@@ -245,6 +283,22 @@ static Rectangle objectBox(const WorldObject& o);
 // the save system lands. The demo starts with the full kit so it's all
 // reachable; chests/item-get sequences will grant these properly later.
 static Inventory inventory;
+
+// Toggle-item states (Byrna aura, magic cape): drain the magic meter
+// while on (updateToggleItems); Byrna protects the hero, the cape also
+// blinds enemy AI to them.
+static bool byrnaActive = false;
+static float byrnaDrain = 0.0f;
+static float byrnaSting = 0.0f;
+static bool capeActive = false;
+static float capeDrain = 0.0f;
+// Boss intro: entering a live arena holds the world while a letterbox
+// names the boss (~1.5s).
+static const float BOSS_INTRO_DURATION = 1.5f;
+static float bossIntroTime = 0.0f;
+static char bossIntroName[64] = "";
+static Sound sndBossIntro = {};
+
 static float shakeTime = 0.0f;
 static float shakeStrength = 0.0f;
 static float lowHpBeepTimer = 0.0f;
@@ -255,6 +309,16 @@ static bool itemOwnedQuery(int item)
     return item >= 0 && item < Inventory::MAX_ITEMS && inventory.owned[item];
 }
 
+// Shop seam for dialogue choices ("cost"): returns true when the wallet
+// covered the amount — deducting it — and false (nothing deducted) when
+// the pick can't be afforded.
+static bool tryPayRupeesQuery(int rupees)
+{
+    if (rupees < 0 || inventory.rupees < rupees) return false;
+    inventory.addRupees(-rupees);
+    return true;
+}
+
 // Passive light (the lantern, as data): the first owned item whose config
 // carries a light radius. Items are game-defined; no item id is
 // hard-coded here.
@@ -263,6 +327,41 @@ static int lightItemOwned()
     for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
         if (ITEMS[i].hasLight && inventory.owned[i]) return i;
     return -1;
+}
+
+// Swimming (flippers, as data): any owned item carrying the swim passive
+// makes deep water swimmable. Same shape as the lantern scan.
+static bool swimItemOwned()
+{
+    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
+        if (ITEMS[i].hasSwim && inventory.owned[i]) return true;
+    return false;
+}
+
+// Heavy lifting (gloves, as data): any owned item carrying the lift
+// passive lets the hero hoist heavy objects (big rocks, statues).
+static bool liftItemOwned()
+{
+    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
+        if (ITEMS[i].hasLift && inventory.owned[i]) return true;
+    return false;
+}
+
+// Compass (as data): any owned item carrying the compass passive marks
+// chest/boss rooms on the map tab.
+static bool compassItemOwned()
+{
+    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
+        if (ITEMS[i].hasCompass && inventory.owned[i]) return true;
+    return false;
+}
+
+// World-flag upgrade (silver arrows, magical boomerang): while the item's
+// upgrade flag is set, its use-action runs with the upgraded stats.
+static bool itemUpgraded(const ItemConfig& item)
+{
+    return item.upgradeFlag >= 0 && item.upgradeFlag < WORLD_FLAG_COUNT
+           && gWorldFlags[item.upgradeFlag];
 }
 
 // Enemy death drops: the enemy's own table when it has one, the engine
@@ -523,6 +622,7 @@ static void spawnProjectile(float x, float y, float dx, float dy, int damage)
         projectiles[i].dy = dy;
         projectiles[i].speed = 140.0f;
         projectiles[i].damage = damage;
+        projectiles[i].enemyDamage = 1;
         return;
     }
 }
@@ -553,11 +653,13 @@ static void spawnBeam(float x, float y, Direction facing)
         projectiles[i].dy = dy;
         projectiles[i].speed = 300.0f;
         projectiles[i].damage = 0;
+        projectiles[i].enemyDamage = 1;
         return;
     }
 }
 
-static void throwBoomerang(float x, float y, Direction facing)
+static void throwBoomerang(float x, float y, Direction facing,
+                            float speed, float range)
 {
     if (boomer.active) return;  // cannot be reused while airborne
     boomer.active = true;
@@ -569,6 +671,8 @@ static void throwBoomerang(float x, float y, Direction facing)
     boomer.dirX = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
     boomer.dirY = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
     boomer.time = 0.0f;
+    boomer.speed = speed;
+    boomer.range = range;
     // Throw sfx is item data (useSfx), played by the use interpreter.
 }
 
@@ -607,6 +711,7 @@ static Sound sndChestOpen = {};
 static Sound sndFanfare = {};
 static Sound sndFire = {};  // element vocabulary: fire ignites torches
 static Sound sndUseKey = {};
+static Sound sndFairy = {};
 static Sound sndBossDies = {};
 static Sound sndSecret = {};
 static Sound sndWarp = {};
@@ -669,8 +774,9 @@ static void recordBlastedTile(int roomIndex, int tileX, int tileY)
 
 static bool bossAliveInRoom()
 {
+    // The arena seal holds while a boss OR a mid-fight mini-boss lives.
     for (int i = 0; i < enemyCount; i++)
-        if (enemies[i].alive() && enemies[i].isBoss()) return true;
+        if (enemies[i].alive() && enemies[i].isArenaLock()) return true;
     return false;
 }
 
@@ -777,6 +883,7 @@ static Dialogue itemGetDialogue = { "item-get", 1, itemGetLines };
 static void clearWorldSystems();
 static void loadRoom(int index, int enterMotion = -1, int tileX = -1, int tileY = -1);
 static void startMusic(const char* file);
+static void startAmbient(const char* file);
 static void updateTitle();
 static void drawTitleScreen();
 
@@ -786,7 +893,7 @@ static void drawTitleScreen();
 // the browser.
 static void loadRoomFromSave(int room, int tileX, int tileY);
 static const int SAVE_MAGIC = 0x4C544F50;  // "LTOP"
-static const int SAVE_VERSION = 6;  // v6: per-game identity field
+static const int SAVE_VERSION = 7;  // v7: 20 item slots (owned[] widened)
 static const int SAVE_SLOT_COUNT = 3;     // selectable once a title screen exists
 static const int SAVE_FLAG_CAP = 256;
 static const int SAVE_ENCOUNTER_CAP = 512;
@@ -988,6 +1095,8 @@ static void resetGameState()
     blastCount = 0;
     worldRng.seed(0xC0FFEE1Au);
     lanternDrain = 0.0f;
+    byrnaActive = false;
+    capeActive = false;
     itemGet.active = false;
     clearWorldSystems();
 
@@ -1029,6 +1138,7 @@ static void quitToTitle()
     saveToFile(saveSlotInUse);
     gameState = STATE_TITLE;
     startMusic(NULL);
+    startAmbient(NULL);
 }
 
 static void updateTitle()
@@ -1249,7 +1359,8 @@ static void placeBomb(float x, float y)
 
 // Bow: spawn the arrow projectile (the use-action interpreter paid the
 // cost - arrows, or a rupee when the quiver is dry, LttP behavior).
-static void spawnArrow(float x, float y, Direction facing)
+static void spawnArrow(float x, float y, Direction facing, float speed,
+                       int enemyDamage)
 {
     for (int i = 0; i < 8; i++)
     {
@@ -1274,8 +1385,9 @@ static void spawnArrow(float x, float y, Direction facing)
         }
         projectiles[i].dx = dx;
         projectiles[i].dy = dy;
-        projectiles[i].speed = 340.0f;
+        projectiles[i].speed = speed;
         projectiles[i].damage = 0;
+        projectiles[i].enemyDamage = enemyDamage;
         return;
     }
 }
@@ -1316,6 +1428,94 @@ static void spawnElementProjectile(float x, float y, Direction facing, int eleme
 // The item button runs whatever is equipped. Items are game content: the
 // baked use-action composes the engine's vocabulary (costs + spawn kind +
 // sfx), and this interpreter runs it - no per-item branches exist.
+// Medallions (use-kind "medallion", the element decides the storm):
+// screen-wide bursts sweeping every enemy in the room — fire burns them
+// to ash, ice freezes them solid, and no element is the earth-quake
+// that flips them over. Arena bosses keep their armor (medallions
+// bounce off boss battles, like LttP).
+static void castMedallion(int element)
+{
+    playNamedSfx("spin energy.wav");
+
+    // Weather-ish visuals across the visible screen: embers rising,
+    // frost falling, or the whole ground shuddering.
+    float scale = virtualScale();
+    float left = camera.target.x - (float)GetScreenWidth() * 0.5f / scale;
+    float top = camera.target.y - VIRTUAL_HEIGHT * 0.5f;
+    float width = (float)GetScreenWidth() / scale;
+    float height = VIRTUAL_HEIGHT;
+
+    if (element == ELEMENT_FIRE)
+    {
+        // Bombos: the firestorm burns every enemy dead.
+        screenFlash(0.35f, Color{ 255, 170, 70, 255 }, 0.45f);
+        shakeTime = 0.5f;
+        shakeStrength = 5.0f;
+        playNamedSfx("fire.wav");
+        for (int i = 0; i < 24; i++)
+        {
+            spawnParticles(left + worldRng.nextFloat() * width,
+                           top + worldRng.nextFloat() * height,
+                           1, 255, 150, 50, 40.0f, 160.0f);
+        }
+        for (int e = 0; e < enemyCount; e++)
+        {
+            if (!enemies[e].alive() || enemies[e].isBoss()) continue;
+            Vector2 c = enemies[e].center();
+            if (enemies[e].tryHit(Rectangle{ c.x - 44.0f, c.y - 44.0f, 88.0f, 88.0f },
+                                   nextBeamSwingId--, Vector2{ 0.0f, -1.0f }, 99))
+            {
+                PlaySound(sndEnemyDie);
+                spawnPoof(c.x, c.y);
+                spawnParticles(c.x, c.y, 6, 255, 140, 40, 90.0f, 140.0f);
+                int drop = rollEnemyDrop(enemies[e]);
+                if (drop != PICKUP_NONE)
+                    spawnPickup(drop, c.x - 8.0f, c.y - 8.0f);
+            }
+        }
+        return;
+    }
+
+    if (element == ELEMENT_ICE)
+    {
+        // Ether: the air freezes solid — everything afloat stands still.
+        screenFlash(0.35f, Color{ 150, 200, 255, 255 }, 0.45f);
+        playNamedSfx("ice rod.wav");
+        for (int i = 0; i < 24; i++)
+        {
+            spawnParticles(left + worldRng.nextFloat() * width, top - 6.0f,
+                           1, 190, 220, 255, 26.0f, 40.0f);
+        }
+        for (int e = 0; e < enemyCount; e++)
+        {
+            if (!enemies[e].alive() || enemies[e].isBoss()) continue;
+            enemies[e].freeze(4.0f);
+            PlaySound(sndBoomerangHit);
+        }
+        return;
+    }
+
+    // Quake: the ground bucks and every enemy flips over on its back.
+    screenFlash(0.30f, Color{ 210, 205, 190, 255 }, 0.35f);
+    shakeTime = 0.6f;
+    shakeStrength = 7.0f;
+    playNamedSfx("quake 2.wav");
+    for (int i = 0; i < 24; i++)
+    {
+        spawnParticles(left + worldRng.nextFloat() * width,
+                       top + height - 4.0f,
+                       1, 150, 120, 90, 70.0f, 120.0f);
+    }
+    for (int e = 0; e < enemyCount; e++)
+    {
+        if (!enemies[e].alive() || enemies[e].isBoss()) continue;
+        enemies[e].stun(1.5f);
+    }
+}
+
+// Somaria-style block conjuring (defined later, beside the object pool).
+static void toggleSomariaBlock(const ItemConfig& item);
+
 static void useEquippedItem()
 {
     if (inventory.equippedItem < 0 || inventory.equippedItem >= ITEM_COUNT) return;
@@ -1364,10 +1564,20 @@ static void useEquippedItem()
     switch (item.useKind)
     {
     case ITEM_USE_BOOMERANG:
-        throwBoomerang(heroCenter.x, heroCenter.y, hero.facingDirection());
+        // The magical upgrade flies faster and reaches farther.
+        throwBoomerang(heroCenter.x, heroCenter.y, hero.facingDirection(),
+                       itemUpgraded(item) && item.upgradeSpeed > 0
+                           ? (float)item.upgradeSpeed : 200.0f,
+                       itemUpgraded(item) && item.upgradeSpeed > 0
+                           ? 176.0f : 104.0f);
         break;
     case ITEM_USE_ARROW:
-        spawnArrow(heroCenter.x, heroCenter.y, hero.facingDirection());
+        // Silver arrows strike harder as well as faster.
+        spawnArrow(heroCenter.x, heroCenter.y, hero.facingDirection(),
+                   itemUpgraded(item) && item.upgradeSpeed > 0
+                       ? (float)item.upgradeSpeed : 340.0f,
+                   itemUpgraded(item) && item.upgradeDamage > 0
+                       ? item.upgradeDamage : 1);
         break;
     case ITEM_USE_BOMB:
         // Placed at the hero's feet (bottom of the sprite).
@@ -1376,6 +1586,82 @@ static void useEquippedItem()
     case ITEM_USE_BOLT:
         spawnElementProjectile(heroCenter.x, heroCenter.y, hero.facingDirection(),
                                item.element);
+        break;
+    case ITEM_USE_HAMMER:
+        // The hero pounds: windup, then the quake lands in the facing
+        // (updateHammer resolves the effects at HAMMER_WINDUP).
+        hero.startHammer();
+        break;
+    case ITEM_USE_SHOVEL:
+        // The hero digs: windup, then the tile ahead turns over
+        // (updateShovel resolves the dig at DIG_WINDUP).
+        hero.startDig();
+        break;
+    case ITEM_USE_HOOKSHOT:
+        // The chained hook flies from the hero's hands (only one airborne;
+        // the hero stays locked until the chain resolves).
+        if (!hook.active)
+        {
+            Vector2 c = hero.center();
+            Direction facing = hero.facingDirection();
+            hook.active = true;
+            hook.retracting = false;
+            hook.latched = false;
+            hook.x = c.x;
+            hook.y = c.y;
+            hook.startX = c.x;
+            hook.startY = c.y;
+            hook.dirX = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+            hook.dirY = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+            hero.startHookshot();
+            PlaySound(sndHookshot);
+        }
+        break;
+    case ITEM_USE_MEDALLION:
+        // Screen-wide element burst; the element decides the storm.
+        castMedallion(item.element);
+        break;
+    case ITEM_USE_BYRNA:
+        // Toggle the protective aura; it drains the meter while on.
+        if (byrnaActive)
+        {
+            byrnaActive = false;
+        }
+        else if (inventory.magic > 0)
+        {
+            byrnaActive = true;
+            byrnaDrain = 0.0f;
+            byrnaSting = 0.0f;
+        }
+        else
+        {
+            PlaySound(sndError);  // nothing in the meter to burn
+        }
+        break;
+    case ITEM_USE_CAPE:
+        // Toggle the ghost cloak; it drains the meter while on.
+        if (capeActive)
+        {
+            capeActive = false;
+        }
+        else if (inventory.magic > 0)
+        {
+            capeActive = true;
+            capeDrain = 0.0f;
+        }
+        else
+        {
+            PlaySound(sndError);
+        }
+        break;
+    case ITEM_USE_SOMARIA:
+        // Conjure/shatter the linked block type (puzzle payloads).
+        toggleSomariaBlock(item);
+        break;
+    case ITEM_USE_POWDER:
+        // Sprinkle in the facing (updatePowder resolves the puff at
+        // SPRINKLE_WINDUP: stuns, torches, shrines).
+        hero.startSprinkle();
         break;
     default:
         PlaySound(sndError);
@@ -1394,9 +1680,14 @@ static void clearWorldSystems()
     for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
     for (int i = 0; i < 8; i++) projectiles[i].active = false;
     boomer.active = false;
+    hook.active = false;
+    hook.retracting = false;
+    hook.latched = false;
     for (int i = 0; i < MAX_OBJECTS; i++) objects[i].active = false;
     carriedIndex = -1;
     liftingIndex = -1;
+    grabbedIndex = -1;
+    for (int i = 0; i < MAX_BURIED; i++) buriedDug[i] = false;
     for (int i = 0; i < MAX_BOMBS_LIVE; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     for (int i = 0; i < MAX_NPCS; i++) npcs[i].active = false;
@@ -1452,6 +1743,53 @@ static void startMusic(const char* file)
     strcpy(musicFile, path);
     musicLoaded = true;
     PlayMusicStream(music);
+}
+
+// Room ambience (birds, rain): a second, quieter music stream that loops
+// under the bgm. Same no-restart convention as the music.
+static Music ambientMusic = {};
+static bool ambientLoaded = false;
+static char ambientFile[600] = "";
+
+static void startAmbient(const char* file)
+{
+    char path[600];
+    if (file && file[0])
+    {
+        snprintf(path, sizeof(path), "assets/audio/%s", file);
+    }
+    else
+    {
+        path[0] = '\0';
+    }
+
+    if (path[0] == '\0')
+    {
+        if (ambientLoaded)
+        {
+            StopMusicStream(ambientMusic);
+            UnloadMusicStream(ambientMusic);
+            ambientLoaded = false;
+        }
+        ambientFile[0] = '\0';
+        return;
+    }
+
+    if (ambientLoaded && strcmp(ambientFile, path) == 0) return;
+
+    if (ambientLoaded)
+    {
+        StopMusicStream(ambientMusic);
+        UnloadMusicStream(ambientMusic);
+        ambientLoaded = false;
+    }
+
+    ambientMusic = LoadMusicStream(path);
+    ambientMusic.looping = true;
+    strcpy(ambientFile, path);
+    ambientLoaded = true;
+    SetMusicVolume(ambientMusic, 0.55f);
+    PlayMusicStream(ambientMusic);
 }
 
 static Texture2D heartsTexture = {};
@@ -1603,6 +1941,112 @@ static void drawDarkness()
     EndBlendMode();
 }
 
+// Weather (room "weather", engine vocabulary): pure presentation over
+// the world in screen space — rain streaks, storm lightning, fog bands.
+// The seeded Rng drives the particle seeding and lightning cadence so
+// weather stays deterministic like every other world roll.
+static const int RAIN_DROPS = 90;
+struct RainDrop
+{
+    float x;
+    float y;
+    float speed;
+};
+static RainDrop rain[RAIN_DROPS] = {};
+static bool rainSeeded = false;
+static float lightningTimer = 8.0f;
+static Sound sndThunder = {};
+
+static void updateWeather(float dt)
+{
+    int weather = room.config().weather;
+    if (weather == WEATHER_NONE) return;
+
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    if (!rainSeeded)
+    {
+        rainSeeded = true;
+        for (int i = 0; i < RAIN_DROPS; i++)
+        {
+            rain[i].x = worldRng.nextFloat() * (float)sw;
+            rain[i].y = worldRng.nextFloat() * (float)sh;
+            rain[i].speed = 380.0f + worldRng.nextFloat() * 190.0f;
+        }
+    }
+
+    if (weather == WEATHER_RAIN || weather == WEATHER_STORM)
+    {
+        for (int i = 0; i < RAIN_DROPS; i++)
+        {
+            rain[i].y += rain[i].speed * dt;
+            rain[i].x -= 46.0f * dt;  // slight wind slant
+            if (rain[i].y > (float)sh || rain[i].x < -12.0f)
+            {
+                rain[i].y = -12.0f;
+                rain[i].x = worldRng.nextFloat() * ((float)sw + 40.0f);
+            }
+        }
+    }
+
+    if (weather == WEATHER_STORM)
+    {
+        lightningTimer -= dt;
+        if (lightningTimer <= 0.0f)
+        {
+            lightningTimer = 6.0f + worldRng.nextFloat() * 8.0f;
+            screenFlash(0.26f, Color{ 240, 240, 255, 255 }, 0.55f);
+            PlaySound(sndThunder);
+        }
+    }
+}
+
+static void drawWeather()
+{
+    int weather = room.config().weather;
+    if (weather == WEATHER_NONE) return;
+
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    if (weather == WEATHER_RAIN || weather == WEATHER_STORM)
+    {
+        for (int i = 0; i < RAIN_DROPS; i++)
+        {
+            DrawLine((int)rain[i].x, (int)rain[i].y,
+                     (int)(rain[i].x + 2.6f), (int)(rain[i].y + 8.5f),
+                     Color{ 150, 175, 215, 130 });
+        }
+    }
+
+    if (weather == WEATHER_FOG || weather == WEATHER_STORM)
+    {
+        // Drifting fog bands (storm fog runs under the rain for weight).
+        float t = (float)GetTime();
+        for (int band = 0; band < 3; band++)
+        {
+            float y = (float)(sh / 4) + (float)band * (sh / 4.0f)
+                      + sinf(t * (0.13f + band * 0.05f) + band * 2.1f) * 18.0f;
+            unsigned char alpha = (unsigned char)(36 - band * 8);
+            DrawRectangle(0, (int)y, sw, sh / 8 + 14, Color{ 200, 208, 222, alpha });
+        }
+    }
+}
+
+// Ambient tint (room "tint" / "night"): a color multiply over the world
+// (under the HUD), composing with dark rooms the way the lightmap does.
+static void drawTint()
+{
+    const RoomConfig& cfg = room.config();
+    if (cfg.tintR >= 255 && cfg.tintG >= 255 && cfg.tintB >= 255) return;
+    BeginBlendMode(BLEND_MULTIPLIED);
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(),
+                  Color{ (unsigned char)cfg.tintR, (unsigned char)cfg.tintG,
+                         (unsigned char)cfg.tintB, 255 });
+    EndBlendMode();
+}
+
 static void drawHud()
 {
     // Hearts row in virtual pixels over the world: 16x16 each, 1px gap.
@@ -1661,11 +2105,12 @@ static void drawHud()
                  (int)(38.0f * scale), (int)(8 * scale), Color{ 250, 220, 120, 255 });
     }
 
-    // Arena boss health bar, bottom-center while the fight rages.
+    // Arena boss (and mid-fight mini-boss) health bar, bottom-center while
+    // the fight rages.
     for (int i = 0; i < enemyCount; i++)
     {
         const Enemy& boss = enemies[i];
-        if (!boss.alive() || !boss.isBoss()) continue;
+        if (!boss.alive() || !boss.isArenaLock()) continue;
 
         float barW = 120.0f * scale;
         float barH = 6.0f * scale;
@@ -1762,8 +2207,34 @@ static void drawToasts()
     }
 }
 
-static void updatePauseMenu()
+// Flute (use-kind "flute"): the bird-summon fast travel. The item button
+// opens a destination picker over the visited-room map; picking a room
+// flies the hero there on the bird (fade-in at the room's spawn tile,
+// banked like every warp).
+static bool fluteMenu = false;
+static int fluteCursor = 0;
+static Sound sndFlap = {};
+
+static void updateFluteMenu()
 {
+    static float mapX[MAX_ROOM_MARKS];
+    static float mapY[MAX_ROOM_MARKS];
+    int roomTotal = ROOM_COUNT < MAX_ROOM_MARKS ? ROOM_COUNT : MAX_ROOM_MARKS;
+    mapLayout(mapX, mapY, roomTotal);
+
+    // Anything but arrows/action cancels.
+    if (swordPressed() || itemPressed() || dashPressed())
+    {
+        fluteMenu = false;
+        return;
+    }
+
+    // Directional cursor: hop to the nearest visited room along the press.
+    int moveX = 0;
+    int moveY = 0;
+    if (IsKeyPressed(KEY_LEFT) || IsGamepadButtonPressed(...)) ...
+```
+Hmm let me just write it directly. Then drawFluteMenu and the wiring. Let me write the full code block.<tool_call>edit<arg_key>filePath</arg_key><arg_value>/Users/ehill/Documents/GitHub/raylib-ltop-engine/src/main.cpp
     // Save-and-quit works from either tab.
     if (dashPressed())
     {
@@ -1930,6 +2401,21 @@ static void drawPauseOverlay()
                 DrawCircle((int)(cell.x + cell.width * 0.5f),
                            (int)(cell.y + cell.height * 0.5f), 2.5f * scale, RAYWHITE);
             }
+
+            // Compass (as data): with the passive owned, the map marks
+            // chest rooms (gold) and boss rooms (red).
+            if (compassItemOwned() && (ROOMS[i].hasChest || ROOMS[i].hasBoss))
+            {
+                if (ROOMS[i].hasChest)
+                    DrawRectangle((int)(cell.x + cell.width * 0.18f),
+                                  (int)(cell.y + cell.height * 0.5f - 2.0f * scale),
+                                  (int)(4.0f * scale), (int)(4.0f * scale),
+                                  Color{ 235, 200, 70, 255 });
+                if (ROOMS[i].hasBoss)
+                    DrawCircle((int)(cell.x + cell.width * 0.72f),
+                               (int)(cell.y + cell.height * 0.55f),
+                               2.5f * scale, Color{ 225, 80, 80, 255 });
+            }
         }
         return;
     }
@@ -2038,7 +2524,9 @@ static void placeHeroAtEntry(const RoomConfig& cfg, int enterMotion)
             int py = horizontal ? probe : fixed;
             if (cfg.colliders[py * w + px] != 0) continue;
             TileMeta meta = room.tileMetaAt(px, py);
-            if (meta.flags & (TILE_FLAG_PIT | TILE_FLAG_WATER_DEEP)) continue;
+            if (meta.flags & TILE_FLAG_PIT) continue;
+            // Deep water is a fine landing with flippers (swim in).
+            if (!swimItemOwned() && (meta.flags & TILE_FLAG_WATER_DEEP)) continue;
             ok = true;
             tx = px;
             ty = py;
@@ -2117,6 +2605,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
     }
 
     startMusic(cfg.music);
+    startAmbient(cfg.ambient);
 
     prevTileX = -1;
     prevTileY = -1;
@@ -2125,6 +2614,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
     // room reloads).
     clearWorldSystems();
     enemyCount = cfg.enemyCount < 16 ? cfg.enemyCount : 16;
+    bool bossLives = false;
     for (int i = 0; i < enemyCount; i++)
     {
         const EnemySpawn& spawn = cfg.enemies[i];
@@ -2136,7 +2626,17 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
             && bossDefeated[bossSlot]) continue;
         enemies[i].spawn(ENEMIES[spawn.enemy], enemySheets[spawn.enemy],
                          spawn.tileX, spawn.tileY);
+        if (ENEMIES[spawn.enemy].boss)
+        {
+            bossLives = true;
+            snprintf(bossIntroName, sizeof(bossIntroName), "%s",
+                     ENEMIES[spawn.enemy].name);
+        }
     }
+    // Entering a live arena plays the intro beat: the world holds while
+    // the letterbox names the boss.
+    bossIntroTime = bossLives ? BOSS_INTRO_DURATION : 0.0f;
+    if (bossLives) PlaySound(sndBossIntro);
 
     // Objects (pots, bushes): fresh copies each entry, like LttP pots that
     // are back on the next visit.
@@ -2169,6 +2669,12 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         objects[i].slideToY = objects[i].y;
         objects[i].slideT = 0.0f;
         objects[i].switchActive = false;
+        // Platform rail (OBJINT_PLATFORM): start at the first waypoint.
+        objects[i].path = spawn.path;
+        objects[i].pathCount = spawn.pathCount;
+        objects[i].pathIndex = 0;
+        objects[i].pathT = 0.0f;
+        objects[i].modeTimer = 0.0f;
         // Chests stay open across reloads (permanent-until-save registry).
         {
             int slot = index * MAX_OBJECTS + i;
@@ -2355,6 +2861,18 @@ static void collectPickup(Pickup& p)
         hero.addMaxHearts(2);
         PlaySound(sndItemGet);
         break;
+    case PICKUP_FAIRY:
+        // A caught fairy: a full refill of hearts and magic, on the wing.
+        hero.heal(hero.maxHealthHalves());
+        inventory.addMagic(inventory.magicMax);
+        spawnParticles(p.x + 8.0f, p.y + 8.0f, 10, 255, 200, 220,
+                       60.0f, 90.0f);
+        PlaySound(sndFairy);
+        break;
+    case PICKUP_KEY:
+        inventory.smallKeys++;
+        PlaySound(sndUseKey);
+        break;
     default:
         break;
     }
@@ -2366,7 +2884,8 @@ static void updateGrass()
     // One cut pass per offensive action (swing/spin/dash): tiles overlapped
     // by the active hitbox get cut.
     static int lastCutSwing = -1;
-    bool cutting = hero.attacking() || hero.spinning() || hero.dashing();
+    bool cutting = hero.attacking() || hero.spinning() || hero.dashing()
+                   || hero.hammering();
     if (!cutting) return;
     if (hero.swingId() == lastCutSwing) return;
     lastCutSwing = hero.swingId();
@@ -2565,6 +3084,9 @@ static void applyChestGrant(int kind, int param)
     case GRANTEFFECT_ADD_HEARTS: hero.addMaxHearts(2); break;
     case GRANTEFFECT_ADD_SMALL_KEY: inventory.smallKeys++; break;
     case GRANTEFFECT_ADD_BIG_KEY: inventory.bigKeys++; break;
+    case GRANTEFFECT_SET_FLAG:
+        if (param >= 0 && param < WORLD_FLAG_COUNT) gWorldFlags[param] = true;
+        break;
     default: break;
     }
 }
@@ -2899,14 +3421,22 @@ static bool updateObjectActions()
 
     // Lift: a liftable ground-state object overlapping a probe in front of
     // the hero (pots and bushes; blocks/signs/barriers aren't liftable).
+    // Heavy objects (big rocks) need the lift passive (gloves) to hoist.
     Rectangle probe = { heroBox.x + dx * 20.0f, heroBox.y + dy * 20.0f,
                         heroBox.width, heroBox.height };
     int best = -1;
     float bestDist = 1e9f;
+    bool heavy = false;
+    bool canLiftHeavy = liftItemOwned();
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         if (!objects[i].active || objects[i].state != OBJ_GROUND) continue;
         if (!objectLiftable(objects[i].type)) continue;
+        if (objInteracts(objects[i], OBJINT_HEAVY) && !canLiftHeavy)
+        {
+            heavy = true;
+            continue;
+        }
         if (!overlap(probe, objectBox(objects[i]))) continue;
         float dist = fabsf(objects[i].x - heroBox.x) + fabsf(objects[i].y - heroBox.y);
         if (dist < bestDist)
@@ -2915,7 +3445,25 @@ static bool updateObjectActions()
             best = i;
         }
     }
-    if (best < 0) return false;
+    if (best < 0)
+    {
+        // Grab: a pullable ground-state object in front (statues, blocks)
+        // — the hero holds it, and pressing away drags it one tile
+        // (updateGrabPull). Falls through here, so a liftable object
+        // lifts instead of grabbing.
+        for (int i = 0; i < MAX_OBJECTS; i++)
+        {
+            WorldObject& o = objects[i];
+            if (!o.active || !objInteracts(o, OBJINT_PULLABLE)) continue;
+            if (o.state != OBJ_GROUND) continue;
+            if (!overlap(probe, objectBox(o))) continue;
+            grabbedIndex = i;
+            hero.startGrab();
+            return true;
+        }
+        if (heavy) PlaySound(sndError);  // bare-handed hero, giant rock
+        return false;
+    }
 
     // Pot ambush ("hides" enemy): lifting reveals what was living
     // underneath — the room's shutter logic sees it too, like LttP.
@@ -3000,6 +3548,417 @@ static void updatePushBlocks(float dt)
     }
 }
 
+// Grab-and-pull: the hero holds a pullable object (grab via the action
+// button); pressing straight away from it drags the pair one tile — the
+// object follows into the tile the hero vacates. Both paths are checked
+// before the pull starts, then the hero glides and the object slides in
+// step (matching durations), so the settle logic (latch switches, sink
+// blocks) treats a pull exactly like a push.
+static void updateGrabPull()
+{
+    if (grabbedIndex < 0) return;
+    if (!hero.grabbing())
+    {
+        grabbedIndex = -1;
+        return;
+    }
+    if (hero.pulling()) return;
+
+    WorldObject& o = objects[grabbedIndex];
+    if (!o.active || o.state != OBJ_GROUND)
+    {
+        grabbedIndex = -1;
+        return;
+    }
+
+    // Pull trigger: pressing the exact opposite of the facing it was
+    // grabbed with (the hero walked up facing the object).
+    Direction facing = hero.facingDirection();
+    float faceX = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+    float faceY = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+    Vector2 input = hero.inputDir();
+    if (input.x != -faceX || input.y != -faceY) return;
+
+    float pullX = -faceX;
+    float pullY = -faceY;
+
+    // Levers don't travel: pulling one flips the handle instead (the hero
+    // still does the pull stumble) and the link group's barriers follow
+    // like a switch group — a re-pull flips it back.
+    if (objInteracts(o, OBJINT_LEVER))
+    {
+        o.switchActive = !o.switchActive;
+        PlaySound(sndButton);
+        hero.startPull(pullX, pullY);
+        return;
+    }
+
+    // The object's destination is the hero's current tile (it follows the
+    // hero); the hero's is one tile further back. Both must be clear.
+    int tileX = (int)((o.x + TILE_SIZE * 0.5f) / TILE_SIZE);
+    int tileY = (int)((o.y + TILE_SIZE * 0.5f) / TILE_SIZE);
+    float destX = (float)((tileX + (int)pullX) * TILE_SIZE);
+    float destY = (float)((tileY + (int)pullY) * TILE_SIZE);
+    Rectangle destBox = { destX + 6.0f, destY + 12.0f, 20.0f, 16.0f };
+    if (objectBlockedExcept(destBox, grabbedIndex)) return;
+
+    Rectangle heroBox = hero.box();
+    Rectangle heroDest = { heroBox.x + pullX * TILE_SIZE,
+                           heroBox.y + pullY * TILE_SIZE,
+                           heroBox.width, heroBox.height };
+    if (room.solidBox(heroDest)) return;
+
+    o.state = OBJ_SLIDING;
+    o.slideFromX = o.x;
+    o.slideFromY = o.y;
+    o.slideToX = destX;
+    o.slideToY = destY;
+    o.slideT = 0.0f;
+    o.pushTimer = 0.0f;
+    hero.startPull(pullX, pullY);
+    PlaySound(sndMoveObject);
+}
+
+// Timed switches ("mode": "timed"): how long the plate holds after the
+// weight leaves.
+static const float TIMED_SWITCH_SECONDS = 3.0f;
+
+// Toggle items (Byrna aura, magic cape): pressing the item button flips
+// them on; each drains a magic half every 2 seconds while on and falls
+// off the moment the meter empties. Byrna's aura makes the hero
+// untouchable and stings whatever presses against it; the cape turns
+// the hero ghostly and enemies lose sight of them.
+static void updateToggleItems(float dt)
+{
+    if (byrnaActive)
+    {
+        byrnaDrain += dt;
+        if (byrnaDrain >= 2.0f)
+        {
+            byrnaDrain = 0.0f;
+            inventory.magic--;
+            if (inventory.magic <= 0)
+            {
+                inventory.magic = 0;
+                byrnaActive = false;
+            }
+        }
+        byrnaSting += dt;
+        if (byrnaSting >= 0.8f)
+        {
+            // The aura stings whatever is pressed against the hero.
+            byrnaSting = 0.0f;
+            Rectangle aura = hero.box();
+            for (int e = 0; e < enemyCount; e++)
+            {
+                if (!enemies[e].alive()) continue;
+                if (!overlap(aura, enemies[e].box())) continue;
+                Vector2 c = enemies[e].center();
+                if (enemies[e].tryHit(aura, nextBeamSwingId--,
+                                       Vector2{ c.x - hero.center().x,
+                                                c.y - hero.center().y }))
+                {
+                    PlaySound(sndEnemyDie);
+                    spawnPoof(c.x, c.y);
+                    int drop = rollEnemyDrop(enemies[e]);
+                    if (drop != PICKUP_NONE)
+                        spawnPickup(drop, c.x - 8.0f, c.y - 8.0f);
+                }
+            }
+        }
+    }
+    if (capeActive)
+    {
+        capeDrain += dt;
+        if (capeDrain >= 2.0f)
+        {
+            capeDrain = 0.0f;
+            inventory.magic--;
+            if (inventory.magic <= 0)
+            {
+                inventory.magic = 0;
+                capeActive = false;
+            }
+        }
+    }
+    hero.setProtected(byrnaActive || capeActive);
+    hero.setCloaked(capeActive);
+}
+
+// Somaria-style use-actions ("spawn" on the item): the item button
+// conjures the linked block type in front of the hero (on clear ground),
+// or shatters it where it stands — push it onto switches for puzzles.
+// Room-local: the block is gone when the room reloads.
+static void toggleSomariaBlock(const ItemConfig& item)
+{
+    if (item.spawnObject < 0 || item.spawnObject >= OBJECT_COUNT)
+    {
+        PlaySound(sndError);
+        return;
+    }
+
+    // Existing block of the type: shatter it.
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        WorldObject& o = objects[i];
+        if (!o.active || o.type != item.spawnObject) continue;
+        spawnPoof(o.x + 16.0f, o.y + 16.0f);
+        o.active = false;
+        return;
+    }
+
+    // None out there: conjure one on the tile in front of the hero.
+    Rectangle heroBox = hero.box();
+    Direction facing = hero.facingDirection();
+    float dx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+    float dy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+    int tx = (int)((heroBox.x + heroBox.width * 0.5f + dx * 22.0f) / TILE_SIZE);
+    int ty = (int)((heroBox.y + heroBox.height * 0.5f + dy * 22.0f) / TILE_SIZE);
+    Rectangle spot = { (float)(tx * TILE_SIZE) + 4.0f,
+                       (float)(ty * TILE_SIZE) + 4.0f, 24.0f, 24.0f };
+    if (room.solidBox(spot))  // walls, other objects, the hero itself
+    {
+        PlaySound(sndError);
+        return;
+    }
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        if (objects[i].active) continue;
+        WorldObject& o = objects[i];
+        o.active = true;
+        o.type = item.spawnObject;
+        o.state = OBJ_GROUND;
+        o.x = (float)(tx * TILE_SIZE);
+        o.y = (float)(ty * TILE_SIZE);
+        o.groundX = o.x;
+        o.groundY = o.y;
+        o.velX = 0.0f;
+        o.velY = 0.0f;
+        o.z = 0.0f;
+        o.vz = 0.0f;
+        o.aux1 = -1;
+        o.aux2 = 0;
+        o.aux3 = 0;
+        o.pushTimer = 0.0f;
+        o.pushDirX = 0.0f;
+        o.pushDirY = 0.0f;
+        o.slideFromX = o.x;
+        o.slideFromY = o.y;
+        o.slideToX = o.x;
+        o.slideToY = o.y;
+        o.slideT = 0.0f;
+        o.switchActive = false;
+        o.opened = false;
+        o.path = 0;
+        o.pathCount = 0;
+        o.pathIndex = 0;
+        o.pathT = 0.0f;
+        o.modeTimer = 0.0f;
+        spawnPoof(o.x + 16.0f, o.y + 16.0f);
+        return;
+    }
+    PlaySound(sndError);  // no free object slot this visit
+}
+
+// Moving platforms (OBJINT_PLATFORM): a rail of tile waypoints glided in a
+// loop at raft speed. Whoever stands on the platform (the hero) rides
+// along with its per-frame delta, and riding suppresses tile hazards —
+// a raft over deep water carries the hero without a swim.
+static const float PLATFORM_SPEED = 34.0f;  // px/s along the rail
+
+static void updatePlatforms(float dt)
+{
+    bool riding = false;
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        WorldObject& o = objects[i];
+        if (!o.active || !objInteracts(o, OBJINT_PLATFORM)) continue;
+        if (o.pathCount < 2 || !o.path) continue;
+
+        float oldX = o.x;
+        float oldY = o.y;
+
+        // Glide the current leg; short legs may complete several times in
+        // one frame (guarded against pathological loops).
+        int guard = 0;
+        while (guard++ < 8)
+        {
+            int from = o.pathIndex;
+            int to = (from + 1) % o.pathCount;
+            float fx = (float)(o.path[from * 2] * TILE_SIZE);
+            float fy = (float)(o.path[from * 2 + 1] * TILE_SIZE);
+            float tx = (float)(o.path[to * 2] * TILE_SIZE);
+            float ty = (float)(o.path[to * 2 + 1] * TILE_SIZE);
+            float legX = tx - fx;
+            float legY = ty - fy;
+            float legLen = sqrtf(legX * legX + legY * legY);
+            if (legLen <= 0.0001f)
+            {
+                o.pathIndex = to;
+                continue;
+            }
+            o.pathT += dt * PLATFORM_SPEED / legLen;
+            if (o.pathT < 1.0f)
+            {
+                o.x = fx + legX * o.pathT;
+                o.y = fy + legY * o.pathT;
+                break;
+            }
+            // Leg complete: land exactly on the waypoint and take the next.
+            o.x = tx;
+            o.y = ty;
+            o.pathIndex = to;
+            o.pathT = 0.0f;
+        }
+
+        // Carry whoever stands on it (the hero), along with the delta.
+        float dx = o.x - oldX;
+        float dy = o.y - oldY;
+        if (dx != 0.0f || dy != 0.0f)
+        {
+            if (overlap(hero.box(), objectBox(o)))
+            {
+                riding = true;
+                hero.nudge(dx, dy);
+            }
+        }
+        else if (overlap(hero.box(), objectBox(o)))
+        {
+            riding = true;  // stationary this frame, still standing on it
+        }
+    }
+    hero.setRiding(riding);
+}
+
+// Hammer pound: once the windup lands (HAMMER_WINDUP), the quake shakes
+// the screen and the pound box shatters hammer-smashable objects (rocks,
+// pots, stakes). One quake per swing, deduped by the action id.
+static void updateHammer()
+{
+    static int lastPoundSwing = -1;
+    if (!hero.hammering()) return;
+    if (hero.stateElapsed() < Hero::HAMMER_WINDUP) return;
+    if (lastPoundSwing == hero.swingId()) return;
+    lastPoundSwing = hero.swingId();
+
+    PlaySound(sndHammerPound);
+    shakeTime = 0.2f;
+    shakeStrength = 2.5f;
+
+    Rectangle box = hero.attackBox();
+    if (box.width <= 0.0f) return;
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active || !objInteracts(o, OBJINT_HAMMER_SMASH)) continue;
+        if (o.state != OBJ_GROUND) continue;
+        if (!overlap(box, objectBox(o))) continue;
+        smashObject(i, true);
+    }
+}
+
+// Magic powder (use-action item): once the windup lands, the puff in the
+// hero's facing stuns enemies it catches, lights torch posts, and
+// awakens shrine objects — setting their baked story flag (a sprinkle
+// secret that persists in the save). One puff per action id.
+static void updatePowder()
+{
+    static int lastSprinkleSwing = -1;
+    if (!hero.sprinkling()) return;
+    if (hero.stateElapsed() < Hero::SPRINKLE_WINDUP) return;
+    if (lastSprinkleSwing == hero.swingId()) return;
+    lastSprinkleSwing = hero.swingId();
+
+    Rectangle box = hero.attackBox();
+    if (box.width <= 0.0f) return;
+
+    // Enemies caught in the puff reel stunned in a sparkle shower.
+    for (int e = 0; e < enemyCount; e++)
+    {
+        if (!enemies[e].alive()) continue;
+        if (!overlap(box, enemies[e].box())) continue;
+        enemies[e].stun(2.0f);
+        Vector2 c = enemies[e].center();
+        spawnParticles(c.x, c.y, 8, 150, 220, 120, 70.0f, 110.0f);
+        PlaySound(sndBoomerangHit);
+    }
+
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        WorldObject& o = objects[i];
+        if (!o.active || o.state != OBJ_GROUND) continue;
+        if (!overlap(box, objectBox(o))) continue;
+
+        // Torches catch fire from a sprinkle, like a fire bolt.
+        if (objInteracts(o, OBJINT_TORCH) && !o.opened)
+        {
+            o.opened = true;
+            PlaySound(sndFire);
+        }
+
+        // Shrine-style awakening: the sprinkle sets its story flag
+        // (aux2 through the shared world-flag registry — it persists).
+        if (objInteracts(o, OBJINT_POWDER) && !o.switchActive
+            && o.aux2 >= 0 && o.aux2 < WORLD_FLAG_COUNT)
+        {
+            gWorldFlags[o.aux2] = true;
+            o.switchActive = true;  // awakened (room-local visual state)
+            spawnParticles(o.x + 16.0f, o.y + 12.0f, 12, 170, 230, 140,
+                           80.0f, 130.0f);
+            playNamedSfx("secret.wav");
+        }
+    }
+}
+
+// Shovel (use-action item): once the windup lands, the tile ahead turns
+// over — a dirt burst + drop roll on soft soil, with the room's buried
+// items surfacing at their spots first. One dig turn per action id.
+static void updateShovel()
+{
+    static int lastDigSwing = -1;
+    if (!hero.digging()) return;
+    if (hero.stateElapsed() < Hero::DIG_WINDUP) return;
+    if (lastDigSwing == hero.swingId()) return;
+    lastDigSwing = hero.swingId();
+
+    Rectangle heroBox = hero.box();
+    Direction facing = hero.facingDirection();
+    float dx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+    float dy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+    float px = heroBox.x + heroBox.width * 0.5f + dx * 22.0f;
+    float py = heroBox.y + heroBox.height * 0.5f + dy * 22.0f;
+    int tx = (int)(px / TILE_SIZE);
+    int ty = (int)(py / TILE_SIZE);
+    TileMeta meta = room.tileMetaAt(tx, ty);
+    if (!(meta.flags & TILE_FLAG_DIGGABLE)) return;
+    // No digging into walls (solid tiles don't turn over).
+    if (room.solidTilesBox(Rectangle{ (float)(tx * TILE_SIZE) + 4.0f,
+                                      (float)(ty * TILE_SIZE) + 4.0f, 24.0f, 24.0f }))
+        return;
+
+    PlaySound(sndDig);
+    spawnParticles((float)(tx * TILE_SIZE) + 16.0f, (float)(ty * TILE_SIZE) + 14.0f,
+                   10, 128, 96, 60, 80.0f, 150.0f);
+
+    // Buried treasure at this spot surfaces (once per visit).
+    const RoomConfig& cfg = room.config();
+    for (int i = 0; i < cfg.buriedCount && i < MAX_BURIED; i++)
+    {
+        if (buriedDug[i]) continue;
+        if (cfg.buried[i].tileX != tx || cfg.buried[i].tileY != ty) continue;
+        buriedDug[i] = true;
+        spawnPickup(cfg.buried[i].kind,
+                    (float)(tx * TILE_SIZE) + 8.0f, (float)(ty * TILE_SIZE) + 8.0f);
+        return;
+    }
+
+    // Empty soil: the standard drop roll (mostly nothing, like LttP digs).
+    int drop = rollDrop(worldRng);
+    if (drop != PICKUP_NONE)
+        spawnPickup(drop, (float)(tx * TILE_SIZE) + 8.0f,
+                    (float)(ty * TILE_SIZE) + 8.0f);
+}
+
 static WorldObject* switchAtTile(int tileX, int tileY)
 {
     for (int i = 0; i < MAX_OBJECTS; i++)
@@ -3013,10 +3972,11 @@ static WorldObject* switchAtTile(int tileX, int tileY)
     return 0;
 }
 
-static void updateSwitches()
+static void updateSwitches(float dt)
 {
     // Press state: weight = the hero standing on the plate or a block
-    // resting on it; latch switches stay pressed once triggered.
+    // resting on it; latch switches stay pressed once triggered, timed
+    // ones hold for a few seconds after the weight leaves.
     Rectangle heroBox = hero.box();
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
@@ -3043,6 +4003,29 @@ static void updateSwitches()
             {
                 s.switchActive = true;
                 PlaySound(sndButton);
+            }
+        }
+        else if (s.aux1 == 2)
+        {
+            // Timed: holds for TIMED_SWITCH_SECONDS after the weight
+            // leaves (every weighted frame refills the clock).
+            if (weight)
+            {
+                if (!s.switchActive)
+                {
+                    s.switchActive = true;
+                    PlaySound(sndButton);
+                }
+                s.modeTimer = TIMED_SWITCH_SECONDS;
+            }
+            else if (s.switchActive)
+            {
+                s.modeTimer -= dt;
+                if (s.modeTimer <= 0.0f)
+                {
+                    s.switchActive = false;
+                    PlaySound(sndButton);
+                }
             }
         }
         else if (weight != s.switchActive)
@@ -3102,6 +4085,10 @@ static void updateSwitches()
             // Lit torches latch their link group open.
             if (objInteracts(s, OBJINT_TORCH) && s.aux2 == b.aux2 && s.opened)
                 lowered = true;
+            // Pulled levers latch their link group open (a grab-pull flips
+            // the handle either way, so a re-pull closes the gate again).
+            if (objInteracts(s, OBJINT_LEVER) && s.aux2 == b.aux2 && s.switchActive)
+                lowered = true;
         }
 
         if (lowered && b.state == OBJ_GROUND)
@@ -3120,6 +4107,9 @@ static void updateSwitches()
 static void updateObjects()
 {
     float dt = frameDt();
+
+    // Grab-and-pull pairs (holding a statue, dragging it a tile).
+    updateGrabPull();
 
     // Push blocks: wind up, slide, settle.
     updatePushBlocks(dt);
@@ -3172,7 +4162,7 @@ static void updateObjects()
     }
 
     // Switches and their linked barriers.
-    updateSwitches();
+    updateSwitches(dt);
 
     // Hoist: the object glides from its tile to over the hero's head while
     // the lift pause plays.
@@ -3296,6 +4286,10 @@ static void updateEnemies()
 {
     if (hero.dead()) return;
 
+    // The cape (magic cloak): enemies lose sight of the hero entirely —
+    // the AI (enemy.update below) chases a ghost far offscreen, while
+    // combat math keeps the true center; intangibility blocks their
+    // strikes through hero protection.
     Vector2 heroCenter = hero.center();
     Rectangle heroBox = hero.box();
     bool dashContact = hero.dashing();
@@ -3307,7 +4301,9 @@ static void updateEnemies()
         Enemy& enemy = enemies[i];
         if (!enemy.alive()) continue;
 
-        enemy.update(room, heroCenter, worldRng, frameDt());
+        enemy.update(room, capeActive ? Vector2{ heroCenter.x, heroCenter.y - 9000.0f }
+                                      : heroCenter,
+                      worldRng, frameDt());
 
         // Offensive contact (sword arc, spin radius, dash): knockback away
         // from the hero; one hit per action id.
@@ -3334,6 +4330,12 @@ static void updateEnemies()
                 int bossSlot = currentRoom * 16 + i;
                 if (bossSlot >= 0 && bossSlot < MAX_BOSS_SLOTS)
                     bossDefeated[bossSlot] = true;
+                // The victory banks the room's story flag
+                // ("boss_defeated_<room>", generator-baked) so dialogue
+                // can branch on it; it persists in the save like any flag.
+                const RoomConfig& rc = room.config();
+                if (rc.bossFlag >= 0 && rc.bossFlag < WORLD_FLAG_COUNT)
+                    gWorldFlags[rc.bossFlag] = true;
                 saveToFile(saveSlotInUse);
 
                 itemGet.active = true;
@@ -3358,10 +4360,12 @@ static void updateEnemies()
             continue;
         }
 
-        // Non-lethal connect: a lighter hit-pause beat.
+        // Non-lethal connect: a lighter hit-pause beat. Hammer pounds
+        // also flip the enemy over — it reels stunned on its back.
         if (enemy.hitsLanded() > hitsBefore)
         {
             hitPause = enemy.isBoss() ? HIT_PAUSE_BOSS : HIT_PAUSE_CONNECT;
+            if (hero.hammering()) enemy.stun(1.2f);
         }
 
         // Octorok spit.
@@ -3398,8 +4402,10 @@ static void updateProjectiles()
 
         Rectangle rock = { p.x, p.y, 16.0f, 16.0f };
 
-        // Passive shield: while free to move, rocks arriving from the faced
-        // direction get knocked away at a deflected angle.
+        // Shield block: while free to move, rocks arriving from the faced
+        // direction get knocked away at a deflected angle. Holding the
+        // guard button raises the shield and widens the blocked arc to
+        // nearly everything but a projectile from directly behind.
         if (!p.friendly && !p.beam && hero.shielding())
         {
             Vector2 face = { 0.0f, 0.0f };
@@ -3415,7 +4421,8 @@ static void updateProjectiles()
             if (vlen > 0.0001f)
             {
                 float oncoming = -(p.dx / vlen * face.x + p.dy / vlen * face.y);
-                if (oncoming > 0.45f && overlap(rock, heroBox))
+                float blockArc = hero.guarding() ? -0.2f : 0.45f;
+                if (oncoming > blockArc && overlap(rock, heroBox))
                 {
                     // Deflect: reflect and jitter the flight angle.
                     float angle = atan2f(p.dy, p.dx) + 3.14159f
@@ -3426,6 +4433,23 @@ static void updateProjectiles()
                     PlaySound(sndTink);
                     continue;
                 }
+            }
+        }
+
+        // Sword batting: an offensive swing/spin/pound that catches an
+        // incoming projectile reflects it back along its flight —
+        // reflectable magic (the wizard falls to his own volleys).
+        if (!p.friendly && !p.beam
+            && (hero.attacking() || hero.spinning() || hero.hammering()))
+        {
+            Rectangle swing = hero.attackBox();
+            if (swing.width > 0.0f && overlap(rock, swing))
+            {
+                p.dx = -p.dx;
+                p.dy = -p.dy;
+                p.friendly = true;
+                PlaySound(sndTink);
+                continue;
             }
         }
 
@@ -3467,10 +4491,10 @@ static void updateProjectiles()
             }
         }
 
-        if (p.beam || p.arrow)
+        if (p.beam || p.arrow || (p.friendly && !isMagic))
         {
-            // Sword beams and arrows strike enemies (one hit per id); both
-            // stop on the first enemy touched.
+            // Sword beams, arrows, and deflected projectiles strike enemies
+            // (one hit per id); all stop on the first enemy touched.
             for (int e = 0; e < enemyCount; e++)
             {
                 if (!enemies[e].alive()) continue;
@@ -3485,7 +4509,8 @@ static void updateProjectiles()
                     kx = p.dx;
                     ky = p.dy;
                 }
-                if (enemies[e].tryHit(rock, p.id, Vector2{ kx, ky }))
+                if (enemies[e].tryHit(rock, p.id, Vector2{ kx, ky },
+                                      p.enemyDamage))
                 {
                     PlaySound(sndEnemyDie);
                     spawnPoof(enemyCenter.x, enemyCenter.y);
@@ -3572,13 +4597,13 @@ static void updateBoomerang()
     if (!boomer.returning)
     {
         // Outbound leg: straight flight with a lateral arc wobble.
-        float along = boomer.time * 200.0f;
+        float along = boomer.time * boomer.speed;
         float perp = sinf(boomer.time * 14.0f) * 16.0f;
         float nx = boomer.startX + boomer.dirX * along - boomer.dirY * perp;
         float ny = boomer.startY + boomer.dirY * along + boomer.dirX * perp;
 
         Rectangle flight = { nx - 8.0f, ny - 8.0f, 16.0f, 16.0f };
-        if (along >= 104.0f || room.solidBox(flight))
+        if (along >= boomer.range || room.solidBox(flight))
         {
             boomer.returning = true;
             return;
@@ -3621,6 +4646,126 @@ static void updateBoomerang()
         Rectangle item = { pickups[i].x, pickups[i].y, 16.0f, 16.0f };
         if (overlap(flight, item)) collectPickup(pickups[i]);
     }
+}
+
+// Hookshot (see struct): the chain head extends, latches hookables
+// (reeling the hero to the tile in front of the latch), bounces off
+// anything solid, stuns enemies and collects pickups in passing, and
+// recoils home on a miss. The hero stays locked in HERO_HOOKSHOT until
+// the chain resolves.
+static void updateHookshot()
+{
+    if (!hook.active) return;
+    float dt = frameDt();
+    Vector2 heroCenter = hero.center();
+
+    if (hook.latched)
+    {
+        // Reeling: the hero glides (the hero state owns the motion);
+        // the chain resolves once the hero has landed.
+        if (!hero.hookPulling())
+        {
+            hook.active = false;
+            hook.latched = false;
+        }
+        return;
+    }
+
+    Rectangle head = { hook.x - 6.0f, hook.y - 6.0f, 12.0f, 12.0f };
+
+    // Stun enemies / collect pickups the head passes through.
+    for (int e = 0; e < enemyCount; e++)
+    {
+        if (!enemies[e].alive()) continue;
+        if (!overlap(head, enemies[e].box())) continue;
+        enemies[e].stun(1.2f);
+        PlaySound(sndBoomerangHit);
+        hook.retracting = true;
+    }
+    for (int i = 0; i < MAX_PICKUPS; i++)
+    {
+        if (!pickups[i].active) continue;
+        Rectangle item = { pickups[i].x, pickups[i].y, 16.0f, 16.0f };
+        if (overlap(head, item)) collectPickup(pickups[i]);
+    }
+
+    // Latch: a hookable object grabs the chain — the hero reels in to
+    // the tile in front of the latch (approach side), gliding over
+    // anything between.
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active || !objInteracts(o, OBJINT_HOOKABLE)) continue;
+        if (o.state != OBJ_GROUND) continue;
+        if (!overlap(head, objectBox(o))) continue;
+
+        hook.latched = true;
+        hook.retracting = false;
+        hook.x = o.x + TILE_SIZE * 0.5f;
+        hook.y = o.y + TILE_SIZE * 0.5f;
+        float landX = o.x - hook.dirX * TILE_SIZE;
+        float landY = o.y - hook.dirY * TILE_SIZE;
+        hero.startHookPull(landX, landY);
+        PlaySound(sndHookshot);
+        return;
+    }
+
+    if (hook.retracting)
+    {
+        // Recoil: fly home, resolving the shot on arrival.
+        float dx = heroCenter.x - hook.x;
+        float dy = heroCenter.y - hook.y;
+        float dist = sqrtf(dx * dx + dy * dy);
+        float move = HOOK_SPEED * dt;
+        if (move >= dist)
+        {
+            hook.active = false;
+            hero.endHookshot();
+            return;
+        }
+        hook.x += dx / dist * move;
+        hook.y += dy / dist * move;
+        return;
+    }
+
+    // Extending: walls bounce the chain, range exhausts it.
+    hook.x += hook.dirX * HOOK_SPEED * dt;
+    hook.y += hook.dirY * HOOK_SPEED * dt;
+    Rectangle probe = { hook.x - 4.0f, hook.y - 4.0f, 8.0f, 8.0f };
+    if (room.solidBox(probe))
+    {
+        hook.retracting = true;
+        return;
+    }
+    float dx = hook.x - hook.startX;
+    float dy = hook.y - hook.startY;
+    if (dx * dx + dy * dy >= HOOK_RANGE * HOOK_RANGE)
+    {
+        hook.retracting = true;  // out of wire
+    }
+}
+
+// Draw the hookshot chain: a dotted wire from the hero to the head,
+// with a claw tip.
+static void drawHookshotChain()
+{
+    if (!hook.active) return;
+    Vector2 from = hero.center();
+    float dx = hook.x - from.x;
+    float dy = hook.y - from.y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist < 1.0f) return;
+    float ux = dx / dist;
+    float uy = dy / dist;
+    for (float d = 4.0f; d < dist - 2.0f; d += 8.0f)
+    {
+        DrawLine((int)(from.x + ux * d), (int)(from.y + uy * d),
+                 (int)(from.x + ux * (d + 4.0f)), (int)(from.y + uy * (d + 4.0f)),
+                 Color{ 225, 225, 235, 255 });
+    }
+    DrawCircle((int)hook.x, (int)hook.y, 3.0f, Color{ 235, 235, 245, 255 });
+    DrawCircle((int)(hook.x - hook.dirX * 3.0f), (int)(hook.y - hook.dirY * 3.0f),
+               2.0f, Color{ 140, 140, 155, 255 });
 }
 
 static void updatePoofs()
@@ -3715,6 +4860,21 @@ static void drawGroundFx()
         DrawTexturePro(boomerangTexture, src, dest, origin, 0.0f, WHITE);
     }
 
+    // Hookshot chain: a dotted wire from the hero out to the claw.
+    drawHookshotChain();
+
+    // Byrna aura: protective sparks orbiting the hero while it burns.
+    if (byrnaActive)
+    {
+        Vector2 c = hero.center();
+        for (int i = 0; i < 6; i++)
+        {
+            float a = (float)GetTime() * 5.0f + i * (PI * 2.0f / 6.0f);
+            DrawCircle((int)(c.x + cosf(a) * 17.0f), (int)(c.y + sinf(a) * 17.0f),
+                       2.0f, Color{ 255, 240, 170, 230 });
+        }
+    }
+
     // Live bombs: blink faster as the fuse runs out.
     for (int i = 0; i < MAX_BOMBS_LIVE; i++)
     {
@@ -3780,6 +4940,15 @@ static void drawFloorObjects()
             unsigned char alpha = (unsigned char)(int)(90 + 100 * pulse);
             DrawRectangle((int)(o.x + 8.0f), (int)(o.y + 8.0f), 16, 16,
                           Color{ 120, 200, 255, alpha });
+            continue;
+        }
+        if (objInteracts(o, OBJINT_PLATFORM))
+        {
+            // Moving platform: rides under everything that stands on it.
+            Rectangle src = { 0.0f, 0.0f, 32.0f, 32.0f };
+            Rectangle dest = { o.x, o.y, 32.0f, 32.0f };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(objectSheets[o.type], src, dest, origin, 0.0f, WHITE);
             continue;
         }
         if (o.state == OBJ_SUNK)
@@ -3866,13 +5035,16 @@ static void drawEntitiesSorted()
         if (d.kind == 0)
         {
             HeroState hs = hero.state();
-            if (hs != HERO_FALL && hs != HERO_SPLASH && hs != HERO_DEAD)
+            if (hs != HERO_FALL && hs != HERO_SPLASH && hs != HERO_DEAD
+                && hs != HERO_SWIM)
             {
                 // Tree-blob shadow at the feet.
                 DrawEllipse((int)(heroBox.x + heroBox.width * 0.5f),
                            (int)(heroBox.y + heroBox.height - 2.0f),
                            8.0f, 3.0f, Color{ 20, 20, 40, 70 });
             }
+            // Wading in shallow water: a mirrored copy below the feet.
+            if (hero.wading()) hero.drawReflection();
             hero.draw();
         }
         else if (d.kind == 1)
@@ -3880,14 +5052,44 @@ static void drawEntitiesSorted()
             Rectangle b = enemies[d.index].box();
             DrawEllipse((int)(b.x + b.width * 0.5f), (int)(b.y + b.height - 2.0f),
                         8.0f, 3.0f, Color{ 20, 20, 40, 70 });
+            TileMeta em = room.tileMetaAt((int)((b.x + b.width * 0.5f) / TILE_SIZE),
+                                          (int)((b.y + b.height * 0.5f) / TILE_SIZE));
+            if (em.flags & TILE_FLAG_WATER_SHALLOW) enemies[d.index].drawReflection();
             enemies[d.index].draw();
         }
         else if (d.kind == 3)
         {
             const Npc& npc = npcs[d.index];
-            Rectangle b = npcBox(npc);
+            Rectangle b = npcBox(npcs[d.index]);
             DrawEllipse((int)(b.x + b.width * 0.5f), (int)(b.y + b.height - 2.0f),
                         8.0f, 3.0f, Color{ 20, 20, 40, 70 });
+            // Wading NPCs reflect too (same frame the draw below shows).
+            TileMeta em = room.tileMetaAt((int)((b.x + b.width * 0.5f) / TILE_SIZE),
+                                          (int)((b.y + b.height * 0.5f) / TILE_SIZE));
+            if ((em.flags & TILE_FLAG_WATER_SHALLOW) && npc.cfg && npc.sheet.id != 0)
+            {
+                const DirectionalFrames* rframes = npc.moving
+                    ? &npc.cfg->move[npc.facing] : &npc.cfg->stand[npc.facing];
+                if (rframes->count <= 0) rframes = &npc.cfg->stand[npc.facing];
+                if (rframes->count > 0)
+                {
+                    int rcolumns = npc.cfg->sheetColumns;
+                    if (rcolumns <= 0) rcolumns = 1;
+                    int rindex = (int)(npc.animTime * 8.0f) % rframes->count;
+                    int rframe = rframes->frames[rindex];
+                    if (rframe < 0) rframe = 0;
+                    if (npc.cfg->frameCount > 0 && rframe >= npc.cfg->frameCount)
+                        rframe = npc.cfg->frameCount - 1;
+                    Rectangle rsrc = { (float)((rframe % rcolumns) * TILE_SIZE),
+                                      (float)((rframe / rcolumns) * TILE_SIZE),
+                                      (float)TILE_SIZE, -(float)TILE_SIZE };
+                    Rectangle rdest = { npc.x, npc.y + (float)TILE_SIZE,
+                                        (float)TILE_SIZE, (float)TILE_SIZE * 0.62f };
+                    Vector2 rorigin = { 0.0f, 0.0f };
+                    DrawTexturePro(npc.sheet, rsrc, rdest, rorigin, 0.0f,
+                                   Color{ 175, 200, 240, 100 });
+                }
+            }
             if (npc.cfg && npc.sheet.id != 0)
             {
                 const DirectionalFrames* frames = npc.moving
@@ -3913,9 +5115,12 @@ static void drawEntitiesSorted()
         else
         {
             const WorldObject& o = objects[d.index];
-            // Chests have a two-frame sheet: closed / lid open.
+            // Chests have a two-frame sheet: closed / lid open. Levers
+            // mirror their single frame: the handle leans with the state.
             float srcX = (objInteracts(o, OBJINT_TWO_FRAME) && o.opened) ? 32.0f : 0.0f;
-            Rectangle src = { srcX, 0.0f, 32.0f, 32.0f };
+            float srcW = 32.0f;
+            if (objInteracts(o, OBJINT_LEVER) && o.switchActive) srcW = -32.0f;
+            Rectangle src = { srcX, 0.0f, srcW, 32.0f };
             Rectangle dest = { o.x, o.y, 32.0f, 32.0f };
             Vector2 origin = { 0.0f, 0.0f };
             DrawTexturePro(objectSheets[o.type], src, dest, origin, 0.0f, WHITE);
@@ -4203,6 +5408,7 @@ static void drawDoorways()
 static void updateAndDraw(void)
 {
     if (musicLoaded) UpdateMusicStream(music);
+    if (ambientLoaded) UpdateMusicStream(ambientMusic);
 
     // Jingle ducking: once the fanfare/secret sting finishes, the bgm
     // picks up where it was paused.
@@ -4273,6 +5479,13 @@ static void updateAndDraw(void)
             // (handled in drawGameOver flow below).
             hero.update(room, frameDt());
         }
+        else if (bossIntroTime > 0.0f)
+        {
+            // Boss intro: the world holds while the letterbox names the
+            // arena's boss (drawn with the world, after the HUD).
+            bossIntroTime -= frameDt();
+            if (bossIntroTime < 0.0f) bossIntroTime = 0.0f;
+        }
         else
         {
             // Hit-pause: the world holds its breath for a beat after an
@@ -4288,7 +5501,12 @@ static void updateAndDraw(void)
             HeroState stateBefore = hero.state();
 
             updateDashSmash();  // pegasus boots shatter pots/bushes pre-move
+            hero.setCanSwim(swimItemOwned());
+            updatePlatforms(frameDt());  // rafts glide + carry before the walk
             hero.update(room, frameDt());
+            updateHammer();  // the pound lands once the windup elapses
+            updateShovel();  // the dig turns the tile ahead over
+            updatePowder();   // the powder puff lands in the facing
             bool actionUsed = updateObjectActions();
             updateEncounters(!actionUsed);
             updateGrass();
@@ -4298,8 +5516,10 @@ static void updateAndDraw(void)
                 useEquippedItem();
             }
             updateBoomerang();
+            updateHookshot();
             updateNpcs(frameDt());
             updateLantern(frameDt());
+            updateToggleItems(frameDt());  // Byrna/cape drains + gates
             updateHealTiles(frameDt());
             updateBombs(frameDt());
             updateObjects();
@@ -4308,6 +5528,7 @@ static void updateAndDraw(void)
             updatePickups();
             updatePoofs();
             updateParticles(frameDt());
+            updateWeather(frameDt());
 
             // Feedback: damage taken -> screen shake; a deep-water dive
             // kicks up droplets; low health -> beeping.
@@ -4430,6 +5651,10 @@ static void updateAndDraw(void)
     // Dark rooms: lantern + torch lightmap over the world (HUD stays lit).
     drawDarkness();
 
+    // Ambient tint and weather layers, under the HUD like the lightmap.
+    drawTint();
+    drawWeather();
+
     // Room-load fade (spawns, death-continue, future warp tiles).
     if (roomFade > 0.0f)
     {
@@ -4450,6 +5675,29 @@ static void updateAndDraw(void)
     drawToasts();
     drawPauseOverlay();
     drawGameOver();
+
+    // Boss intro letterbox: bars slide in, the boss gets named, the
+    // world holds underneath (see the bossIntroTime gate).
+    if (bossIntroTime > 0.0f)
+    {
+        float scale = virtualScale();
+        float elapsed = BOSS_INTRO_DURATION - bossIntroTime;
+        float slide = clampf(elapsed / 0.25f, 0.0f, 1.0f);
+        float barH = 26.0f * slide * scale;
+        DrawRectangle(0, 0, GetScreenWidth(), (int)barH, BLACK);
+        DrawRectangle(0, GetScreenHeight() - (int)barH, GetScreenWidth(),
+                      (int)barH + 1, BLACK);
+        if (slide >= 1.0f)
+        {
+            const char* name = bossIntroName[0] ? bossIntroName : "BOSS";
+            int size = (int)(9.0f * scale);
+            int width = MeasureText(name, size);
+            DrawText(name, (GetScreenWidth() - width) / 2,
+                     (int)(barH * 0.5f - size * 0.5f), size,
+                     Color{ 235, 235, 245, 255 });
+        }
+    }
+
     dialogue.draw();
 
     EndDrawing();
@@ -4494,7 +5742,7 @@ int main(int argc, char** argv)
         SetTextureFilter(enemySheets[i], TEXTURE_FILTER_POINT);
     }
 
-    for (int i = 0; i < OBJECT_COUNT && i < 16; i++)
+    for (int i = 0; i < OBJECT_COUNT && i < 32; i++)
     {
         objectSheets[i] = LoadTexture(OBJECTS[i].image);
         SetTextureFilter(objectSheets[i], TEXTURE_FILTER_POINT);
@@ -4517,6 +5765,10 @@ int main(int argc, char** argv)
     sndBreak = LoadSound("assets/audio/break.wav");
     sndItemWater = LoadSound("assets/audio/item in water.wav");
     sndMoveObject = LoadSound("assets/audio/move object.wav");
+    sndHammerPound = LoadSound("assets/audio/quake 1.wav");
+    sndDig = LoadSound("assets/audio/dig.wav");
+    sndThunder = LoadSound("assets/audio/thunder.wav");
+    sndHookshot = LoadSound("assets/audio/hookshot.wav");
     sndButton = LoadSound("assets/audio/button.wav");
     sndDoorOpen = LoadSound("assets/audio/door open.wav");
     sndDoorClose = LoadSound("assets/audio/door close.wav");
@@ -4529,7 +5781,9 @@ int main(int argc, char** argv)
     sndChestOpen = LoadSound("assets/audio/chest open.wav");
     sndFanfare = LoadSound("assets/audio/item get 2.wav");
     sndUseKey = LoadSound("assets/audio/use key.wav");
+    sndFairy = LoadSound("assets/audio/fairy.wav");
     sndBossDies = LoadSound("assets/audio/boss dies.wav");
+    sndBossIntro = LoadSound("assets/audio/boss hit.wav");
     sndSecret = LoadSound("assets/audio/secret.wav");
     sndWarp = LoadSound("assets/audio/warp.wav");
     sndCrystal = LoadSound("assets/audio/crystal.wav");
@@ -4541,6 +5795,7 @@ int main(int argc, char** argv)
 
     dialogue.init();
     gDialogueItemOwned = itemOwnedQuery;
+    gDialogueTryPayRupees = tryPayRupeesQuery;
 
     if (ENCOUNTER_TOTAL > 0)
     {
@@ -4603,6 +5858,7 @@ int main(int argc, char** argv)
     while (!WindowShouldClose()) updateAndDraw();
 
     startMusic(NULL);
+    startAmbient(NULL);
     delete[] encounterFired;
     encounterFired = 0;
     hero.unload();

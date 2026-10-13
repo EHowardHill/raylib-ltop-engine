@@ -20,6 +20,7 @@ static const float CHARS_PER_SECOND = 30.0f;
 
 // Installed by the game at boot (see dialogue.h).
 bool (*gDialogueItemOwned)(int item) = 0;
+bool (*gDialogueTryPayRupees)(int rupees) = 0;
 
 // Cursor up/down for the choice list (keyboard + gamepad dpad).
 static bool cursorUpPressed()
@@ -39,7 +40,7 @@ static bool cursorDownPressed()
 }
 
 DialogueBox::DialogueBox()
-    : font(), border(), letterSfx(), finishSfx(),
+    : font(), border(), letterSfx(), finishSfx(), errorSfx(),
       current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0),
       choiceActive(false), choiceCursor(0),
       musicRequest(), musicPending(false),
@@ -56,6 +57,7 @@ void DialogueBox::init()
     SetTextureFilter(border, TEXTURE_FILTER_POINT);
     letterSfx = LoadSound("assets/audio/message.wav");
     finishSfx = LoadSound("assets/audio/message_finish.wav");
+    errorSfx = LoadSound("assets/audio/error.wav");
 }
 
 void DialogueBox::shutdown()
@@ -64,6 +66,7 @@ void DialogueBox::shutdown()
     UnloadTexture(border);
     UnloadSound(letterSfx);
     UnloadSound(finishSfx);
+    UnloadSound(errorSfx);
     shutdownNamedSfx();
     current = 0;
     musicPending = false;
@@ -277,8 +280,25 @@ void DialogueBox::update()
         if (actionPressed() && line.choices)
         {
             const DialogueChoice& choice = line.choices[choiceCursor];
+
+            // Shop picks ("cost"): the wallet covers it or the pick
+            // rattles — nothing applied, the list stays up.
+            if (choice.costRupees > 0
+                && !(gDialogueTryPayRupees && gDialogueTryPayRupees(choice.costRupees)))
+            {
+                PlaySound(errorSfx);
+                return;
+            }
+
             applyFlags(choice.setFlags, choice.setCount, choice.clearFlags, choice.clearCount);
             if (choice.sfx) playNamedSfx(choice.sfx);
+            // Purchases ("give") queue the same grant drain line gives
+            // use; the game turns it into ownership + a toast.
+            if (choice.giveItem >= 0)
+            {
+                giveItem = choice.giveItem;
+                givePending = true;
+            }
             choiceActive = false;
 
             // The chosen option decides where the dialogue goes (the line's

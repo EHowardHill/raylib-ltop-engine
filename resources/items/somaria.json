@@ -1,0 +1,8 @@
+{
+    "label": "CANE OF SOMARIA",
+    "use": {
+        "kind": "somaria",
+        "sfx": "cane.wav"
+    },
+    "spawn": "somaria_block"
+}

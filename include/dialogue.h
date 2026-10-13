@@ -6,6 +6,11 @@
 // installs this at boot (dialogue stays decoupled from the inventory).
 extern bool (*gDialogueItemOwned)(int item);
 
+// Shop seam: choices may cost rupees ("cost"). The game installs this at
+// boot; it returns true when the wallet covered the amount (and deducts
+// it), false when the pick can't be afforded (nothing deducted).
+extern bool (*gDialogueTryPayRupees)(int rupees);
+
 class DialogueBox
 {
 public:
@@ -47,6 +52,7 @@ private:
     Texture2D border;
     Sound letterSfx;
     Sound finishSfx;
+    Sound errorSfx;  // a pick the wallet can't afford (shop choices)
 
     const Dialogue* current;
     int lineIndex;

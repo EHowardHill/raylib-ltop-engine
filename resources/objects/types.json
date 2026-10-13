@@ -2,43 +2,146 @@
     "types": [
         {
             "name": "pot",
-            "interactions": ["solid", "liftable", "dash_smash", "hides"]
+            "interactions": [
+                "solid",
+                "liftable",
+                "dash_smash",
+                "hammer_smash",
+                "hides"
+            ]
         },
         {
             "name": "bush",
-            "interactions": ["solid", "liftable", "dash_smash", "cut", "leaves"]
+            "interactions": [
+                "solid",
+                "liftable",
+                "dash_smash",
+                "cut",
+                "leaves"
+            ]
         },
         {
             "name": "block",
-            "interactions": ["solid", "pushable", "sinks", "weight"]
+            "interactions": [
+                "solid",
+                "pushable",
+                "pullable",
+                "sinks",
+                "weight"
+            ]
         },
         {
             "name": "switch",
-            "interactions": ["floor", "switch"]
+            "interactions": [
+                "floor",
+                "switch"
+            ]
         },
         {
             "name": "barrier",
-            "interactions": ["solid", "barrier"]
+            "interactions": [
+                "solid",
+                "barrier"
+            ]
         },
         {
             "name": "sign",
-            "interactions": ["solid", "readable"]
+            "interactions": [
+                "solid",
+                "readable"
+            ]
         },
         {
             "name": "chest",
-            "interactions": ["solid", "chest", "two_frame"]
+            "interactions": [
+                "solid",
+                "chest",
+                "two_frame"
+            ]
         },
         {
             "name": "torch",
-            "interactions": ["solid", "torch"]
+            "interactions": [
+                "solid",
+                "torch"
+            ]
         },
         {
             "name": "warp",
-            "interactions": ["floor", "warp"]
+            "interactions": [
+                "floor",
+                "warp"
+            ]
         },
         {
             "name": "crystal",
-            "interactions": ["solid", "crystal"]
+            "interactions": [
+                "solid",
+                "crystal"
+            ]
+        },
+        {
+            "name": "rock",
+            "interactions": [
+                "solid",
+                "hammer_smash"
+            ]
+        },
+        {
+            "name": "big_rock",
+            "interactions": [
+                "solid",
+                "liftable",
+                "heavy"
+            ]
+        },
+        {
+            "name": "statue",
+            "interactions": [
+                "solid",
+                "pushable",
+                "pullable",
+                "sinks",
+                "weight"
+            ]
+        },
+        {
+            "name": "lever",
+            "interactions": [
+                "solid",
+                "pullable",
+                "lever"
+            ]
+        },
+        {
+            "name": "platform",
+            "interactions": [
+                "floor",
+                "platform"
+            ]
+        },
+        {
+            "name": "hook_post",
+            "interactions": [
+                "solid",
+                "hookable"
+            ]
+        },
+        {
+            "name": "somaria_block",
+            "interactions": [
+                "solid",
+                "pushable",
+                "sinks",
+                "weight"
+            ]
+        },
+        {
+            "name": "shrine",
+            "interactions": [
+                "solid",
+                "powder"
+            ]
         }
     ]
 }

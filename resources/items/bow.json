@@ -7,5 +7,10 @@
             "amount": 1,
             "rupee_fallback": true
         }
+    },
+    "upgrade": {
+        "flag": "silver_arrows",
+        "speed": 420,
+        "damage": 2
     }
 }

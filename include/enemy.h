@@ -33,9 +33,14 @@ public:
     void spawn(const EnemyConfig& config, Texture2D sheet, int tileX, int tileY);
     void update(const Room& room, Vector2 heroCenter, Rng& rng, float dt);
     void draw() const;
+    // Shallow-water reflection: flipped, translucent copy below the feet.
+    void drawReflection() const;
 
     bool alive() const { return hp > 0; }
     bool isBoss() const { return cfg && cfg->boss; }
+    // Mid-fight: seals the room + health bar while alive; room-local death.
+    bool isMiniBoss() const { return cfg && cfg->miniBoss; }
+    bool isArenaLock() const { return isBoss() || isMiniBoss(); }
     int health() const { return hp; }
     int maxHealth() const { return cfg ? cfg->hp : 0; }
     const EnemyConfig& config() const { return *cfg; }
@@ -54,13 +59,22 @@ public:
     void freeze(float seconds);
     bool frozen() const { return mode == ENEMY_FROZEN; }
 
-    // Sword resolution: applies one hit per swing (single-hit-per-swing via
-    // swing ids), knockback along knockDir, hitstun; returns true if this
+    // Sword resolution: applies `damage` hits per swing (single hit per
+    // swing id), knockback along knockDir, hitstun; returns true if this
     // call is the one that killed it.
-    bool tryHit(Rectangle attackBox, int swingId, Vector2 knockDir);
+    bool tryHit(Rectangle attackBox, int swingId, Vector2 knockDir,
+                int damage = 1);
 
     // Event drains: the room systems read these once per frame.
     bool popShot(float& dirX, float& dirY);
+    // Queue a projectile along a direction (drained by the room's
+    // projectile spawner). Custom behaviors shoot with this.
+    void queueShot(float dirX, float dirY)
+    {
+        shotDirX = dirX;
+        shotDirY = dirY;
+        shotPending_ = true;
+    }
 
     // --- Custom behavior API (gamecode layer 4) ---
     // Movement/mode primitives custom behaviors drive the enemy with. The

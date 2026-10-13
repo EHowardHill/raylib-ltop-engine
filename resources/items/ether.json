@@ -1,0 +1,10 @@
+{
+    "label": "ETHER",
+    "use": {
+        "kind": "medallion",
+        "element": "ice",
+        "cost": {
+            "magic": 8
+        }
+    }
+}

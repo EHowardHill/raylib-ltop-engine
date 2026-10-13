@@ -140,9 +140,16 @@ void Enemy::freeze(float seconds)
     knockY = 0.0f;
 }
 
-bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir)
+bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir,
+                    int damage)
 {
     if (!alive()) return false;
+
+    // Strike-immune (reflectable-magic bosses): direct hero actions —
+    // sword/spin/dash/hammer, which swing the hero's positive action
+    // counter — bounce off. Only projectile hits (negative unique ids)
+    // land.
+    if (cfg->strikeImmune && swingId >= 0) return false;
 
     // Frozen: any hit shatters the ice (and the enemy) instantly.
     if (mode == ENEMY_FROZEN)
@@ -166,7 +173,7 @@ bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir)
     lastSwing = swingId;
     hits++;
 
-    hp--;
+    hp -= (damage > 0) ? damage : 1;
     if (hp <= 0)
     {
         return true;
@@ -443,4 +450,42 @@ void Enemy::draw() const
         }
     }
     drawFrame(frame);
+}
+
+void Enemy::drawReflection() const
+{
+    // Same frame as draw(), flipped and squashed below the feet, tinted
+    // like the shallow water it stands in. Frozen blocks don't reflect.
+    if (!cfg || !alive() || mode == ENEMY_FROZEN) return;
+
+    const DirectionalFrames* frames = (mode == ENEMY_WALK || mode == ENEMY_CHARGE)
+                                          ? &cfg->move[facing] : &cfg->stand[facing];
+    if (frames->count <= 0) frames = &cfg->stand[facing];
+    if (frames->count <= 0) return;
+
+    int frame = frames->frames[(int)(animTime * ENEMY_ANIM_FPS) % frames->count];
+    int columns = cfg->sheetColumns;
+    if (columns <= 0) columns = 1;
+    if (frame < 0) frame = 0;
+    if (frame >= cfg->frameCount && cfg->frameCount > 0) frame = cfg->frameCount - 1;
+
+    Rectangle src = { (float)((frame % columns) * TILE_SIZE),
+                     (float)((frame / columns) * TILE_SIZE),
+                     (float)TILE_SIZE, -(float)TILE_SIZE };
+    Rectangle dest;
+    if (cfg->boss)
+    {
+        // Mirror the 1.5x boss sprite around the tile bottom.
+        dest = Rectangle{ x + (float)TILE_SIZE * 0.5f - (float)TILE_SIZE * 0.75f,
+                         y + (float)TILE_SIZE * 1.5f,
+                         (float)TILE_SIZE * 1.5f,
+                         (float)TILE_SIZE * 1.5f * 0.62f };
+    }
+    else
+    {
+        dest = Rectangle{ x, y + (float)TILE_SIZE,
+                          (float)TILE_SIZE, (float)TILE_SIZE * 0.62f };
+    }
+    Vector2 origin = { 0.0f, 0.0f };
+    DrawTexturePro(sheet, src, dest, origin, 0.0f, Color{ 175, 200, 240, 100 });
 }

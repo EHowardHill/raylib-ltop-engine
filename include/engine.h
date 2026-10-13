@@ -40,6 +40,8 @@ struct DialogueChoice
     const int* clearFlags;  // world flags to clear when chosen
     int clearCount;
     const char* sfx;        // audio file, 0 = none
+    int giveItem;           // item granted when chosen, -1 = none (after cost)
+    int costRupees;         // price checked + paid on selection, 0 = free
 };
 
 // One line of dialogue with optional scripting. Effects:
@@ -130,6 +132,9 @@ struct EnemyConfig
     const EnemyPhase* phases; // boss phase table (ascending hpBelow)
     int phaseCount;
     bool boss;              // arena boss: bigger sprite, room seal, banked defeat
+    bool miniBoss;          // mid-fight: seals the room + health bar, room-local death
+    bool strikeImmune;      // direct hero strikes (sword/spin/dash/hammer)
+                            // bounce off — only projectile hits land
     const char* customBehavior; // gamecode "custom:<name>" behavior, 0 = none
     const DropEntry* drops; // per-enemy drop table, 0 = engine default
     int dropCount;
@@ -165,6 +170,19 @@ constexpr unsigned OBJINT_CRYSTAL = 0x4000;    // sword strikes toggle the cryst
 constexpr unsigned OBJINT_LEAVES = 0x8000;     // smashes into leaves instead of shards
 constexpr unsigned OBJINT_TWO_FRAME = 0x10000; // two-frame sheet (frame 2 once opened)
 constexpr unsigned OBJINT_HIDES = 0x20000;    // hides an enemy (aux1) until lifted
+constexpr unsigned OBJINT_PULLABLE = 0x40000; // grabbable + pullable (action button grabs;
+                                              // walking away drags it one tile)
+constexpr unsigned OBJINT_HAMMER_SMASH = 0x80000; // hammer pounds shatter it
+constexpr unsigned OBJINT_HEAVY = 0x100000;    // liftable only with a lift passive item
+                                              // (gloves); too heavy to hoist bare-handed
+constexpr unsigned OBJINT_LEVER = 0x200000;   // pull-handle: grabbing and pulling flips it
+                                              // (aux2 = barrier link group it toggles)
+constexpr unsigned OBJINT_PLATFORM = 0x400000; // moving platform: glides a tile-waypoint
+                                              // rail, carrying whoever stands on it
+constexpr unsigned OBJINT_HOOKABLE = 0x800000; // hookshot latch: the chain grabs it
+                                              // and reels the hero in
+constexpr unsigned OBJINT_POWDER = 0x1000000; // magic powder awakens it (aux2 = the
+                                              // world flag the sprinkle sets)
 
 struct ObjectConfig
 {
@@ -203,6 +221,7 @@ constexpr int GRANTEFFECT_ADD_MAGIC = 4;
 constexpr int GRANTEFFECT_ADD_HEARTS = 5;   // heart container: max +1 heart
 constexpr int GRANTEFFECT_ADD_SMALL_KEY = 6;
 constexpr int GRANTEFFECT_ADD_BIG_KEY = 7;
+constexpr int GRANTEFFECT_SET_FLAG = 8;     // story flag set (param = flag index)
 
 // Grant rule: the engine applies `effect` (with param = item index or
 // amount), shows the item-get rise with `pickupFrame` (pickups sheet
@@ -224,6 +243,10 @@ struct ObjectSpawn
     int aux1;  // switch: 0 hold / 1 latch; readable: dialogue; chest: kind; hides: enemy; warp: room
     int aux2;  // switch/barrier/torch: link group; chest: grant kind; warp: tile x
     int aux3;  // barrier: color; chest: grant item index or amount; warp: tile y
+    // Platform rail (OBJINT_PLATFORM): tile waypoints as x,y pairs,
+    // glided in a loop (0 = stays put).
+    const short* path;
+    int pathCount;
 };
 
 // NPCs: character-driven townsfolk. Idle NPCs turn to face the hero when
@@ -252,6 +275,13 @@ struct PickupSpawn
     int kind;
 };
 
+// Room weather vocabulary (room "weather" data): purely presentational
+// layers drawn over the world (screen space), on top of any darkness/tint.
+constexpr int WEATHER_NONE = 0;
+constexpr int WEATHER_RAIN = 1;    // falling streaks over the screen
+constexpr int WEATHER_STORM = 2;   // rain + lightning flashes + thunder
+constexpr int WEATHER_FOG = 3;     // drifting fog bands
+
 struct RoomConfig
 {
     const char* name;
@@ -261,6 +291,7 @@ struct RoomConfig
     int spawnTileY;
     const char* music;
     const char* walkSfx;
+    const char* ambient;   // streamed, looping room ambience (birds, rain)
     const Encounter* instant;
     int instantCount;
     const Encounter* interactive;
@@ -273,7 +304,16 @@ struct RoomConfig
     int npcCount;
     const PickupSpawn* pickups;  // placed world items (hearts in grass...)
     int pickupCount;
+    const PickupSpawn* buried;  // buried treasure: dug up with the shovel
+    int buriedCount;
+    bool hasBoss;    // compass marker: the room spawns a boss
+    bool hasChest;   // compass marker: the room holds a chest
+    int bossFlag;    // story flag set when the room's boss falls, -1 = none
     bool dark;       // darkness mask: lantern + lit torches reveal
+    int weather;      // WEATHER_* overlay (rain, storm, fog)
+    int tintR;        // ambient tint, multiplied over the world (255 = none)
+    int tintG;
+    int tintB;
     int doorN;      // door kind id on each edge (-1 = no door)
     int doorS;
     int doorE;
@@ -305,7 +345,7 @@ struct TilesetConfig
 // generator. Indexed by tile id - 1, matching the ids stored in room layers.
 struct TileMeta
 {
-    unsigned char flags;
+    unsigned short flags;
     unsigned char damage;      // half-hearts, when TILE_FLAG_DAMAGE is set
     unsigned char cutResult;  // tile id left behind when cut, 0 = empty
     unsigned char bombResult; // tile id left behind when bombed, 255 = empty
@@ -315,14 +355,15 @@ struct TileMeta
     unsigned char heal;     // 1 = fairy-fountain water: refills hearts/magic
 };
 
-constexpr unsigned char TILE_FLAG_PIT = 0x01;      // hole: hero falls in
-constexpr unsigned char TILE_FLAG_DAMAGE = 0x02;   // hazard: hurts on contact
-constexpr unsigned char TILE_FLAG_CUTTABLE = 0x04;  // grass: sword cuts it
-constexpr unsigned char TILE_FLAG_WATER_DEEP = 0x08;    // deep water: splash + bounce back to the bank
-constexpr unsigned char TILE_FLAG_WATER_SHALLOW = 0x10; // shallow water: wading
-constexpr unsigned char TILE_FLAG_ICE = 0x20;           // ice: slippery momentum
-constexpr unsigned char TILE_FLAG_LEDGE = 0x40;         // ledge: vault over it along ledgeDir
-constexpr unsigned char TILE_FLAG_BOMBABLE = 0x80;       // cracked wall/floor: bombs blast it open
+constexpr unsigned short TILE_FLAG_PIT = 0x01;      // hole: hero falls in
+constexpr unsigned short TILE_FLAG_DAMAGE = 0x02;   // hazard: hurts on contact
+constexpr unsigned short TILE_FLAG_CUTTABLE = 0x04;  // grass: sword cuts it
+constexpr unsigned short TILE_FLAG_WATER_DEEP = 0x08;    // deep water: splash + bounce back to the bank
+constexpr unsigned short TILE_FLAG_WATER_SHALLOW = 0x10; // shallow water: wading
+constexpr unsigned short TILE_FLAG_ICE = 0x20;           // ice: slippery momentum
+constexpr unsigned short TILE_FLAG_LEDGE = 0x40;         // ledge: vault over it along ledgeDir
+constexpr unsigned short TILE_FLAG_BOMBABLE = 0x80;       // cracked wall/floor: bombs blast it open
+constexpr unsigned short TILE_FLAG_DIGGABLE = 0x100;      // soft soil: the shovel turns it over
 
 inline float virtualScale()
 {
@@ -360,6 +401,7 @@ constexpr InputBinding BINDING_ACTION = { KEY_Z, GAMEPAD_BUTTON_RIGHT_FACE_DOWN 
 constexpr InputBinding BINDING_SWORD = { KEY_X, GAMEPAD_BUTTON_RIGHT_FACE_LEFT };
 constexpr InputBinding BINDING_ITEM = { KEY_C, GAMEPAD_BUTTON_RIGHT_FACE_UP };
 constexpr InputBinding BINDING_DASH = { KEY_V, GAMEPAD_BUTTON_RIGHT_TRIGGER_1 };
+constexpr InputBinding BINDING_SHIELD = { KEY_LEFT_SHIFT, GAMEPAD_BUTTON_LEFT_TRIGGER_1 };
 constexpr InputBinding BINDING_PAUSE = { KEY_ENTER, GAMEPAD_BUTTON_MIDDLE_RIGHT };
 
 inline bool bindingPressed(const InputBinding& binding)
@@ -462,6 +504,8 @@ constexpr int PICKUP_ARROW = 4;
 constexpr int PICKUP_BOMB = 5;
 constexpr int PICKUP_MAGIC = 6;
 constexpr int PICKUP_HEART_CONTAINER = 7;
+constexpr int PICKUP_FAIRY = 8;  // full heal + magic refill, on the wing
+constexpr int PICKUP_KEY = 9;    // a small key lying in the world
 
 // Item use-action vocabulary (engine-owned; a game's items compose these
 // in resources/items/*.json). The engine interprets these; the per-item
@@ -471,6 +515,15 @@ constexpr int ITEM_USE_BOOMERANG = 1;  // boomerang flight: arc out, homing retu
 constexpr int ITEM_USE_ARROW = 2;      // arrow projectile
 constexpr int ITEM_USE_BOMB = 3;       // placed bomb at the hero's feet
 constexpr int ITEM_USE_BOLT = 4;       // element bolt (fire/ice rod)
+constexpr int ITEM_USE_HAMMER = 5;     // hero pound: windup + quake in the facing
+constexpr int ITEM_USE_SHOVEL = 6;     // hero dig: turns over diggable ground ahead
+constexpr int ITEM_USE_HOOKSHOT = 7;   // chained hook: latches, stuns, fetches
+constexpr int ITEM_USE_MEDALLION = 8;  // screen-wide element burst (element decides)
+constexpr int ITEM_USE_BYRNA = 9;      // toggle aura: invincible while magic drains
+constexpr int ITEM_USE_CAPE = 10;      // toggle cloak: invisible + intangible while magic drains
+constexpr int ITEM_USE_SOMARIA = 11;   // toggle block: spawns/removes the linked block type
+constexpr int ITEM_USE_POWDER = 12;    // sprinkle: stuns, lights torches, awakens shrines
+constexpr int ITEM_USE_FLUTE = 13;     // bird-summon fast travel to visited rooms
 
 // Projectile elements (rods, future medallions).
 constexpr int ELEMENT_NONE = 0;
@@ -479,8 +532,9 @@ constexpr int ELEMENT_ICE = 2;   // freezes enemies solid
 
 // Item configuration, baked per game from resources/items/<name>.json.
 // The use-action composes the vocabulary above with costs and an sfx cue;
-// passives are always-on effects (the lantern's dark-room light). An item
-// with useKind ITEM_USE_NONE is passive-only (using it plays the error cue).
+// passives are always-on effects (the lantern's dark-room light, the
+// flippers' deep-water swimming). An item with useKind ITEM_USE_NONE is
+// passive-only (using it plays the error cue).
 struct ItemConfig
 {
     const char* name;
@@ -494,6 +548,17 @@ struct ItemConfig
     const char* useSfx;  // audio file played on a successful use, 0 = none
     bool hasLight;       // passive: light radius in dark rooms
     int lightRadius;     // px
+    bool hasSwim;        // passive: deep water is swimmable (flippers)
+    bool hasLift;        // passive: heavy objects are liftable (gloves)
+    bool hasCompass;     // passive: the map marks chest/boss rooms
+    // World-flag upgrade (silver arrows, magical boomerang): while the
+    // flag is set, the use-action runs with the upgraded stats.
+    int upgradeFlag;     // world flag index, -1 = none
+    int upgradeSpeed;    // px/s while upgraded (0 = keep the default)
+    int upgradeDamage;   // hits per strike while upgraded (0 = default)
+    // Spawned object (Somaria-style block use-actions): the object type
+    // the use-action conjures/removes, -1 = none.
+    int spawnObject;
 };
 
 // Inventory: quantities + owned items + the equipped item (the item
@@ -501,7 +566,7 @@ struct ItemConfig
 // Process-lifetime until the save system lands.
 struct Inventory
 {
-    static const int MAX_ITEMS = 16;
+    static const int MAX_ITEMS = 20;
 
     int equippedItem;    // game-defined item id or -1 (empty hands)
     bool owned[MAX_ITEMS];

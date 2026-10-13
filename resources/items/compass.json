@@ -1,0 +1,6 @@
+{
+    "label": "COMPASS",
+    "passive": {
+        "compass": true
+    }
+}

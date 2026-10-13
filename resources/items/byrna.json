@@ -1,0 +1,7 @@
+{
+    "label": "CANE OF BYRNA",
+    "use": {
+        "kind": "byrna",
+        "sfx": "cane.wav"
+    }
+}

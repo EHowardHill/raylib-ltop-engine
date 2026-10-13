@@ -1,0 +1,43 @@
+{
+    "lines": [
+        {
+            "text": "Welcome to my shop! Finest gear in the field.",
+            "sfx": "rupee.wav"
+        },
+        {
+            "text": "What can I get you?",
+            "choice": [
+                {
+                    "text": "SHOVEL - 50 RUPEES",
+                    "cost": 50,
+                    "sfx": "wallet 2.wav",
+                    "give": "shovel",
+                    "goto": "thanks"
+                },
+                {
+                    "text": "HEART REFILL - 5 RUPEES",
+                    "cost": 5,
+                    "sfx": "wallet 2.wav",
+                    "goto": "thanks"
+                },
+                {
+                    "text": "NOT TODAY"
+                }
+            ]
+        },
+        {
+            "label": "thanks",
+            "text": "A fine purchase. My pleasure!",
+            "set": [
+                "shop_served"
+            ]
+        },
+        {
+            "text": "Short on rupees? Come back when your purse is heavier."
+        },
+        {
+            "text": "Come again any time!",
+            "if": "shop_served"
+        }
+    ]
+}

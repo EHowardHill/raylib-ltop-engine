@@ -1,0 +1,7 @@
+{
+    "label": "HOOKSHOT",
+    "use": {
+        "kind": "hookshot",
+        "sfx": "hookshot.wav"
+    }
+}

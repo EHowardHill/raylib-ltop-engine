@@ -66,6 +66,9 @@
         "72": {
             "bombable": true,
             "bomb_result": 0
+        },
+        "46": {
+            "dig": true
         }
     }
 }
