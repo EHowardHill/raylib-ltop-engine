@@ -1,5 +1,6 @@
 #include "dialogue.h"
 #include "assets.h"
+#include "sfx.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -17,49 +18,8 @@ static const float TEXT_PAD_X = 6.0f;
 static const float TEXT_PAD_Y = 5.0f;
 static const float CHARS_PER_SECOND = 30.0f;
 
-// Lazy sfx cache for scripted cues (name -> loaded Sound).
-static const int MAX_SCRIPT_SFX = 16;
-struct ScriptSfx
-{
-    char name[96];
-    Sound sound;
-    bool used;
-};
-static ScriptSfx scriptSfx[MAX_SCRIPT_SFX] = {};
-
-static Sound loadScriptSfx(const char* name)
-{
-    for (int i = 0; i < MAX_SCRIPT_SFX; i++)
-    {
-        if (scriptSfx[i].used && strcmp(scriptSfx[i].name, name) == 0)
-            return scriptSfx[i].sound;
-    }
-    for (int i = 0; i < MAX_SCRIPT_SFX; i++)
-    {
-        if (scriptSfx[i].used) continue;
-        char path[128];
-        snprintf(path, sizeof(path), "assets/audio/%s", name);
-        scriptSfx[i].sound = LoadSound(path);
-        scriptSfx[i].used = true;
-        snprintf(scriptSfx[i].name, sizeof(scriptSfx[i].name), "%s", name);
-        return scriptSfx[i].sound;
-    }
-    // Cache full: reuse slot 0 (playing a wrong cue beats crashing).
-    return scriptSfx[0].sound;
-}
-
-static void unloadScriptSfx()
-{
-    for (int i = 0; i < MAX_SCRIPT_SFX; i++)
-    {
-        if (scriptSfx[i].used)
-        {
-            UnloadSound(scriptSfx[i].sound);
-            scriptSfx[i].used = false;
-            scriptSfx[i].name[0] = '\0';
-        }
-    }
-}
+// Installed by the game at boot (see dialogue.h).
+bool (*gDialogueItemOwned)(int item) = 0;
 
 // Cursor up/down for the choice list (keyboard + gamepad dpad).
 static bool cursorUpPressed()
@@ -83,6 +43,7 @@ DialogueBox::DialogueBox()
       current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0),
       choiceActive(false), choiceCursor(0),
       musicRequest(), musicPending(false),
+      giveItem(-1), givePending(false),
       warpRoom(-1), warpTileX(0), warpTileY(0), warpPending(false)
 {
     for (int i = 0; i < MAX_ROWS; i++) rows[i].offset = 0;
@@ -103,7 +64,7 @@ void DialogueBox::shutdown()
     UnloadTexture(border);
     UnloadSound(letterSfx);
     UnloadSound(finishSfx);
-    unloadScriptSfx();
+    shutdownNamedSfx();
     current = 0;
     musicPending = false;
     warpPending = false;
@@ -144,6 +105,7 @@ void DialogueBox::open(const Dialogue& dialogue)
     choiceActive = false;
     choiceCursor = 0;
     musicPending = false;
+    givePending = false;
     warpPending = false;
     startLine();
 }
@@ -161,14 +123,29 @@ void DialogueBox::startLine()
         const DialogueLine& line = current->lines[lineIndex];
         if (line.ifFlag >= 0 && !gWorldFlags[line.ifFlag]) { lineIndex++; continue; }
         if (line.unlessFlag >= 0 && gWorldFlags[line.unlessFlag]) { lineIndex++; continue; }
+        if (line.ifItem >= 0 && !(gDialogueItemOwned && gDialogueItemOwned(line.ifItem)))
+        {
+            lineIndex++;
+            continue;
+        }
+        if (line.unlessItem >= 0 && gDialogueItemOwned && gDialogueItemOwned(line.unlessItem))
+        {
+            lineIndex++;
+            continue;
+        }
 
-        // Shown-effects: world flags, sfx cue, music switch.
+        // Shown-effects: world flags, sfx cue, music switch, item grant.
         applyFlags(line.setFlags, line.setCount, line.clearFlags, line.clearCount);
-        if (line.sfx) PlaySound(loadScriptSfx(line.sfx));
+        if (line.sfx) playNamedSfx(line.sfx);
         if (line.music)
         {
             snprintf(musicRequest, sizeof(musicRequest), "%s", line.music);
             musicPending = true;
+        }
+        if (line.giveItem >= 0)
+        {
+            giveItem = line.giveItem;
+            givePending = true;
         }
 
         choiceActive = false;
@@ -275,7 +252,7 @@ void DialogueBox::update()
     if (reveal < (float)totalChars)
     {
         int previous = (int)reveal;
-        reveal += CHARS_PER_SECOND * GetFrameTime();
+        reveal += CHARS_PER_SECOND * frameDt();
         if (reveal > (float)totalChars) reveal = (float)totalChars;
 
         int now = (int)reveal;
@@ -301,7 +278,7 @@ void DialogueBox::update()
         {
             const DialogueChoice& choice = line.choices[choiceCursor];
             applyFlags(choice.setFlags, choice.setCount, choice.clearFlags, choice.clearCount);
-            if (choice.sfx) PlaySound(loadScriptSfx(choice.sfx));
+            if (choice.sfx) playNamedSfx(choice.sfx);
             choiceActive = false;
 
             // The chosen option decides where the dialogue goes (the line's
@@ -338,6 +315,14 @@ const char* DialogueBox::takeMusicRequest()
     if (!musicPending) return 0;
     musicPending = false;
     return musicRequest;
+}
+
+bool DialogueBox::takeGiveRequest(int& item)
+{
+    if (!givePending) return false;
+    givePending = false;
+    item = giveItem;
+    return true;
 }
 
 bool DialogueBox::takeWarpRequest(int& room, int& tileX, int& tileY)

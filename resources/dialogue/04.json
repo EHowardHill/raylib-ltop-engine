@@ -10,6 +10,15 @@
         {
             "text": "Stay a while. The gate puzzle keeps the little ones busy.",
             "unless": "demo_agreed"
+        },
+        {
+            "text": "Here, take my old boomerang. Treat it well!",
+            "unless_item": "boomerang",
+            "give": "boomerang"
+        },
+        {
+            "text": "How's that boomerang of yours working out?",
+            "if_item": "boomerang"
         }
     ]
 }

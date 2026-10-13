@@ -50,8 +50,15 @@ fi
 # Generate the baked asset data and link the game
 .venv/bin/python3 scripts/generate_assets.py
 
+# Game-local C++ (resources/code/*.cpp) compiles into the binary with the
+# engine — the layer-4 seam (see NOTES.md "Custom behaviors").
+GAME_CODE=""
+for file in resources/code/*.cpp; do
+    if [ -e "$file" ]; then GAME_CODE="$GAME_CODE $file"; fi
+done
+
 mkdir -p "$OUT"
-em++ src/*.cpp src_auto/*.cpp "$RAYLIB_LIB" \
+em++ src/*.cpp src_auto/*.cpp $GAME_CODE "$RAYLIB_LIB" \
     -I"$RAYLIB_SRC/src" -Iinclude -Iinclude_auto \
     -DPLATFORM_WEB -O2 \
     -s USE_GLFW=3 -s ALLOW_MEMORY_GROWTH=1 -s ASYNCIFY \

@@ -1,0 +1,11 @@
+{
+    "label": "BOMBS",
+    "use": {
+        "kind": "bomb",
+        "cost": {
+            "ammo": "bomb",
+            "amount": 1
+        },
+        "sfx": "lay bomb.wav"
+    }
+}

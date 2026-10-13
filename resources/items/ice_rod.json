@@ -1,0 +1,11 @@
+{
+    "label": "ICE ROD",
+    "use": {
+        "kind": "bolt",
+        "element": "ice",
+        "cost": {
+            "magic": 2
+        },
+        "sfx": "ice rod.wav"
+    }
+}

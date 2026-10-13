@@ -1,0 +1,11 @@
+{
+    "label": "FIRE ROD",
+    "use": {
+        "kind": "bolt",
+        "element": "fire",
+        "cost": {
+            "magic": 2
+        },
+        "sfx": "fire rod.wav"
+    }
+}

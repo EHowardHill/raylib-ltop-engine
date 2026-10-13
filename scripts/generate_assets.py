@@ -85,6 +85,7 @@ def load_dialogues(flags):
     """Dialogue .json: {"lines": [<line>, ...]} where each <line> is either a
     plain text string or an object:
       {"text": ..., "label": ..., "if": <flag>, "unless": <flag>,
+       "if_item": <item>, "unless_item": <item>, "give": <item>,
        "set": [<flags>], "clear": [<flags>], "sfx": "<file>",
        "music": "<file>"|"", "goto": "<label>",
        "warp": {"room": "<room>", "tile": [x, y]},
@@ -104,6 +105,15 @@ def load_dialogues(flags):
             if value is None or value == "":
                 return -1
             return flags.index(value)
+
+        def item(value, what):
+            if value is None or value == "":
+                return -1
+            index = ITEM_INDEX.get(str(value), -1)
+            if index < 0:
+                warn("dialogue '%s' %s references unknown item '%s'"
+                     % (filename, what, value))
+            return index
 
         def flag_list(values, what):
             if values is None:
@@ -140,6 +150,9 @@ def load_dialogues(flags):
                 "label": entry.get("label"),
                 "if": flag(entry.get("if"), "if"),
                 "unless": flag(entry.get("unless"), "unless"),
+                "ifItem": item(entry.get("if_item"), "if_item"),
+                "unlessItem": item(entry.get("unless_item"), "unless_item"),
+                "give": item(entry.get("give"), "give"),
                 "set": flag_list(entry.get("set"), "set"),
                 "clear": flag_list(entry.get("clear"), "clear"),
                 "sfx": str(entry["sfx"]) if entry.get("sfx") else None,
@@ -238,51 +251,417 @@ def load_characters():
     return characters
 
 
-BEHAVIORS = {"": 0, "soldier": 1, "octorok": 2, "boss": 3}
+# --- Game identity ----------------------------------------------------------
 
-# Room object types: what "objects" entries in room json may reference. The
-# index order is baked into the engine as OBJECT_* constants (engine.h).
-# Per-type extras in room json: switches take "mode" ("hold"/"latch") and a
-# "link" id; barriers take a "link" id; signs take a "dialogue" name.
-OBJECT_TYPES = [
-    {"name": "pot", "image": "pot.png"},
-    {"name": "bush", "image": "bush.png"},
-    {"name": "block", "image": "block.png"},
-    {"name": "switch", "image": "switch.png"},
-    {"name": "barrier", "image": "barrier.png"},
-    {"name": "sign", "image": "sign.png"},
-    {"name": "chest", "image": "chest.png"},
-    {"name": "torch", "image": "torch.png"},
+def load_game():
+    """resources/game.json (optional): {"title": ..., "slug": ...}.
+    The title is engine chrome (title screen subtitle); the slug identifies
+    the game in save files so a save from one game is never loaded by
+    another (filesystem-safe, <= 15 chars)."""
+    title = "UNTITLED GAME"
+    slug = "game"
+    path = res("game.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        title = str(data.get("title") or title)
+        slug = str(data.get("slug") or slug)
+    clean = re.sub(r"[^a-z0-9-]", "", str(slug).lower()) or "game"
+    if clean != str(slug).lower():
+        warn("game slug '%s' is not filesystem-safe; using '%s'" % (slug, clean))
+    if len(clean) > 15:
+        warn("game slug '%s' is longer than 15 chars; truncating" % clean)
+        clean = clean[:15]
+    return {"title": title, "slug": clean}
+
+
+# --- Items (resources/items/<name>.json) -------------------------------------
+
+# Item use-action vocabulary, interpreted by the engine (ITEM_USE_*).
+ITEM_USE_KINDS = {"none": 0, "boomerang": 1, "arrow": 2, "bomb": 3, "bolt": 4}
+ELEMENTS = {"none": 0, "fire": 1, "ice": 2}
+
+
+def load_items():
+    """Item definitions live in resources/items/<name>.json:
+    {"label": <subscreen label>,
+     "use": {"kind": <use-action>, "element": "fire"|"ice" (bolts),
+             "cost": {"magic": N} or {"ammo": "arrow"|"bomb", "amount": N,
+                                       "rupee_fallback": bool},
+             "sfx": <audio file>},
+     "passive": {"light": <radius px>}}
+    Ids are assigned in sorted-filename order and emitted as ITEM_<NAME>
+    constants. All behavior is composed from the engine's use-action
+    vocabulary; the useEquippedItem switch is gone."""
+    items = []
+    directory = res("items")
+    if not os.path.isdir(directory):
+        warn("no items found in resources/items")
+        return items
+    for filename in sorted(os.listdir(directory)):
+        if not filename.endswith(".json"):
+            continue
+        name = filename[:-5]
+        with open(os.path.join(directory, filename), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+
+        label = str(data.get("label") or name.upper())
+        use = data.get("use") or {}
+        if not isinstance(use, dict):
+            warn("item '%s' has a bad 'use' %r (expected an object)" % (name, use))
+            use = {}
+
+        kind_name = str(use.get("kind") or "none")
+        if kind_name not in ITEM_USE_KINDS:
+            warn("item '%s' has unknown use kind '%s' %s"
+                 % (name, kind_name, sorted(ITEM_USE_KINDS)))
+            kind_name = "none"
+        element_name = str(use.get("element") or "none")
+        if element_name not in ELEMENTS:
+            warn("item '%s' has unknown element '%s' %s"
+                 % (name, element_name, sorted(ELEMENTS)))
+            element_name = "none"
+
+        cost = use.get("cost") or {}
+        if not isinstance(cost, dict):
+            warn("item '%s' has a bad 'cost' %r (expected an object)" % (name, cost))
+            cost = {}
+        magic_cost = max(0, int(cost.get("magic") or 0))
+        ammo = str(cost.get("ammo") or "")
+        bomb_cost = 0
+        arrow_cost = 0
+        arrow_fallback = False
+        if ammo == "bomb":
+            bomb_cost = max(0, int(cost.get("amount") or 1))
+        elif ammo == "arrow":
+            arrow_cost = max(0, int(cost.get("amount") or 1))
+            arrow_fallback = bool(cost.get("rupee_fallback", False))
+        elif ammo:
+            warn("item '%s' has unknown ammo kind '%s' (arrow/bomb)" % (name, ammo))
+
+        sfx = str(use["sfx"]) if use.get("sfx") else None
+
+        passive = data.get("passive") or {}
+        if not isinstance(passive, dict):
+            warn("item '%s' has a bad 'passive' %r (expected an object)"
+                 % (name, passive))
+            passive = {}
+        light = max(0, int(passive.get("light") or 0))
+
+        items.append({
+            "name": name,
+            "label": label,
+            "useKind": ITEM_USE_KINDS[kind_name],
+            "element": ELEMENTS[element_name],
+            "magicCost": magic_cost,
+            "bombCost": bomb_cost,
+            "arrowCost": arrow_cost,
+            "arrowRupeeFallback": arrow_fallback,
+            "sfx": sfx,
+            "light": light,
+        })
+    if len(items) > 16:
+        warn("%d items exceed the inventory slots (16); the extras are"
+             " unreachable" % len(items))
+    return items
+
+
+ITEM_INDEX = {}  # name -> id, filled by generate() after load_items()
+
+
+# --- Object types (resources/objects/types.json) -----------------------------
+
+# The engine's interaction vocabulary (OBJINT_* in engine.h): what a type
+# composed of, behaviorally. The engine interprets interactions; a game
+# defines its own types by composing them.
+OBJINT_NAMES = {
+    "solid": 0x1,          # blocks movement while on the ground
+    "floor": 0x2,          # walkable plate, drawn under entities
+    "liftable": 0x4,       # action button hoists it overhead
+    "cut": 0x8,            # sword swings smash it (grass-style)
+    "dash_smash": 0x10,    # pegasus dash shatters it
+    "pushable": 0x20,      # sustained push slides it one tile
+    "sinks": 0x40,         # push-block sinks onto latch switches
+    "weight": 0x80,        # counts as weight on floor switches
+    "switch": 0x100,       # floor plate (aux1 hold/latch, aux2 link)
+    "barrier": 0x200,      # linked gate (aux2 link, aux3 color)
+    "readable": 0x400,     # sign (aux1 dialogue)
+    "chest": 0x800,        # container (aux1 kind, aux2/aux3 grant)
+    "torch": 0x1000,       # lightable post (aux2 link)
+    "warp": 0x2000,        # warp pad (aux1 room, aux2/aux3 tile)
+    "crystal": 0x4000,     # sword strikes toggle the crystal state
+    "leaves": 0x8000,      # smashes into leaves instead of shards
+    "two_frame": 0x10000,  # two-frame sheet (frame 2 once opened)
+    "hides": 0x20000,      # hides an enemy (aux1) until lifted
+}
+
+# Baseline type set, used when the game ships no types.json (a fresh game
+# folder is playable from day one).
+DEFAULT_OBJECT_TYPES = [
+    {"name": "pot", "interactions": ["solid", "liftable", "dash_smash", "hides"]},
+    {"name": "bush", "interactions": ["solid", "liftable", "dash_smash", "cut", "leaves"]},
+    {"name": "block", "interactions": ["solid", "pushable", "sinks", "weight"]},
+    {"name": "switch", "interactions": ["floor", "switch"]},
+    {"name": "barrier", "interactions": ["solid", "barrier"]},
+    {"name": "sign", "interactions": ["solid", "readable"]},
+    {"name": "chest", "interactions": ["solid", "chest", "two_frame"]},
+    {"name": "torch", "interactions": ["solid", "torch"]},
+    {"name": "warp", "interactions": ["floor", "warp"]},
+    {"name": "crystal", "interactions": ["solid", "crystal"]},
 ]
-OBJECT_INDEX = {entry["name"]: i for i, entry in enumerate(OBJECT_TYPES)}
 
-# Chest kinds and grant kinds; baked as CHEST_*/GRANT_* (engine.h).
-CHEST_KINDS = {"normal": 0, "locked": 1, "big": 2}
 
-# Door kinds on room edges; baked as DOOR_* (engine.h).
-DOOR_KINDS = {"open": 0, "closed": 1, "locked": 2, "big": 3,
-              "bombable": 4, "shutter": 5}
-GRANT_KINDS = {"item": 0, "rupees": 1, "arrows": 2, "bombs": 3,
-               "magic": 4, "heart_container": 5, "key": 6, "big_key": 7}
+def load_object_types():
+    """Object type definitions live in resources/objects/types.json:
+    {"types": [{"name": ..., "image": <file>, "interactions": [...]}]}.
+    Types compose the engine's interaction vocabulary; room objects
+    reference types by name. Missing file = the baseline set above."""
+    global OBJECT_TYPES
+    path = res("objects", "types.json")
+    if not os.path.exists(path):
+        return [{"image": t["name"] + ".png", "interactions": list(t["interactions"])}
+                for t in DEFAULT_OBJECT_TYPES]
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    types = []
+    for entry in data.get("types") or []:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            warn("object type entry %r has no name" % entry)
+            continue
+        mask = 0
+        for interaction in entry.get("interactions") or []:
+            if interaction in OBJINT_NAMES:
+                mask |= OBJINT_NAMES[interaction]
+            else:
+                warn("object type '%s' has unknown interaction '%s' %s"
+                     % (entry["name"], interaction, sorted(OBJINT_NAMES)))
+        types.append({
+            "name": str(entry["name"]),
+            "image": str(entry.get("image") or (str(entry["name"]) + ".png")),
+            "interactionsMask": mask,
+        })
+    if len(types) > 16:
+        warn("%d object types exceed the engine pool (16)" % len(types))
+    OBJECT_TYPES = types
+    return types
 
-# Item button items. The index order is baked into the engine as ITEM_*
-# constants (engine.h); keep both sides in sync when adding items.
-ITEMS = [
-    {"name": "boomerang", "label": "BOOMERANG"},
-    {"name": "bow", "label": "BOW"},
-    {"name": "bombs", "label": "BOMBS"},
-    {"name": "fire_rod", "label": "FIRE ROD"},
-    {"name": "ice_rod", "label": "ICE ROD"},
-    {"name": "lantern", "label": "LANTERN"},
+
+OBJECT_INDEX = {}  # name -> id, filled by generate() after load_object_types()
+OBJECT_TYPES = []  # the loaded type list (load_rooms reads the masks)
+
+
+# --- Doors, chests, grants: rule tables ---------------------------------------
+
+# Door kinds on room edges. The kind's RULE is data (interpreted by the
+# engine): no per-kind switch branches exist in the engine.
+#   starts_open:   always passable (cosmetic when open)
+#   push_open:     a push from either side opens it, stays open
+#   key:           "small"/"big" key consumed on first pass
+#   bombable:      a blast at the wall midpoint blows it open
+#   live:          "enemies_dead" = open only while the room is cleared
+DOOR_KIND_DEFS = [
+    {"name": "open", "rule": {"starts_open": True}},
+    {"name": "closed", "rule": {"push_open": True}},
+    {"name": "locked", "rule": {"key": "small"}},
+    {"name": "big", "rule": {"key": "big"}},
+    {"name": "bombable", "rule": {"bombable": True}},
+    {"name": "shutter", "rule": {"live": "enemies_dead"}},
 ]
-ITEM_INDEX = {entry["name"]: i for i, entry in enumerate(ITEMS)}
+DOOR_KINDS = {entry["name"]: i for i, entry in enumerate(DOOR_KIND_DEFS)}
+
+# Chest kinds: what the aux1 kind costs to open.
+CHEST_KIND_DEFS = [
+    {"name": "normal", "key_cost": 0},
+    {"name": "locked", "key_cost": 1},
+    {"name": "big", "key_cost": 2},
+]
+CHEST_KINDS = {entry["name"]: i for i, entry in enumerate(CHEST_KIND_DEFS)}
+
+# Grant kinds (chest payloads; the trigger-vocabulary "grant" action).
+# effect = engine grant-effect vocabulary, pickup = pickups-sheet frame for
+# the rise visual (-1 = medallion), text = item-get description template
+# (%s = item label, %d = amount).
+GRANT_KIND_DEFS = [
+    {"name": "item", "effect": 0, "pickup": -1,
+     "text": "You got the %s!"},
+    {"name": "rupees", "effect": 1, "pickup": 1,
+     "text": "You found %d rupees!"},
+    {"name": "arrows", "effect": 2, "pickup": 4,
+     "text": "You got %d arrows!"},
+    {"name": "bombs", "effect": 3, "pickup": 5,
+     "text": "You got %d bombs!"},
+    {"name": "magic", "effect": 4, "pickup": 6,
+     "text": "Your magic power was restored!"},
+    {"name": "heart_container", "effect": 5, "pickup": 7,
+     "text": "You got a heart container! Your life force grew!"},
+    {"name": "key", "effect": 6, "pickup": -1,
+     "text": "You got a small key!"},
+    {"name": "big_key", "effect": 7, "pickup": -1,
+     "text": "You got the big key! It opens the biggest chest."},
+]
+GRANT_KINDS = {entry["name"]: i for i, entry in enumerate(GRANT_KIND_DEFS)}
+
+# Crystal barrier colors (barrier "color" extra, baked to aux3): linked
+# barriers follow their switch groups; colored ones follow the crystal
+# state (a saved world flag) instead.
+BARRIER_COLORS = {"linked": 0, "blue": 1, "red": 2}
+
+# Placed pickups (room "pickups" list) and per-enemy drop tables: kinds map
+# to the engine's pickups-sheet frames (PICKUP_*).
+PICKUP_KINDS = {"heart": 0, "rupee": 1, "rupee5": 2, "arrow": 4,
+                "bomb": 5, "magic": 6}
 
 
-def load_enemies():
+# --- Game code manifest (resources/code/) ------------------------------------
+
+def load_code_manifest():
+    """resources/code/manifest.json lists the behavior names the game's
+    C++ (resources/code/*.cpp) registers; JSON references them as
+    "custom:<name>" and the generator validates against this list."""
+    path = res("code", "manifest.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    behaviors = data.get("behaviors") or []
+    if not isinstance(behaviors, list):
+        warn("code manifest 'behaviors' is not a list")
+        return []
+    return [str(name) for name in behaviors]
+
+
+# Enemy behavior presets: named compositions of the engine's component
+# vocabulary. A preset fills component params from the enemy's stats;
+# explicit "components" in stats override/extend the preset.
+ENEMY_PRESETS = ["", "soldier", "octorok", "boss"]
+
+
+def enemy_components(name, stats, manifest):
+    """Compose the baked component parameters for one enemy.
+
+    Presets (the "behavior" stat):
+      ""        plain wanderer
+      soldier   patrols, charges when the hero is within "sight" px
+      octorok   walks, pauses, spits rocks roughly every "shoot_period"
+      boss      arena boss: phased charges (faster as health drops)
+      custom:X  a registered game-code behavior (resources/code/)
+
+    Explicit "components" (optional, overrides the preset):
+      {"charge": {"sight": px, "speed_scale": F, "stun_on_wall": bool},
+       "shoot": {"period": N}, "mover": {"walk_time": s, "turn_chance": bool},
+       "phases": [{"hp_below": F, "speed_scale": F}, ...],
+       "boss": bool, "custom": "<name>"}
+    """
+    comps = {
+        "charge_sight": 0.0, "charge_scale": 0.0, "charge_stun": False,
+        "shoot_period": 0, "walk_segment": 0.0, "turn_in_place": False,
+        "phases": [], "boss": False, "custom": None,
+    }
+    behavior = str(stats.get("behavior") or "")
+    sight = int(stats.get("sight") or 0)
+    period = int(stats.get("shoot_period") or 0)
+
+    if behavior == "soldier":
+        comps["charge_sight"] = float(sight or 150)
+        comps["charge_scale"] = 2.2
+        comps["charge_stun"] = True
+    elif behavior == "octorok":
+        comps["shoot_period"] = period or 2
+        comps["walk_segment"] = float(period or 2)
+        comps["turn_in_place"] = True
+    elif behavior == "boss":
+        comps["boss"] = True
+        comps["charge_sight"] = float(sight or 150)
+        comps["charge_scale"] = 2.2
+        comps["charge_stun"] = True
+        # Phases: charge speed scales up as health drops (ascending
+        # hp_below; the engine takes the first threshold matched).
+        comps["phases"] = [(0.34, 3.4), (0.67, 2.6)]
+    elif behavior.startswith("custom:"):
+        comps["custom"] = behavior[len("custom:"):]
+    elif behavior != "":
+        warn("enemy '%s' has unknown behavior '%s' (presets: %s, or custom:<name>)"
+             % (name, behavior, ENEMY_PRESETS[1:]))
+
+    explicit = stats.get("components") or {}
+    if not isinstance(explicit, dict):
+        warn("enemy '%s' has a bad 'components' %r (expected an object)"
+             % (name, explicit))
+        explicit = {}
+    charge = explicit.get("charge")
+    if isinstance(charge, dict):
+        if "sight" in charge: comps["charge_sight"] = max(0.0, float(charge["sight"]))
+        if "speed_scale" in charge: comps["charge_scale"] = max(0.0, float(charge["speed_scale"]))
+        if "stun_on_wall" in charge: comps["charge_stun"] = bool(charge["stun_on_wall"])
+    shoot = explicit.get("shoot")
+    if isinstance(shoot, dict) and "period" in shoot:
+        comps["shoot_period"] = max(0, int(shoot["period"]))
+        if "walk_time" not in (explicit.get("mover") or {}):
+            comps["walk_segment"] = float(comps["shoot_period"])
+    mover = explicit.get("mover")
+    if isinstance(mover, dict):
+        if "walk_time" in mover: comps["walk_segment"] = max(0.0, float(mover["walk_time"]))
+        if "turn_chance" in mover: comps["turn_in_place"] = bool(mover["turn_chance"])
+    if "boss" in explicit:
+        comps["boss"] = bool(explicit["boss"])
+    phases = explicit.get("phases")
+    if isinstance(phases, list) and phases:
+        table = []
+        for phase in phases:
+            if not isinstance(phase, dict):
+                warn("enemy '%s' has a bad phase %r" % (name, phase))
+                continue
+            table.append((max(0.0, min(1.0, float(phase.get("hp_below") or 0.0))),
+                          max(0.0, float(phase.get("speed_scale") or 1.0))))
+        if table:
+            table.sort(key=lambda p: p[0])  # ascending hp_below
+            comps["phases"] = table
+    if explicit.get("custom"):
+        comps["custom"] = str(explicit["custom"])
+
+    # "boss": true stat shortcut (kept for compatibility).
+    if stats.get("boss"):
+        comps["boss"] = True
+
+    if comps["custom"] and comps["custom"] not in manifest:
+        warn("enemy '%s' references custom behavior '%s' that is not in"
+             " resources/code/manifest.json" % (name, comps["custom"]))
+    return comps
+
+
+def parse_enemy_drops(name, stats):
+    """Per-enemy drop table: {"drops": {"heart": 20, "rupee": 11, ...}}
+    maps pickup kinds to weights. No table = the engine default roll."""
+    drops = stats.get("drops")
+    if drops is None:
+        return []
+    if not isinstance(drops, dict):
+        warn("enemy '%s' has a bad 'drops' %r (expected kind -> weight)"
+             % (name, drops))
+        return []
+    table = []
+    for kind_name, weight in drops.items():
+        if kind_name not in PICKUP_KINDS:
+            warn("enemy '%s' drop kind '%s' is unknown %s"
+                 % (name, kind_name, sorted(PICKUP_KINDS)))
+            continue
+        try:
+            weight_value = max(0, int(weight))
+        except (TypeError, ValueError):
+            warn("enemy '%s' drop '%s' has a bad weight %r" % (name, kind_name, weight))
+            continue
+        if weight_value <= 0:
+            continue
+        table.append((PICKUP_KINDS[kind_name], weight_value))
+    return table
+
+
+def load_enemies(manifest):
     """Enemy definitions live in resources/enemies/<name>.json next to their
     sprite sheet (resources/enemies/<name>.png, or an "image" override to
-    reuse another sheet - variants). Stats: hp, speed (px/s), damage
-    (half-hearts), behavior, sight (px), shoot_period (seconds)."""
+    reuse another sheet - variants). Stats compose engine components via a
+    behavior preset or explicit "components"; "drops" is an optional
+    per-enemy drop table."""
     enemies = []
     directory = res("enemies")
     if not os.path.isdir(directory):
@@ -306,10 +685,8 @@ def load_enemies():
         frame_count = (image_width // TILE) * (image_height // TILE) if image_width else 0
 
         stats = data.get("stats") or {}
-        behavior = str(stats.get("behavior") or "")
-        if behavior not in BEHAVIORS:
-            warn("enemy '%s' has unknown behavior '%s'" % (name, behavior))
-
+        comps = enemy_components(name, stats, manifest)
+        drops = parse_enemy_drops(name, stats)
         color = data.get("color") or [200, 60, 60]
 
         enemies.append({
@@ -323,12 +700,20 @@ def load_enemies():
             "hp": max(0, int(stats.get("hp") or 2)),
             "speed": max(0, int(stats.get("speed") or 40)),
             "damage": max(0, int(stats.get("damage") or 1)),
-            "behavior": BEHAVIORS.get(behavior, 0),
-            "boss": bool(stats.get("boss", False)) or behavior == "boss",
-            "sight": max(0, int(stats.get("sight") or 150)),
-            "shootPeriod": max(0, int(stats.get("shoot_period") or 0)),
+            "chargeSight": comps["charge_sight"],
+            "chargeScale": comps["charge_scale"],
+            "chargeStun": comps["charge_stun"],
+            "shootPeriod": comps["shoot_period"],
+            "walkSegment": comps["walk_segment"],
+            "turnInPlace": comps["turn_in_place"],
+            "phases": comps["phases"],
+            "boss": comps["boss"],
+            "custom": comps["custom"],
+            "drops": drops,
             "color": [int(max(0, min(255, c))) for c in color],
         })
+    if len(enemies) > 16:
+        warn("%d enemies exceed the engine pool (16)" % len(enemies))
     return enemies
 
 
@@ -362,17 +747,19 @@ def load_tile_meta(tileset):
     Format: {"tiles": {"<id>": {"pit": true, "damage": 1, "cuttable": true,
     "cut_result": <tile id>, "water": "deep"|"shallow", "ice": true,
     "push": [dx, dy], "ledge": "down"|"right"|"left"|"up",
-    "bombable": true, "bomb_result": <tile id>}}}
+    "bombable": true, "bomb_result": <tile id>, "heal": true}}}
     Tile ids are 1-based frame indices, matching the ids used in room layers.
     "damage" is measured in half-hearts. "cut_result" is the tile id left
     behind when the tile is cut (0 = empty). "push" is a conveyor/current/wind
     drift in px/s applied to whoever stands on the tile. "ledge" marks a
     one-way vault-over ledge facing that direction. "bombable" marks cracked
     walls/floors; "bomb_result" (0 = empty, default) is what blasts leave.
+    "heal" marks fairy-fountain water: standing on it slowly refills hearts
+    and magic.
     """
     count = tileset["tileCount"] if tileset else 0
     meta = [{"flags": 0, "damage": 0, "cutResult": 0, "bombResult": 255,
-             "pushX": 0, "pushY": 0, "ledgeDir": 0}
+             "pushX": 0, "pushY": 0, "ledgeDir": 0, "heal": 0}
             for _ in range(max(count, 0))]
 
     path = res("tiles", "tiles.json")
@@ -451,6 +838,8 @@ def load_tile_meta(tileset):
             entry["flags"] |= 128
             if props.get("bomb_result") is not None:
                 entry["bombResult"] = min(255, max(0, int(props["bomb_result"])))
+        if props.get("heal"):
+            entry["heal"] = 1
     return meta
 
 
@@ -561,11 +950,16 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             if index < 0:
                 warn("room '%s' references unknown object type '%s'" % (stem, type_name))
                 continue
+            mask = OBJECT_TYPES[index]["interactionsMask"]
             location = entry.get("location") or [0, 0]
             aux1 = -1
             aux2 = 0
             aux3 = 0
-            if type_name == "switch":
+            warp_room_raw = None
+            # Aux packing is driven by the type's interactions (engine
+            # vocabulary), never by type name: a new type that composes the
+            # same interactions consumes the same extras.
+            if mask & OBJINT_NAMES["switch"]:
                 mode = entry.get("mode") or "hold"
                 if mode not in ("hold", "latch"):
                     warn("room '%s' switch has unknown mode '%s' (hold/latch); using hold"
@@ -576,30 +970,53 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
                     aux2 = int(entry.get("link") or 0)
                 except (TypeError, ValueError):
                     warn("room '%s' switch has a bad link id %r" % (stem, entry.get("link")))
-            elif type_name == "barrier":
+            if mask & OBJINT_NAMES["barrier"]:
                 try:
                     aux2 = int(entry.get("link") or 0)
                 except (TypeError, ValueError):
                     warn("room '%s' barrier has a bad link id %r" % (stem, entry.get("link")))
-            elif type_name == "sign":
+                color = entry.get("color") or "linked"
+                if color in BARRIER_COLORS:
+                    aux3 = BARRIER_COLORS[color]
+                else:
+                    warn("room '%s' barrier has unknown color '%s' %s"
+                         % (stem, color, sorted(BARRIER_COLORS)))
+                    aux3 = 0
+            if mask & OBJINT_NAMES["readable"]:
                 dialogue_name = entry.get("dialogue")
                 if dialogue_name:
                     aux1 = dialogue_index.get(dialogue_name, -1)
                     if aux1 < 0:
                         warn("room '%s' sign references unknown dialogue '%s'"
                              % (stem, dialogue_name))
-            elif type_name == "torch":
+            if mask & OBJINT_NAMES["torch"]:
                 try:
                     aux2 = int(entry.get("link") or 0)
                 except (TypeError, ValueError):
                     warn("room '%s' torch has a bad link id %r" % (stem, entry.get("link")))
-            elif type_name == "chest":
+            if mask & OBJINT_NAMES["hides"]:
+                # "hides": enemy name — lifting the object reveals an ambush.
+                hides_name = entry.get("hides")
+                if hides_name:
+                    aux1 = enemy_index.get(str(hides_name), -1)
+                    if aux1 < 0:
+                        warn("room '%s' object hides unknown enemy '%s'"
+                             % (stem, hides_name))
+            if mask & OBJINT_NAMES["warp"]:
+                # "warp": {"room": ..., "tile": [x, y]} — the room resolves
+                # to a ROOMS[] index once every room is loaded (aux1).
+                warp_spec = entry.get("warp") or {}
+                warp_room_raw = str(warp_spec.get("room") or "")
+                tile = warp_spec.get("tile") or [0, 0]
+                aux2 = int(tile[0])
+                aux3 = int(tile[1])
+            if mask & OBJINT_NAMES["chest"]:
                 kind = entry.get("kind") or "normal"
                 if kind in CHEST_KINDS:
                     aux1 = CHEST_KINDS[kind]
                 else:
-                    warn("room '%s' chest has unknown kind '%s' (normal/locked/big)"
-                         % (stem, kind))
+                    warn("room '%s' chest has unknown kind '%s' %s"
+                         % (stem, kind, sorted(CHEST_KINDS)))
                     aux1 = 0
                 grant = entry.get("grant") or {}
                 grant_kind = grant.get("kind") or "rupees"
@@ -617,7 +1034,23 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
                             warn("room '%s' chest grants unknown item '%s'"
                                  % (stem, item_name))
             objects.append({"x": int(location[0]), "y": int(location[1]),
-                            "type": index, "aux1": aux1, "aux2": aux2, "aux3": aux3})
+                            "type": index, "aux1": aux1, "aux2": aux2, "aux3": aux3,
+                            "warpRoomRaw": warp_room_raw})
+
+        # Placed pickups ("hearts in grass", buried rupees): spawned fresh
+        # on every room entry, like LttP field pickups.
+        pickup_spawns = []
+        for entry in data.get("pickups") or []:
+            if not isinstance(entry, dict):
+                continue
+            kind_name = entry.get("kind") or ""
+            if kind_name not in PICKUP_KINDS:
+                warn("room '%s' pickup has unknown kind '%s' %s"
+                     % (stem, kind_name, sorted(PICKUP_KINDS)))
+                continue
+            location = entry.get("location") or [0, 0]
+            pickup_spawns.append({"x": int(location[0]), "y": int(location[1]),
+                                 "kind": PICKUP_KINDS[kind_name]})
 
         npc_spawns = []
         for entry in data.get("npcs") or []:
@@ -635,10 +1068,17 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
                 if dialogue_idx < 0:
                     warn("room '%s' npc references unknown dialogue '%s'" % (stem, dialogue_name))
             location = entry.get("location") or [0, 0]
+            path = []
+            for point in entry.get("path") or []:
+                if not isinstance(point, (list, tuple)) or len(point) < 2:
+                    warn("room '%s' npc path point %r is not [x, y]" % (stem, point))
+                    continue
+                path.extend([int(point[0]), int(point[1])])
             npc_spawns.append({
                 "x": int(location[0]), "y": int(location[1]),
                 "character": character, "dialogue": dialogue_idx,
                 "wander": bool(entry.get("wander", False)),
+                "path": path,
                 # Raw flag names; resolved to indices once every dialogue
                 # has registered its flags.
                 "ifFlag": entry.get("if"),
@@ -669,6 +1109,7 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
             "interactive": encounter_list("interactive"),
             "enemySpawns": enemies,
             "objectSpawns": objects,
+            "pickupSpawns": pickup_spawns,
             "npcSpawns": npc_spawns,
             "dark": bool(data.get("dark", False)),
             "doorN": doors.get("north", -1),
@@ -725,6 +1166,14 @@ def load_rooms(dialogue_index, character_index, enemy_index, tile_count=0):
         room["exitS"] = resolve_exit(room["name"], raw.get("south"))
         room["exitE"] = resolve_exit(room["name"], raw.get("east"))
         room["exitW"] = resolve_exit(room["name"], raw.get("west"))
+
+    # Resolve warp-pad targets ("warp": {"room": ...}) to ROOMS[] indices.
+    for room in rooms:
+        for obj in room["objectSpawns"]:
+            raw = obj.pop("warpRoomRaw")
+            if raw is None:
+                continue
+            obj["aux1"] = resolve_exit(room["name"], raw)
     return rooms
 
 
@@ -773,7 +1222,7 @@ def emit_dialogues(c, dialogues):
                 c.append("")
 
             line_refs.append(
-                "    { %s, %d, %d, %d, %s, %d, %s, %d, %s, %s, %d, %d, %d, %d, %s },"
+                "    { %s, %d, %d, %d, %s, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %s },"
                 % (cstr(line["text"]), line["gotoLine"], line["if"], line["unless"],
                    (lbase + "_SET") if line["set"] else "0", len(line["set"]),
                    (lbase + "_CLEAR") if line["clear"] else "0", len(line["clear"]),
@@ -782,6 +1231,7 @@ def emit_dialogues(c, dialogues):
                    line.get("warpRoomIndex", -1),
                    line["warpTile"][0] if line["warpTile"] else 0,
                    line["warpTile"][1] if line["warpTile"] else 0,
+                   line["ifItem"], line["unlessItem"], line["give"],
                    len(line["choices"]),
                    (lbase + "_CHOICES") if line["choices"] else "0"))
 
@@ -791,7 +1241,7 @@ def emit_dialogues(c, dialogues):
                 c.append(ref)
             c.append("};")
         else:
-            c.append("static const DialogueLine %s_LINES[] = { { 0, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0 } };" % base)
+            c.append("static const DialogueLine %s_LINES[] = { { 0, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, -1, -1, 0, 0 } };" % base)
         c.append("")
 
     c.append("const Dialogue DIALOGUES[] = {")
@@ -842,36 +1292,141 @@ def emit_characters(c, characters):
     c.append("")
 
 
+def cfloat(value):
+    """Emit a C float literal ("2.2f", "0.0f")."""
+    text = "%.6g" % float(value)
+    if "." not in text and "e" not in text and "inf" not in text and "nan" not in text:
+        text += ".0"
+    return text + "f"
+
+
 def emit_enemies(c, enemies):
     for enemy in enemies:
         base = "ENEMY_%s" % sym(enemy["name"])
         emit_character_frame_arrays(c, base, enemy["anims"])
 
+        # Boss phase tables (ascending hp_below; first threshold matched wins).
+        if enemy["phases"]:
+            c.append("static const EnemyPhase %s_PHASES[] = {" % base)
+            entries = ", ".join("{ %s, %s }" % (cfloat(hp), cfloat(scale))
+                                for hp, scale in enemy["phases"])
+            c.append("    %s," % entries)
+            c.append("};")
+            c.append("")
+        # Per-enemy drop tables (kind -> weight); 0 = the engine default roll.
+        if enemy["drops"]:
+            c.append("static const DropEntry %s_DROPS[] = {" % base)
+            entries = ", ".join("{ %d, %d }" % (kind, weight)
+                                for kind, weight in enemy["drops"])
+            c.append("    %s," % entries)
+            c.append("};")
+            c.append("")
+
     c.append("const EnemyConfig ENEMIES[] = {")
     for enemy in enemies:
         base = "ENEMY_%s" % sym(enemy["name"])
-        extra = "%d, %d, %d, %d, %d, %d, %s" % (enemy["hp"], enemy["speed"], enemy["damage"],
-                                                enemy["behavior"], enemy["sight"],
-                                                enemy["shootPeriod"],
-                                                "true" if enemy["boss"] else "false")
+        extra = (
+            "%d, %d, %d, "
+            "%s, %s, %s, "
+            "%d, %s, %s, "
+            "%s, %d, "
+            "%s, %s, "
+            "%s, %d"
+            % (enemy["hp"], enemy["speed"], enemy["damage"],
+               cfloat(enemy["chargeSight"]), cfloat(enemy["chargeScale"]),
+               "true" if enemy["chargeStun"] else "false",
+               enemy["shootPeriod"], cfloat(enemy["walkSegment"]),
+               "true" if enemy["turnInPlace"] else "false",
+               (base + "_PHASES") if enemy["phases"] else "0",
+               len(enemy["phases"]),
+               "true" if enemy["boss"] else "false",
+               cstr(enemy["custom"]) if enemy["custom"] else "0",
+               (base + "_DROPS") if enemy["drops"] else "0",
+               len(enemy["drops"]))
+        )
         emit_character_config_entries(c, base, enemy, extra)
     c.append("};")
     c.append("const int ENEMY_COUNT = %d;" % len(enemies))
     c.append("")
 
+
+def emit_objects(c, object_types):
+    """Object types: name, sprite sheet, and the baked interaction mask
+    (engine vocabulary). Room objects reference types by index; the engine
+    interprets the interactions, never the type identity."""
     c.append("const ObjectConfig OBJECTS[] = {")
-    for entry in OBJECT_TYPES:
-        c.append("    { %s, %s }," % (cstr(entry["name"]),
-                                      cstr("assets/objects/%s" % entry["image"])))
+    for entry in object_types:
+        c.append("    { %s, %s, 0x%X },"
+                 % (cstr(entry["name"]),
+                    cstr("assets/objects/%s" % entry["image"]),
+                    entry["interactionsMask"]))
     c.append("};")
-    c.append("const int OBJECT_COUNT = %d;" % len(OBJECT_TYPES))
+    c.append("const int OBJECT_COUNT = %d;" % len(object_types))
     c.append("")
 
+
+def emit_items(c, items):
+    """Item configs: subscreen label, use-action (engine vocabulary +
+    costs + sfx name), passive flags. The engine interprets these; the
+    per-item switch is gone."""
     c.append("const ItemConfig ITEMS[] = {")
-    for entry in ITEMS:
-        c.append("    { %s, %s }," % (cstr(entry["name"]), cstr(entry["label"])))
+    for item in items:
+        c.append("    { %s, %s, %d, %d, %d, %d, %d, %s, %s, %s, %d },"
+                 % (cstr(item["name"]), cstr(item["label"]),
+                    item["useKind"], item["element"],
+                    item["magicCost"], item["bombCost"], item["arrowCost"],
+                    "true" if item["arrowRupeeFallback"] else "false",
+                    cstr(item["sfx"]) if item["sfx"] else "0",
+                    "true" if item["light"] > 0 else "false",
+                    item["light"]))
     c.append("};")
-    c.append("const int ITEM_COUNT = %d;" % len(ITEMS))
+    c.append("const int ITEM_COUNT = %d;" % len(items))
+    c.append("")
+
+
+def emit_rules(c):
+    """Rule tables for door kinds, chest kinds, and grant kinds. The engine
+    consults these instead of switching on kind constants: kinds are data."""
+    c.append("const DoorRule DOOR_RULES[] = {")
+    for entry in DOOR_KIND_DEFS:
+        rule = entry["rule"]
+        c.append("    { %s, %s, %d, %s, %s },  // %s"
+                 % ("true" if rule.get("starts_open") else "false",
+                    "true" if rule.get("push_open") else "false",
+                    1 if rule.get("key") == "small" else (2 if rule.get("key") == "big" else 0),
+                    "true" if rule.get("bombable") else "false",
+                    "true" if rule.get("live") == "enemies_dead" else "false",
+                    entry["name"]))
+    c.append("};")
+    c.append("const int DOOR_KIND_COUNT = %d;" % len(DOOR_KIND_DEFS))
+    c.append("")
+    c.append("const ChestRule CHEST_RULES[] = {")
+    for entry in CHEST_KIND_DEFS:
+        c.append("    { %d },  // %s" % (entry["key_cost"], entry["name"]))
+    c.append("};")
+    c.append("const int CHEST_KIND_COUNT = %d;" % len(CHEST_KIND_DEFS))
+    c.append("")
+    c.append("const GrantRule GRANT_RULES[] = {")
+    for entry in GRANT_KIND_DEFS:
+        c.append("    { %d, %d, %s },  // %s"
+                 % (entry["effect"], entry["pickup"], cstr(entry["text"]),
+                    entry["name"]))
+    c.append("};")
+    c.append("const int GRANT_KIND_COUNT = %d;" % len(GRANT_KIND_DEFS))
+    c.append("")
+
+
+def emit_game(c, game, manifest):
+    """Game identity + the game-code behavior manifest (resources/code/):
+    the names game code registers; JSON references them as "custom:<name>"."""
+    c.append("const char* const GAME_TITLE = %s;" % cstr(game["title"]))
+    c.append("const char* const GAME_SLUG = %s;" % cstr(game["slug"]))
+    c.append("")
+    c.append("const char* const CUSTOM_BEHAVIOR_NAMES[] = {")
+    for name in manifest:
+        c.append("    %s," % cstr(name))
+    c.append("};")
+    c.append("const int CUSTOM_BEHAVIOR_COUNT = %d;" % len(manifest))
     c.append("")
 
 
@@ -882,13 +1437,14 @@ def emit_tile_meta(c, meta):
         for i in range(0, len(meta), per_line):
             chunk = meta[i:i + per_line]
             c.append("    " + " ".join(
-                "{ %d, %d, %d, %d, %d, %d, %d }," % (m["flags"], m["damage"],
-                                                     m["cutResult"], m["bombResult"],
-                                                     m["pushX"], m["pushY"], m["ledgeDir"])
+                "{ %d, %d, %d, %d, %d, %d, %d, %d }," % (m["flags"], m["damage"],
+                                                        m["cutResult"], m["bombResult"],
+                                                        m["pushX"], m["pushY"], m["ledgeDir"],
+                                                        m["heal"])
                 for m in chunk))
         c.append("};")
     else:
-        c.append("const TileMeta TILE_META[] = { { 0, 0, 0, 255, 0, 0, 0 } };")
+        c.append("const TileMeta TILE_META[] = { { 0, 0, 0, 255, 0, 0, 0, 0 } };")
     c.append("const int TILE_META_COUNT = %d;" % len(meta))
     c.append("")
 
@@ -935,14 +1491,30 @@ def emit_rooms(c, rooms):
             c.append("};")
             c.append("")
 
+        if room["pickupSpawns"]:
+            name = "%s_PICKUPS" % base
+            c.append("static const PickupSpawn %s[%d] = {" % (name, len(room["pickupSpawns"])))
+            entries = ", ".join("{ %d, %d, %d }" % (p["x"], p["y"], p["kind"])
+                                for p in room["pickupSpawns"])
+            c.append("    %s," % entries)
+            c.append("};")
+            c.append("")
+
         if room["npcSpawns"]:
+            # Path waypoints bake as per-NPC short arrays (x,y pairs).
+            for ni, n in enumerate(room["npcSpawns"]):
+                if n["path"]:
+                    emit_array(c, "short", "%s_NPC%d_PATH" % (base, ni), n["path"],
+                               per_line=12)
             name = "%s_NPCS" % base
             c.append("static const NpcSpawn %s[%d] = {" % (name, len(room["npcSpawns"])))
-            entries = ", ".join("{ %d, %d, %d, %d, %s, %d, %d }"
+            entries = ", ".join("{ %d, %d, %d, %d, %s, %s, %d, %d, %d }"
                                 % (n["x"], n["y"], n["character"], n["dialogue"],
                                    "true" if n["wander"] else "false",
+                                   ("%s_NPC%d_PATH" % (base, ni)) if n["path"] else "0",
+                                   len(n["path"]) // 2,
                                    n["ifFlag"], n["unlessFlag"])
-                                for n in room["npcSpawns"])
+                                for ni, n in enumerate(room["npcSpawns"]))
             c.append("    %s," % entries)
             c.append("};")
             c.append("")
@@ -970,6 +1542,9 @@ def emit_rooms(c, rooms):
         npc_ref = "0"
         if room["npcSpawns"]:
             npc_ref = "%s_NPCS" % base
+        pickup_ref = "0"
+        if room["pickupSpawns"]:
+            pickup_ref = "%s_PICKUPS" % base
 
         # Field list built programmatically: no positional format string to
         # keep in sync with the RoomConfig member order.
@@ -986,6 +1561,7 @@ def emit_rooms(c, rooms):
             enemy_ref, str(len(room["enemySpawns"])),
             object_ref, str(len(room["objectSpawns"])),
             npc_ref, str(len(room["npcSpawns"])),
+            pickup_ref, str(len(room["pickupSpawns"])),
             "true" if room["dark"] else "false",
             str(room["doorN"]), str(room["doorS"]),
             str(room["doorE"]), str(room["doorW"]),
@@ -1431,6 +2007,28 @@ def create_object_bitmap(path, kind):
             return wood if (x * 5 + y * 3) % 13 else wood_light
         return clear
 
+    def warp(x, y):
+        # blue rune pad: square plate with a glowing triple spiral
+        plate = (52, 66, 110, 255)
+        plate_light = (78, 96, 152, 255)
+        plate_dark = (32, 42, 78, 255)
+        rune = (130, 205, 255, 255)
+        if x < 3 or y < 3 or x > 28 or y > 28:
+            return clear
+        if x in (3, 28) or y in (3, 28):
+            return plate_dark
+        if x < 6 or y < 6 or x > 25 or y > 25:
+            return plate_light if (x + y) % 7 else plate
+        dx = x - 15.5
+        dy = y - 15.5
+        d = math.sqrt(dx * dx + dy * dy)
+        if d < 11.5:
+            angle = math.atan2(dy, dx)
+            phase = (angle * 3.0 - d * 0.85) % (2.0 * math.pi)
+            if min(phase, 2.0 * math.pi - phase) < 0.55:
+                return rune
+        return plate if (x * 3 + y * 7) % 11 else plate_light
+
     if kind == "chest":
         # Two frames: 0 closed, 1 open (lid up + dark interior).
         def chest(opened):
@@ -1475,9 +2073,34 @@ def create_object_bitmap(path, kind):
         write_png(path, frame * 2, frame, [bytes(r) for r in rows])
         return True
 
+    def crystal(x, y):
+        # stone pedestal with a faceted gem floating above it
+        stone = (120, 118, 132, 255)
+        stone_dark = (78, 76, 92, 255)
+        stone_light = (158, 156, 172, 255)
+        gem = (150, 170, 230, 255)
+        if 10 <= y <= 28 and 11 <= x <= 20:
+            if y == 28 or x in (11, 20) or y == 10:
+                return stone_dark
+            if y in (11, 12) or x in (12, 13):
+                return stone_light
+            if (x + y) % 9 < 2:
+                return stone_dark
+            return stone
+        # floating gem (diamond shape) with facets
+        dx = x - 15.5
+        dy = y - 8.0
+        if abs(dx) <= 6 - abs(dy) * 0.5 and abs(dy) <= 5:
+            if dx < 0 and dy < 1.0:
+                return (198, 214, 250, 255)
+            if dx > 0 and dy > 1.0:
+                return (108, 130, 198, 255)
+            return gem
+        return clear
+
     render = {"pot": pot, "bush": bush, "block": block,
               "switch": switch, "barrier": barrier, "sign": sign,
-              "torch": torch}.get(kind)
+              "torch": torch, "warp": warp, "crystal": crystal}.get(kind)
     if render is None:
         return False
     rows = []
@@ -1864,6 +2487,16 @@ def sync_runtime_assets():
 
 
 def generate():
+    game = load_game()
+    manifest = load_code_manifest()
+
+    # Game-defined content loads first: everything cross-references the
+    # per-game ids (items, object types) these loaders assign.
+    items = load_items()
+    ITEM_INDEX.update({entry["name"]: i for i, entry in enumerate(items)})
+    object_types = load_object_types()
+    OBJECT_INDEX.update({entry["name"]: i for i, entry in enumerate(object_types)})
+
     flags = FlagRegistry()
     dialogues = load_dialogues(flags)
     dialogue_index = {d["name"]: i for i, d in enumerate(dialogues)}
@@ -1884,7 +2517,7 @@ def generate():
     characters = load_characters()
     character_index = {c["name"]: i for i, c in enumerate(characters)}
 
-    enemies = load_enemies()
+    enemies = load_enemies(manifest)
     enemy_index = {e["name"]: i for i, e in enumerate(enemies)}
 
     tileset = load_tileset()
@@ -1896,6 +2529,33 @@ def generate():
     rooms = load_rooms(dialogue_index, character_index, enemy_index,
                        tileset["tileCount"] if tileset else 0)
 
+    # Fixed-pool budget validation (the engine uses fixed-size arrays so
+    # the console builds stay predictable; warn at bake instead of letting
+    # the engine silently overflow).
+    for room in rooms:
+        if len(room["enemySpawns"]) > 16:
+            warn("room '%s' spawns %d enemies; the pool holds 16"
+                 % (room["name"], len(room["enemySpawns"])))
+        if len(room["objectSpawns"]) > 16:
+            warn("room '%s' spawns %d objects; the pool holds 16"
+                 % (room["name"], len(room["objectSpawns"])))
+        if len(room["npcSpawns"]) > 8:
+            warn("room '%s' spawns %d npcs; the pool holds 8"
+                 % (room["name"], len(room["npcSpawns"])))
+        if len(room["pickupSpawns"]) > 32:
+            warn("room '%s' spawns %d pickups; the pool holds 32"
+                 % (room["name"], len(room["pickupSpawns"])))
+    if len(rooms) > 32:
+        warn("%d rooms exceed the boss-defeat registry (32); far-room boss"
+             " defeats will not be banked" % len(rooms))
+    if len(rooms) > 128:
+        warn("%d rooms exceed the visited-room marks (128)" % len(rooms))
+    if len(flags.names) > 256:
+        warn("%d world flags exceed the save cap (256)" % len(flags.names))
+    total_encounters = sum(len(r["instant"]) + len(r["interactive"]) for r in rooms)
+    if total_encounters > 512:
+        warn("%d encounters exceed the save cap (512)" % total_encounters)
+
     # NPC spawn conditions resolve against the same flag registry the
     # dialogues filled (story-state presence).
     for room in rooms:
@@ -1904,6 +2564,10 @@ def generate():
                              if npc["ifFlag"] else -1)
             npc["unlessFlag"] = (flags.index(npc.pop("unlessFlag"))
                                  if npc["unlessFlag"] else -1)
+
+    # The crystal-switch state (blue/red barriers) is a saved world flag so
+    # it persists like story state; bake its index as a named constant.
+    crystal_flag_index = flags.index("crystal_red")
 
     # Resolve dialogue warp room references (needs every room loaded).
     room_index = {}
@@ -1946,7 +2610,7 @@ def generate():
             print("created placeholder enemy sheet: %s" % os.path.relpath(image_path, ROOT))
 
     os.makedirs(res("objects"), exist_ok=True)
-    for entry in OBJECT_TYPES:
+    for entry in object_types:
         image_path = res("objects", entry["image"])
         if create_object_bitmap(image_path, entry["name"]):
             print("created placeholder object sheet: %s" % os.path.relpath(image_path, ROOT))
@@ -1977,6 +2641,26 @@ def generate():
     h.append("")
     h.append('#include "engine.h"')
     h.append("")
+    h.append("// Game identity (resources/game.json). The slug is baked into save")
+    h.append("// files so a save from one game is never loaded by another.")
+    h.append("extern const char* const GAME_TITLE;")
+    h.append("extern const char* const GAME_SLUG;")
+    h.append("")
+    h.append("// Game-defined id constants (stable, assigned by the generator from")
+    h.append("// the game's own data; engine.h owns none of these).")
+    for label, names, prefix in (("items", items, "ITEM"),
+                                 ("object types", object_types, "OBJECT"),
+                                 ("door kinds", DOOR_KIND_DEFS, "DOOR"),
+                                 ("chest kinds", CHEST_KIND_DEFS, "CHEST"),
+                                 ("grant kinds", GRANT_KIND_DEFS, "GRANT")):
+        h.append("// %s" % label)
+        for i, entry in enumerate(names):
+            h.append("constexpr int %s_%s = %d;" % (prefix, sym(entry["name"]), i))
+        h.append("")
+    h.append("// Crystal barrier colors (barrier aux3).")
+    for name, value in sorted(BARRIER_COLORS.items(), key=lambda kv: kv[1]):
+        h.append("constexpr int BARRIER_%s = %d;" % (sym(name), value))
+    h.append("")
     h.append("extern const int DIALOGUE_COUNT;")
     h.append("extern const Dialogue DIALOGUES[];")
     h.append("")
@@ -1985,12 +2669,24 @@ def generate():
     h.append("")
     h.append("extern const int ENEMY_COUNT;")
     h.append("extern const EnemyConfig ENEMIES[];")
-
+    h.append("")
+    h.append("extern const int DOOR_KIND_COUNT;")
+    h.append("extern const DoorRule DOOR_RULES[];")
+    h.append("extern const int CHEST_KIND_COUNT;")
+    h.append("extern const ChestRule CHEST_RULES[];")
+    h.append("extern const int GRANT_KIND_COUNT;")
+    h.append("extern const GrantRule GRANT_RULES[];")
+    h.append("")
     h.append("extern const int OBJECT_COUNT;")
     h.append("extern const ObjectConfig OBJECTS[];")
     h.append("")
     h.append("extern const int ITEM_COUNT;")
     h.append("extern const ItemConfig ITEMS[];")
+    h.append("")
+    h.append("// Game-code behaviors (resources/code/manifest.json; JSON references")
+    h.append("// them as \"custom:<name>\").")
+    h.append("extern const char* const CUSTOM_BEHAVIOR_NAMES[];")
+    h.append("extern const int CUSTOM_BEHAVIOR_COUNT;")
     h.append("")
     h.append("extern const int ROOM_COUNT;")
     h.append("extern const RoomConfig ROOMS[];")
@@ -2007,15 +2703,21 @@ def generate():
     h.append("")
     h.append("extern const char* const WORLD_FLAG_NAMES[];")
     h.append("extern const int WORLD_FLAG_COUNT;")
+    h.append("// Crystal-switch state (blue = unset / red = set); saved like story state.")
+    h.append("extern const int WORLD_FLAG_CRYSTAL_RED;")
     h.append("")
 
     c = []
     c.append("// Generated by scripts/generate_assets.py - do not edit by hand.")
     c.append('#include "assets.h"')
     c.append("")
+    emit_game(c, game, manifest)
+    emit_rules(c)
     emit_dialogues(c, dialogues)
     emit_characters(c, characters)
     emit_enemies(c, enemies)
+    emit_objects(c, object_types)
+    emit_items(c, items)
     emit_rooms(c, rooms)
     emit_tile_meta(c, tile_meta)
 
@@ -2025,11 +2727,12 @@ def generate():
     c.append("};")
     c.append("const int WORLD_FLAG_COUNT = %d;" % len(flags.names))
     c.append("bool gWorldFlags[WORLD_FLAG_COUNT > 0 ? WORLD_FLAG_COUNT : 1] = {};")
+    c.append("const int WORLD_FLAG_CRYSTAL_RED = %d;" % crystal_flag_index)
     c.append("")
     if tileset:
         c.append("const TilesetConfig TILESET = { %s, %d, %d, %d, %d, %d };"
-                 % (cstr(tileset["image"]), tileset["firstGid"], tileset["columns"],
-                    tileset["tileCount"], tileset["tileWidth"], tileset["tileHeight"]))
+                  % (cstr(tileset["image"]), tileset["firstGid"], tileset["columns"],
+                     tileset["tileCount"], tileset["tileWidth"], tileset["tileHeight"]))
     else:
         c.append("const TilesetConfig TILESET = { 0, 1, 1, 0, %d, %d };" % (TILE, TILE))
     c.append("")
@@ -2043,8 +2746,9 @@ def generate():
 
     print("generated: include_auto/assets.h")
     print("generated: src_auto/assets.cpp")
-    print("  %d dialogues, %d characters, %d enemies, %d rooms, %d tile meta entries"
-          % (len(dialogues), len(characters), len(enemies), len(rooms),
+    print("  %d dialogues, %d characters, %d enemies, %d items, %d object types, %d rooms, %d tile meta entries"
+          % (len(dialogues), len(characters), len(enemies), len(items),
+             len(object_types), len(rooms),
              sum(1 for m in tile_meta if m["flags"] or m["damage"])))
     sync_runtime_assets()
 

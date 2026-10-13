@@ -4,6 +4,7 @@
 #include "hero.h"
 #include "enemy.h"
 #include "dialogue.h"
+#include "sfx.h"
 
 #include <assert.h>
 #include <math.h>
@@ -60,6 +61,87 @@ struct Poof
 };
 static Poof poofs[32] = {};
 
+// Sprite-effect particles: grass chunks, bush leaves, pot shards — little
+// physics chips bursting out of world events (code-drawn, no art).
+static const int MAX_PARTICLES = 64;
+struct Particle
+{
+    bool active;
+    float x;
+    float y;
+    float vx;
+    float vy;
+    float life;
+    float maxLife;
+    float size;
+    Color color;
+};
+static Particle particles[MAX_PARTICLES] = {};
+
+static void spawnParticles(float x, float y, int count,
+                           unsigned char r, unsigned char g, unsigned char b,
+                           float spread, float upSpeed)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++)
+    {
+        if (count <= 0) return;
+        if (particles[i].active) continue;
+
+        particles[i].active = true;
+        particles[i].x = x;
+        particles[i].y = y;
+        particles[i].vx = (worldRng.nextFloat() * 2.0f - 1.0f) * spread;
+        particles[i].vy = -upSpeed * (0.5f + worldRng.nextFloat() * 0.8f);
+        particles[i].maxLife = 0.35f + worldRng.nextFloat() * 0.25f;
+        particles[i].life = particles[i].maxLife;
+        particles[i].size = 2.0f + worldRng.nextFloat() * 2.5f;
+        // Slight per-chunk shade variation so bursts don't look cloned.
+        int shade = worldRng.range(40) - 20;
+        int cr = (int)r + shade;
+        int cg = (int)g + shade;
+        int cb = (int)b + shade;
+        if (cr < 0) cr = 0; if (cr > 255) cr = 255;
+        if (cg < 0) cg = 0; if (cg > 255) cg = 255;
+        if (cb < 0) cb = 0; if (cb > 255) cb = 255;
+        particles[i].color = Color{ (unsigned char)cr, (unsigned char)cg,
+                                    (unsigned char)cb, 255 };
+        count--;
+    }
+}
+
+static void updateParticles(float dt)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++)
+    {
+        Particle& p = particles[i];
+        if (!p.active) continue;
+        p.life -= dt;
+        if (p.life <= 0.0f)
+        {
+            p.active = false;
+            continue;
+        }
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vy += 420.0f * dt;  // gravity
+    }
+}
+
+static void drawParticles()
+{
+    for (int i = 0; i < MAX_PARTICLES; i++)
+    {
+        const Particle& p = particles[i];
+        if (!p.active) continue;
+        float t = p.life / p.maxLife;
+        Color c = p.color;
+        c.a = (unsigned char)(int)(255.0f * clampf(t, 0.0f, 1.0f));
+        float size = p.size * (0.5f + 0.5f * t);
+        DrawRectangle((int)(p.x - size * 0.5f), (int)(p.y - size * 0.5f),
+                      (int)size + 1, (int)size + 1, c);
+    }
+}
+
 // Projectile kinds: rocks from octoroks (possibly deflected) vs sword beams,
 // distinguished by the `beam` flag on Projectile.
 
@@ -86,7 +168,6 @@ static int nextBeamSwingId = -1000;  // unique negative ids for beam hits
 // fetches pickups. One in the air at a time.
 static Texture2D beamTexture = {};
 static Texture2D boomerangTexture = {};
-static Sound sndBoomerang = {};
 static Sound sndBoomerangHit = {};
 static Sound sndTink = {};
 static Sound sndSwordBeam = {};
@@ -146,7 +227,7 @@ struct WorldObject
     bool opened;           // chests: lid open (permanent until reload/save)
 };
 static WorldObject objects[MAX_OBJECTS] = {};
-static Texture2D objectSheets[8] = {};
+static Texture2D objectSheets[16] = {};
 static int carriedIndex = -1;   // objects[] index riding overhead
 static int liftingIndex = -1;   // objects[] index mid-hoist
 static int nextThrowId = -2000; // unique negative ids, like beam hits
@@ -167,6 +248,70 @@ static Inventory inventory;
 static float shakeTime = 0.0f;
 static float shakeStrength = 0.0f;
 static float lowHpBeepTimer = 0.0f;
+
+// Inventory query for dialogue conditions ("if_item"/"unless_item" lines).
+static bool itemOwnedQuery(int item)
+{
+    return item >= 0 && item < Inventory::MAX_ITEMS && inventory.owned[item];
+}
+
+// Passive light (the lantern, as data): the first owned item whose config
+// carries a light radius. Items are game-defined; no item id is
+// hard-coded here.
+static int lightItemOwned()
+{
+    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
+        if (ITEMS[i].hasLight && inventory.owned[i]) return i;
+    return -1;
+}
+
+// Enemy death drops: the enemy's own table when it has one, the engine
+// default otherwise.
+static int rollEnemyDrop(const Enemy& enemy)
+{
+    const EnemyConfig& cfg = enemy.config();
+    if (cfg.drops && cfg.dropCount > 0)
+        return rollDrop(worldRng, cfg.drops, cfg.dropCount);
+    return rollDrop(worldRng);
+}
+
+// Hit-pause: a beat of frozen gameplay when a strike connects — the LttP
+// impact feel on top of the screen shake.
+static float hitPause = 0.0f;
+static const float HIT_PAUSE_CONNECT = 0.045f;  // sword/spin/dash connects
+static const float HIT_PAUSE_KILL = 0.08f;      // the blow that kills
+static const float HIT_PAUSE_BOSS = 0.11f;      // boss armor rings louder
+
+// Screen flash: full-screen color pulse that eases out over its duration
+// (bomb blasts, boss deaths). The world keeps rendering underneath.
+static float flashTime = 0.0f;
+static float flashDuration = 0.0f;
+static float flashPeak = 0.0f;
+static Color flashColor = WHITE;
+
+static void screenFlash(float duration, Color color, float peakAlpha)
+{
+    if (duration <= 0.0f) return;
+    flashDuration = duration;
+    flashTime = duration;
+    flashColor = color;
+    flashPeak = clampf(peakAlpha, 0.0f, 1.0f);
+}
+
+// Fanfare/jingle convention: item-get fanfares and the secret jingle duck
+// the bgm — paused (not stopped) while the jingle plays, then resumed
+// exactly where it left off.
+static Sound jingleSound = {};
+static bool jingleDucking = false;
+
+static void playJingle(Sound sound)
+{
+    StopSound(jingleSound);
+    jingleSound = sound;
+    jingleDucking = true;
+    PlaySound(sound);
+    if (musicLoaded) PauseMusicStream(music);
+}
 
 // World sfx bank.
 static Sound sndGrass = {};
@@ -223,6 +368,23 @@ static Rectangle objectBox(const WorldObject& o)
     return Rectangle{ o.x + 6.0f, o.y + 12.0f, 20.0f, 16.0f };
 }
 
+// Object interactions: the engine's behavior seam. Everything that used to
+// branch on object type identity branches on the baked interaction mask
+// (resources/objects/types.json composes types from the OBJINT_*
+// vocabulary), so game-defined types behave like the interactions they
+// compose.
+static bool objInteracts(const WorldObject& o, unsigned flag)
+{
+    return o.type >= 0 && o.type < OBJECT_COUNT
+           && (OBJECTS[o.type].interactions & flag) != 0;
+}
+
+static bool objInteractions(int type, unsigned flag)
+{
+    return type >= 0 && type < OBJECT_COUNT
+           && (OBJECTS[type].interactions & flag) != 0;
+}
+
 // NPCs: character-driven townsfolk (see NpcSpawn). Idle ones turn to face
 // the hero when nearby; wanderers stroll with pauses; talking (action
 // button) makes them face the hero and opens their dialogue.
@@ -237,6 +399,9 @@ struct Npc
     float y;
     Direction facing;
     bool wander;
+    const short* path;   // tile waypoints (x,y pairs), 0 = none
+    int pathCount;
+    int pathIndex;       // current waypoint
     int dialogue;   // DIALOGUE index, -1 = silent
     float modeTime;
     float timer;     // wander pause countdown
@@ -260,7 +425,7 @@ static bool npcBlocked(const Npc& self, Rectangle box)
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         const WorldObject& o = objects[i];
-        if (!o.active || o.type == OBJECT_SWITCH) continue;
+        if (!o.active || !objInteracts(o, OBJINT_SOLID)) continue;
         if (o.state != OBJ_GROUND && o.state != OBJ_SLIDING) continue;
         if (overlap(box, objectBox(o))) return true;
     }
@@ -276,13 +441,13 @@ static bool npcBlocked(const Npc& self, Rectangle box)
 static bool objectSolidExtra(Rectangle box, void*)
 {
     // Room solidity hook: ground-state and sliding objects block movement
-    // like tile colliders. Floor switches are walkable plates; lifted,
-    // carried, thrown and sunk things don't block. NPCs stand in the way
-    // too (their own movement checks exclude themselves).
+    // like tile colliders. Floor switches and warp pads are walkable plates;
+    // lifted, carried, thrown and sunk things don't block. NPCs stand in
+    // the way too (their own movement checks exclude themselves).
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         if (!objects[i].active) continue;
-        if (objects[i].type == OBJECT_SWITCH) continue;
+        if (!objInteracts(objects[i], OBJINT_SOLID)) continue;
         if (objects[i].state != OBJ_GROUND && objects[i].state != OBJ_SLIDING) continue;
         if (overlap(box, objectBox(objects[i]))) return true;
     }
@@ -302,7 +467,7 @@ static bool objectBlockedExcept(Rectangle box, int exceptIndex)
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         if (!objects[i].active || i == exceptIndex) continue;
-        if (objects[i].type == OBJECT_SWITCH) continue;
+        if (!objInteracts(objects[i], OBJINT_SOLID)) continue;
         if (objects[i].state != OBJ_GROUND && objects[i].state != OBJ_SLIDING) continue;
         if (overlap(box, objectBox(objects[i]))) return true;
     }
@@ -311,7 +476,7 @@ static bool objectBlockedExcept(Rectangle box, int exceptIndex)
 
 static bool objectLiftable(int type)
 {
-    return type == OBJECT_POT || type == OBJECT_BUSH;
+    return objInteractions(type, OBJINT_LIFTABLE);
 }
 
 static void smashObject(int index, bool spawnDrops)
@@ -320,7 +485,17 @@ static void smashObject(int index, bool spawnDrops)
     o.active = false;
     if (carriedIndex == index) carriedIndex = -1;
     if (liftingIndex == index) liftingIndex = -1;
-    PlaySound(sndBreak);
+    if (objInteracts(o, OBJINT_LEAVES))
+    {
+        // Leafy things (bushes) rustle apart like cut grass.
+        PlaySound(sndGrass);
+        spawnParticles(o.x + 16.0f, o.y + 14.0f, 8, 80, 140, 60, 70.0f, 130.0f);
+    }
+    else
+    {
+        PlaySound(sndBreak);
+        spawnParticles(o.x + 16.0f, o.y + 14.0f, 8, 165, 130, 95, 80.0f, 120.0f);
+    }
     spawnPoof(o.x + 16.0f, o.y + 16.0f);
     if (spawnDrops)
     {
@@ -338,6 +513,8 @@ static void spawnProjectile(float x, float y, float dx, float dy, int damage)
         projectiles[i].active = true;
         projectiles[i].friendly = false;
         projectiles[i].beam = false;
+        projectiles[i].arrow = false;
+        projectiles[i].element = ELEMENT_NONE;
         projectiles[i].dir = 0;
         projectiles[i].id = 0;
         projectiles[i].x = x;
@@ -392,7 +569,7 @@ static void throwBoomerang(float x, float y, Direction facing)
     boomer.dirX = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
     boomer.dirY = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
     boomer.time = 0.0f;
-    PlaySound(sndBoomerang);
+    // Throw sfx is item data (useSfx), played by the use interpreter.
 }
 
 // Bombs (the item): placed at the hero's feet, fuse ticking to a blast that
@@ -422,18 +599,18 @@ static Explosion explosions[MAX_EXPLOSIONS] = {};
 
 static Sound sndBombExplode = {};
 static Sound sndBombWall = {};
-static Sound sndLayBomb = {};
 static Sound sndItemGet = {};
 static Sound sndError = {};
 static Sound sndUiCursor = {};
 static Sound sndUiButton = {};
 static Sound sndChestOpen = {};
 static Sound sndFanfare = {};
-static Sound sndFireRod = {};
-static Sound sndIceRod = {};
-static Sound sndFire = {};
+static Sound sndFire = {};  // element vocabulary: fire ignites torches
 static Sound sndUseKey = {};
 static Sound sndBossDies = {};
+static Sound sndSecret = {};
+static Sound sndWarp = {};
+static Sound sndCrystal = {};
 
 // Darkness masks (dark rooms): a lightmap rendered additively (ambient
 // gloom + radial lights) then multiplied over the frame.
@@ -465,6 +642,30 @@ static bool bossDefeated[MAX_BOSS_SLOTS] = {};
 // registries since ROOM_COUNT is extern.
 static const int MAX_ROOM_MARKS = 128;
 static bool roomVisited[MAX_ROOM_MARKS] = {};
+
+// Blasted-tile registry (bombable walls/floors blown open): keyed by room
+// + tile; re-applied on room load so passages stay open, and persisted in
+// the save so they stay open across sessions too.
+static const int MAX_BLAST_SLOTS = 256;
+static short blastRoom[MAX_BLAST_SLOTS] = {};
+static short blastX[MAX_BLAST_SLOTS] = {};
+static short blastY[MAX_BLAST_SLOTS] = {};
+static int blastCount = 0;
+
+static void recordBlastedTile(int roomIndex, int tileX, int tileY)
+{
+    for (int i = 0; i < blastCount; i++)
+    {
+        if (blastRoom[i] == (short)roomIndex && blastX[i] == (short)tileX
+            && blastY[i] == (short)tileY)
+            return;
+    }
+    if (blastCount >= MAX_BLAST_SLOTS) return;
+    blastRoom[blastCount] = (short)roomIndex;
+    blastX[blastCount] = (short)tileX;
+    blastY[blastCount] = (short)tileY;
+    blastCount++;
+}
 
 static bool bossAliveInRoom()
 {
@@ -536,19 +737,15 @@ static bool doorIsOpen(int roomIndex, int edge)
     // Arena lock: a living boss seals the whole room, door or not.
     if (roomIndex == currentRoom && bossAliveInRoom()) return false;
 
-    switch (doorKind(roomIndex, edge))
-    {
-    case DOOR_NONE:
-    case DOOR_OPEN:
-        return true;
-    case DOOR_SHUTTER:
-        return livingEnemies() == 0;
-    default:
-    {
-        int slot = roomIndex * 4 + edge;
-        return slot >= 0 && slot < MAX_DOOR_SLOTS && doorOpened[slot];
-    }
-    }
+    int kind = doorKind(roomIndex, edge);
+    if (kind == DOOR_NONE || kind >= DOOR_KIND_COUNT) return true;
+    const DoorRule& rule = DOOR_RULES[kind];
+    if (rule.startsOpen) return true;
+    // Live conditions (the classic shutter): open while they hold.
+    if (rule.liveEnemiesDead) return livingEnemies() == 0;
+    // Opened-door registry (keys, pushed-open, blasted doors stay open).
+    int slot = roomIndex * 4 + edge;
+    return slot >= 0 && slot < MAX_DOOR_SLOTS && doorOpened[slot];
 }
 
 // Item-get sequence: the grant rises from the chest to over the hero's
@@ -589,15 +786,18 @@ static void drawTitleScreen();
 // the browser.
 static void loadRoomFromSave(int room, int tileX, int tileY);
 static const int SAVE_MAGIC = 0x4C544F50;  // "LTOP"
-static const int SAVE_VERSION = 4;
+static const int SAVE_VERSION = 6;  // v6: per-game identity field
 static const int SAVE_SLOT_COUNT = 3;     // selectable once a title screen exists
 static const int SAVE_FLAG_CAP = 256;
 static const int SAVE_ENCOUNTER_CAP = 512;
+static const int SAVE_BLAST_CAP = 256;
 
 struct SaveData
 {
     int magic;
     int version;
+    char game[16];    // game slug (generator-baked): a save from one game
+                      // is never loaded by another
     int room;          // current room index
     int tileX;
     int tileY;         // hero tile
@@ -615,6 +815,10 @@ struct SaveData
     bool bosses[MAX_BOSS_SLOTS];
     bool visited[MAX_ROOM_MARKS];
     bool encounters[SAVE_ENCOUNTER_CAP];
+    short blastRooms[SAVE_BLAST_CAP];
+    short blastTilesX[SAVE_BLAST_CAP];
+    short blastTilesY[SAVE_BLAST_CAP];
+    int blastTotal;
 };
 
 static int saveSlotInUse = 0;
@@ -658,6 +862,15 @@ static void applySave(const SaveData& data)
     }
     worldRng.seed(data.rngState);
 
+    blastCount = data.blastTotal > MAX_BLAST_SLOTS ? MAX_BLAST_SLOTS : data.blastTotal;
+    if (blastCount < 0) blastCount = 0;
+    for (int i = 0; i < blastCount; i++)
+    {
+        blastRoom[i] = data.blastRooms[i];
+        blastX[i] = data.blastTilesX[i];
+        blastY[i] = data.blastTilesY[i];
+    }
+
     // Land in the saved room at the saved tile (fade in).
     if (data.room >= 0 && data.room < ROOM_COUNT)
     {
@@ -683,7 +896,8 @@ static bool peekSave(int slot, SaveData& out)
     memcpy(&out, bytes, sizeof(out));
     UnloadFileData(bytes);
 
-    return out.magic == SAVE_MAGIC && out.version == SAVE_VERSION;
+    return out.magic == SAVE_MAGIC && out.version == SAVE_VERSION
+           && strncmp(out.game, GAME_SLUG, sizeof(out.game)) == 0;
 }
 
 static bool loadFromFile(int slot)
@@ -701,6 +915,7 @@ static void saveToFile(int slot)
     memset(&data, 0, sizeof(data));
     data.magic = SAVE_MAGIC;
     data.version = SAVE_VERSION;
+    snprintf(data.game, sizeof(data.game), "%s", GAME_SLUG);
     data.room = currentRoom;
     int tileX = 0;
     int tileY = 0;
@@ -735,6 +950,14 @@ static void saveToFile(int slot)
         for (int i = 0; i < total; i++) data.encounters[i] = encounterFired[i];
     }
 
+    for (int i = 0; i < blastCount && i < SAVE_BLAST_CAP; i++)
+    {
+        data.blastRooms[i] = blastRoom[i];
+        data.blastTilesX[i] = blastX[i];
+        data.blastTilesY[i] = blastY[i];
+    }
+    data.blastTotal = blastCount;
+
     char path[128];
     if (slot < 0 || slot >= SAVE_SLOT_COUNT) return;
     saveFilePath(slot, path, sizeof(path));
@@ -762,6 +985,7 @@ static void resetGameState()
     for (int i = 0; i < MAX_ROOM_MARKS; i++) roomVisited[i] = false;
     if (encounterFired)
         for (int i = 0; i < ENCOUNTER_TOTAL; i++) encounterFired[i] = false;
+    blastCount = 0;
     worldRng.seed(0xC0FFEE1Au);
     lanternDrain = 0.0f;
     itemGet.active = false;
@@ -843,7 +1067,7 @@ static void drawTitleScreen()
     int width = MeasureText(title, titleSize);
     DrawText(title, (sw - width) / 2, (int)(34 * scale), titleSize, RAYWHITE);
 
-    const char* sub = "A LINK TO THE PAST-STYLE ENGINE DEMO";
+    const char* sub = GAME_TITLE;
     int subSize = (int)(8 * scale);
     width = MeasureText(sub, subSize);
     DrawText(sub, (sw - width) / 2, (int)(64 * scale), subSize,
@@ -910,6 +1134,7 @@ static void detonateBomb(Bomb& bomb)
     // Blast feedback.
     shakeTime = 0.35f;
     shakeStrength = 5.0f;
+    screenFlash(0.16f, Color{ 255, 255, 245, 255 }, 0.40f);
 
     // Damage enemies in the radius (one hit each, knocked from the blast).
     int blastId = nextBeamSwingId--;
@@ -926,7 +1151,7 @@ static void detonateBomb(Bomb& bomb)
         {
             PlaySound(sndEnemyDie);
             spawnPoof(ec.x, ec.y);
-            int drop = rollDrop(worldRng);
+            int drop = rollEnemyDrop(enemies[e]);
             if (drop != PICKUP_NONE)
                 spawnPickup(drop, ec.x - 8.0f, ec.y - 8.0f);
         }
@@ -947,19 +1172,26 @@ static void detonateBomb(Bomb& bomb)
             float dx = cx - bomb.x;
             float dy = cy - bomb.y;
             if (dx * dx + dy * dy > BOMB_RADIUS * BOMB_RADIUS) continue;
-            if (room.bombTileAt(tx, ty)) blasted = true;
+            if (room.bombTileAt(tx, ty))
+            {
+                blasted = true;
+                recordBlastedTile(currentRoom, tx, ty);
+            }
         }
     }
     if (blasted) PlaySound(sndBombWall);
 
     // Bombable doors on this room's edges blow open when the blast reaches.
+    bool secretFound = blasted;
     {
         const RoomConfig& cfg = room.config();
         float mapW = (float)(cfg.mapWidth * TILE_SIZE);
         float mapH = (float)(cfg.mapHeight * TILE_SIZE);
         for (int edge = 0; edge < 4; edge++)
         {
-        if (doorKind(currentRoom, edge) != DOOR_BOMBABLE) continue;
+        int edgeKind = doorKind(currentRoom, edge);
+        if (edgeKind < 0 || edgeKind >= DOOR_KIND_COUNT
+            || !DOOR_RULES[edgeKind].bombable) continue;
         if (doorIsOpen(currentRoom, edge)) continue;
         float doorX = mapW * 0.5f;
         float doorY = mapH * 0.5f;
@@ -976,8 +1208,13 @@ static void detonateBomb(Bomb& bomb)
             if (dx * dx + dy * dy > (BOMB_RADIUS + 16.0f) * (BOMB_RADIUS + 16.0f)) continue;
             markDoorOpened(currentRoom, edge);
             PlaySound(sndBombWall);
+            secretFound = true;
         }
     }
+
+    // "Secret discovered" jingle convention: blasting a passage open
+    // ducks the bgm for the sting, then the music resumes.
+    if (secretFound) playJingle(sndSecret);
 }
 
 static void updateBombs(float dt)
@@ -1010,18 +1247,10 @@ static void placeBomb(float x, float y)
     }
 }
 
-// Bow: arrows cost 1 from the quiver, or one rupee when the quiver is dry
-// (LttP behavior); no ammo at all -> an error cue.
-static void fireArrow(float x, float y, Direction facing)
+// Bow: spawn the arrow projectile (the use-action interpreter paid the
+// cost - arrows, or a rupee when the quiver is dry, LttP behavior).
+static void spawnArrow(float x, float y, Direction facing)
 {
-    if (inventory.arrows > 0) inventory.addArrows(-1);
-    else if (inventory.rupees > 0) inventory.addRupees(-1);
-    else
-    {
-        PlaySound(sndError);
-        return;
-    }
-
     for (int i = 0; i < 8; i++)
     {
         if (projectiles[i].active) continue;
@@ -1084,51 +1313,76 @@ static void spawnElementProjectile(float x, float y, Direction facing, int eleme
     }
 }
 
-// The item button runs whatever is equipped.
+// The item button runs whatever is equipped. Items are game content: the
+// baked use-action composes the engine's vocabulary (costs + spawn kind +
+// sfx), and this interpreter runs it - no per-item branches exist.
 static void useEquippedItem()
 {
-    if (inventory.equippedItem < 0) return;
-    Vector2 heroCenter = hero.center();
-    switch (inventory.equippedItem)
+    if (inventory.equippedItem < 0 || inventory.equippedItem >= ITEM_COUNT) return;
+    const ItemConfig& item = ITEMS[inventory.equippedItem];
+    if (item.useKind == ITEM_USE_NONE)
     {
-    case ITEM_BOOMERANG:
+        PlaySound(sndError);  // passive item (or nothing) equipped
+        return;
+    }
+
+    // Costs, in the order the vocabulary defines them: magic, bombs,
+    // arrows (with the optional rupee fallback). An unaffordable cost
+    // plays the error cue and cancels the use.
+    if (item.magicCost > 0 && !inventory.consumeMagic(item.magicCost))
+    {
+        PlaySound(sndError);
+        return;
+    }
+    if (item.bombCost > 0)
+    {
+        if (inventory.bombs < item.bombCost)
+        {
+            PlaySound(sndError);
+            return;
+        }
+        inventory.addBombs(-item.bombCost);
+    }
+    if (item.arrowCost > 0)
+    {
+        if (inventory.arrows >= item.arrowCost)
+        {
+            inventory.addArrows(-item.arrowCost);
+        }
+        else if (item.arrowRupeeFallback && inventory.rupees > 0)
+        {
+            inventory.addRupees(-1);
+        }
+        else
+        {
+            PlaySound(sndError);
+            return;
+        }
+    }
+
+    Vector2 heroCenter = hero.center();
+    switch (item.useKind)
+    {
+    case ITEM_USE_BOOMERANG:
         throwBoomerang(heroCenter.x, heroCenter.y, hero.facingDirection());
         break;
-    case ITEM_BOW:
-        fireArrow(heroCenter.x, heroCenter.y, hero.facingDirection());
+    case ITEM_USE_ARROW:
+        spawnArrow(heroCenter.x, heroCenter.y, hero.facingDirection());
         break;
-    case ITEM_BOMBS:
-        if (inventory.bombs > 0)
-        {
-            inventory.addBombs(-1);
-            // Placed at the hero's feet (bottom of the sprite).
-            placeBomb(heroCenter.x, heroCenter.y + 8.0f);
-            PlaySound(sndLayBomb);
-        }
-        else PlaySound(sndError);
+    case ITEM_USE_BOMB:
+        // Placed at the hero's feet (bottom of the sprite).
+        placeBomb(heroCenter.x, heroCenter.y + 8.0f);
         break;
-    case ITEM_FIRE_ROD:
-        if (inventory.consumeMagic(2))
-        {
-            spawnElementProjectile(heroCenter.x, heroCenter.y, hero.facingDirection(),
-                                   ELEMENT_FIRE);
-            PlaySound(sndFireRod);
-        }
-        else PlaySound(sndError);
-        break;
-    case ITEM_ICE_ROD:
-        if (inventory.consumeMagic(2))
-        {
-            spawnElementProjectile(heroCenter.x, heroCenter.y, hero.facingDirection(),
-                                   ELEMENT_ICE);
-            PlaySound(sndIceRod);
-        }
-        else PlaySound(sndError);
+    case ITEM_USE_BOLT:
+        spawnElementProjectile(heroCenter.x, heroCenter.y, hero.facingDirection(),
+                               item.element);
         break;
     default:
         PlaySound(sndError);
         break;
     }
+
+    if (item.useSfx) playNamedSfx(item.useSfx);
 }
 
 static void clearWorldSystems()
@@ -1137,6 +1391,7 @@ static void clearWorldSystems()
     enemyCount = 0;
     for (int i = 0; i < MAX_PICKUPS; i++) pickups[i].active = false;
     for (int i = 0; i < 32; i++) poofs[i].active = false;
+    for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
     for (int i = 0; i < 8; i++) projectiles[i].active = false;
     boomer.active = false;
     for (int i = 0; i < MAX_OBJECTS; i++) objects[i].active = false;
@@ -1249,11 +1504,12 @@ static void drawGameOver()
 }
 
 // Lantern upkeep: slow magic drain in dark rooms + auto-lighting torches
-// the hero stands next to.
+// the hero stands next to. "The lantern" is whatever item carries the
+// passive light (data); a game can name it anything.
 static void updateLantern(float dt)
 {
     if (!room.config().dark) return;
-    if (ITEM_LANTERN >= ITEM_COUNT || !inventory.owned[ITEM_LANTERN]) return;
+    if (lightItemOwned() < 0) return;
 
     lanternDrain += dt;
     if (lanternDrain >= 4.0f)
@@ -1269,7 +1525,7 @@ static void updateLantern(float dt)
         for (int i = 0; i < MAX_OBJECTS; i++)
         {
             WorldObject& torch = objects[i];
-            if (!torch.active || torch.type != OBJECT_TORCH) continue;
+            if (!torch.active || !objInteracts(torch, OBJINT_TORCH)) continue;
             if (torch.state != OBJ_GROUND || torch.opened) continue;
             float dx = (torch.x + 16.0f) - heroCenter.x;
             float dy = (torch.y + 16.0f) - heroCenter.y;
@@ -1308,9 +1564,10 @@ static void drawDarkness()
     Rectangle src = { 0.0f, 0.0f, (float)lightGradient.width, (float)lightGradient.height };
     Vector2 origin = { lightGradient.width * 0.5f, lightGradient.height * 0.5f };
 
-    // Hero light: wide with the lantern, a dying ember without it.
-    bool hasLantern = (ITEM_LANTERN < ITEM_COUNT && inventory.owned[ITEM_LANTERN]);
-    float heroRadius = hasLantern ? 92.0f : 30.0f;
+    // Hero light: wide with the passive light item, a dying ember without.
+    int lightItem = lightItemOwned();
+    bool hasLantern = lightItem >= 0;
+    float heroRadius = hasLantern ? (float)ITEMS[lightItem].lightRadius : 30.0f;
     Color heroTint = hasLantern ? Color{ 255, 255, 255, 255 }
                                 : Color{ 140, 140, 150, 255 };
     if (hasLantern && inventory.magic <= 0) heroRadius = 42.0f;
@@ -1324,7 +1581,7 @@ static void drawDarkness()
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         const WorldObject& o = objects[i];
-        if (!o.active || o.type != OBJECT_TORCH || !o.opened) continue;
+        if (!o.active || !objInteracts(o, OBJINT_TORCH) || !o.opened) continue;
         float flicker = 1.0f + sinf((float)GetTime() * 17.0f + o.x) * 0.06f;
         float radius = 140.0f * flicker;
         Rectangle tdest = { (o.x + 16.0f - camLeft) * scale,
@@ -1382,11 +1639,12 @@ static void drawHud()
     // Equipped item + its quantity (arrows/bombs), under the rupee counter.
     if (inventory.equippedItem >= 0 && inventory.equippedItem < ITEM_COUNT)
     {
-        const char* label = ITEMS[inventory.equippedItem].label;
+        const ItemConfig& item = ITEMS[inventory.equippedItem];
+        const char* label = item.label;
         char text[24];
         int count = -1;
-        if (inventory.equippedItem == ITEM_BOW) count = inventory.arrows;
-        else if (inventory.equippedItem == ITEM_BOMBS) count = inventory.bombs;
+        if (item.arrowCost > 0) count = inventory.arrows;
+        else if (item.bombCost > 0) count = inventory.bombs;
         if (count >= 0) snprintf(text, sizeof(text), "%s x%d", label, count);
         else snprintf(text, sizeof(text), "%s", label);
         DrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - MeasureText(text, (int)(8 * scale))),
@@ -1483,7 +1741,7 @@ static void drawToasts()
     for (int i = 0; i < 3; i++)
     {
         if (toasts[i].text[0] == '\0') continue;
-        toasts[i].age += GetFrameTime();
+        toasts[i].age += frameDt();
         if (toasts[i].age >= TOAST_LIFE)
         {
             toasts[i].text[0] = '\0';
@@ -1805,6 +2063,14 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
     room.unload();
     room.load(cfg);
 
+    // Blasted passages re-apply: bombed-open walls/floors stay open (the
+    // registry is also persisted in the save, so they survive sessions).
+    for (int i = 0; i < blastCount; i++)
+    {
+        if (blastRoom[i] != (short)index) continue;
+        room.bombTileAt(blastX[i], blastY[i]);
+    }
+
     if (cfg.hero >= 0 && cfg.hero < CHARACTER_COUNT)
         hero.load(CHARACTERS[cfg.hero]);
 
@@ -1878,7 +2144,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
     for (int i = 0; i < objectTotal; i++)
     {
         const ObjectSpawn& spawn = cfg.objects[i];
-        if (spawn.type < 0 || spawn.type >= OBJECT_COUNT || spawn.type >= 8) continue;
+        if (spawn.type < 0 || spawn.type >= OBJECT_COUNT) continue;
         objects[i].active = true;
         objects[i].type = spawn.type;
         objects[i].state = OBJ_GROUND;
@@ -1906,7 +2172,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         // Chests stay open across reloads (permanent-until-save registry).
         {
             int slot = index * MAX_OBJECTS + i;
-            objects[i].opened = (objects[i].type == OBJECT_CHEST
+            objects[i].opened = (objInteracts(objects[i], OBJINT_CHEST)
                                  && slot >= 0 && slot < MAX_CHEST_SLOTS
                                  && chestOpened[slot]);
         }
@@ -1932,12 +2198,27 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         npcs[i].y = (float)(spawn.tileY * TILE_SIZE);
         npcs[i].facing = DIR_DOWN;
         npcs[i].wander = spawn.wander;
+        npcs[i].path = spawn.pathCount > 0 ? spawn.path : 0;
+        npcs[i].pathCount = spawn.pathCount;
+        npcs[i].pathIndex = 0;
         npcs[i].dialogue = spawn.dialogue;
         npcs[i].modeTime = 0.0f;
         npcs[i].timer = 0.5f + worldRng.nextFloat() * 2.0f;
         npcs[i].animTime = 0.0f;
         npcs[i].moving = false;
         npcs[i].lastFacingPick = -1;
+    }
+
+    // Placed pickups (hearts in grass, buried rupees): spawned fresh on
+    // every entry, like LttP field pickups.
+    int pickupTotal = cfg.pickupCount < MAX_PICKUPS ? cfg.pickupCount : MAX_PICKUPS;
+    for (int i = 0; i < pickupTotal; i++)
+    {
+        const PickupSpawn& spawn = cfg.pickups[i];
+        if (spawn.kind < 0) continue;
+        spawnPickup(spawn.kind,
+                    (float)(spawn.tileX * TILE_SIZE) + 8.0f,
+                    (float)(spawn.tileY * TILE_SIZE) + 8.0f);
     }
 }
 
@@ -2104,11 +2385,44 @@ static void updateGrass()
             if (room.cutTileAt(tx, ty))
             {
                 PlaySound(sndGrass);
+                spawnParticles((float)(tx * TILE_SIZE) + 16.0f,
+                               (float)(ty * TILE_SIZE) + 14.0f,
+                               6, 90, 150, 70, 60.0f, 120.0f);
                 int drop = rollDrop(worldRng);
                 if (drop != PICKUP_NONE)
                     spawnPickup(drop, (float)(tx * TILE_SIZE) + 8.0f,
                                 (float)(ty * TILE_SIZE) + 8.0f);
             }
+        }
+    }
+
+    // Bush objects cut like grass: standing bushes overlapped by the swing
+    // smash apart (leaves + drop). Same once-per-swing pass as the tiles.
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active || !objInteracts(o, OBJINT_CUT)) continue;
+        if (o.state != OBJ_GROUND) continue;
+        if (!overlap(attack, objectBox(o))) continue;
+        smashObject(i, true);
+    }
+
+    // Crystal switches: striking one flips the blue/red state — colored
+    // barriers swap raised/lowered (the state is a saved world flag, so
+    // it persists like story progress). Once per swing, like the rest.
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active || !objInteracts(o, OBJINT_CRYSTAL)) continue;
+        if (o.state != OBJ_GROUND) continue;
+        if (!overlap(attack, objectBox(o))) continue;
+        if (WORLD_FLAG_CRYSTAL_RED >= 0 && WORLD_FLAG_CRYSTAL_RED < WORLD_FLAG_COUNT)
+        {
+            gWorldFlags[WORLD_FLAG_CRYSTAL_RED] = !gWorldFlags[WORLD_FLAG_CRYSTAL_RED];
+            PlaySound(sndCrystal);
+            screenFlash(0.15f, Color{ 160, 190, 255, 255 }, 0.25f);
+            spawnParticles(o.x + 16.0f, o.y + 8.0f, 10, 160, 185, 255,
+                           90.0f, 100.0f);
         }
     }
 }
@@ -2139,72 +2453,152 @@ static void updateSwordBeam()
     PlaySound(sndSwordBeam);
 }
 
-// Chest grants: apply to the inventory/hero and describe for the item-get
-// dialogue.
+// Pegasus boots pre-step: pots and bushes shatter under the dash before the
+// hero's collision check can treat them as walls (LttP dash-through), so
+// the dash keeps running instead of crashing.
+static void updateDashSmash()
+{
+    if (!hero.dashing()) return;
+    Rectangle box = hero.box();
+    Direction facing = hero.facingDirection();
+    float dx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+    float dy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+    Rectangle probe = { box.x + dx * 10.0f - 4.0f, box.y + dy * 10.0f - 4.0f,
+                        box.width + 8.0f, box.height + 8.0f };
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active) continue;
+        if (!objInteracts(o, OBJINT_DASH_SMASH)) continue;
+        if (o.state != OBJ_GROUND) continue;
+        if (!overlap(probe, objectBox(o))) continue;
+        smashObject(i, true);
+    }
+}
+
+// Warp pads: stepping onto one loads the target room at the target tile
+// (fade in) and banks the save, like dialogue warps. A short cooldown
+// keeps arrival pads from immediately re-triggering.
+static float warpCooldown = 0.0f;
+
+static void updateWarps()
+{
+    if (warpCooldown > 0.0f)
+    {
+        warpCooldown -= frameDt();
+        return;
+    }
+    if (roomTransition.active || itemGet.active || hero.dead()) return;
+
+    Rectangle heroBox = hero.box();
+    for (int i = 0; i < MAX_OBJECTS; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active || !objInteracts(o, OBJINT_WARP)) continue;
+        Rectangle trigger = { o.x + 6.0f, o.y + 6.0f, 20.0f, 20.0f };
+        if (!overlap(trigger, heroBox)) continue;
+        if (o.aux1 < 0 || o.aux1 >= ROOM_COUNT) continue;
+
+        PlaySound(sndWarp);
+        loadRoom(o.aux1, -1, o.aux2, o.aux3);
+        saveToFile(saveSlotInUse);
+        showToast("SAVED");
+        warpCooldown = 0.6f;
+        return;
+    }
+}
+
+// Fairy-fountain tiles ("heal" tile metadata): standing on the water slowly
+// refills hearts and magic, with rising sparkle motes.
+static float healTick = 0.0f;
+
+static void updateHealTiles(float dt)
+{
+    int tileX = 0;
+    int tileY = 0;
+    hero.tileUnder(tileX, tileY);
+    TileMeta meta = room.tileMetaAt(tileX, tileY);
+    if (!meta.heal)
+    {
+        healTick = 0.0f;
+        return;
+    }
+
+    healTick += dt;
+    if (healTick < 0.5f) return;
+    healTick = 0.0f;
+
+    bool refilled = false;
+    if (hero.healthHalves() < hero.maxHealthHalves())
+    {
+        hero.heal(1);
+        refilled = true;
+    }
+    if (inventory.magic < inventory.magicMax)
+    {
+        inventory.addMagic(1);
+        refilled = true;
+    }
+    if (refilled)
+    {
+        PlaySound(sndHeart);
+        Vector2 c = hero.center();
+        spawnParticles(c.x, c.y, 3, 200, 220, 255, 20.0f, 60.0f);
+    }
+}
+
+// Grants (chest payloads, boss heart containers): grant kinds are game
+// data; the engine interprets the baked GrantRule's effect, pickup frame,
+// and description template.
 static void applyChestGrant(int kind, int param)
 {
-    switch (kind)
+    if (kind < 0 || kind >= GRANT_KIND_COUNT) return;
+    switch (GRANT_RULES[kind].effect)
     {
-    case GRANT_ITEM:
+    case GRANTEFFECT_GIVE_ITEM:
         if (param >= 0 && param < ITEM_COUNT) inventory.give(param);
         break;
-    case GRANT_RUPEES: inventory.addRupees(param > 0 ? param : 1); break;
-    case GRANT_ARROWS: inventory.addArrows(param > 0 ? param : 1); break;
-    case GRANT_BOMBS: inventory.addBombs(param > 0 ? param : 1); break;
-    case GRANT_MAGIC: inventory.addMagic(param > 0 ? param : 2); break;
-    case GRANT_HEART_CONTAINER: hero.addMaxHearts(2); break;
-    case GRANT_SMALL_KEY: inventory.smallKeys++; break;
-    case GRANT_BIG_KEY: inventory.bigKeys++; break;
+    case GRANTEFFECT_ADD_RUPEES: inventory.addRupees(param > 0 ? param : 1); break;
+    case GRANTEFFECT_ADD_ARROWS: inventory.addArrows(param > 0 ? param : 1); break;
+    case GRANTEFFECT_ADD_BOMBS: inventory.addBombs(param > 0 ? param : 1); break;
+    case GRANTEFFECT_ADD_MAGIC: inventory.addMagic(param > 0 ? param : 2); break;
+    case GRANTEFFECT_ADD_HEARTS: hero.addMaxHearts(2); break;
+    case GRANTEFFECT_ADD_SMALL_KEY: inventory.smallKeys++; break;
+    case GRANTEFFECT_ADD_BIG_KEY: inventory.bigKeys++; break;
     default: break;
     }
 }
 
 static int grantPickupFrame(int kind)
 {
-    switch (kind)
-    {
-    case GRANT_RUPEES: return PICKUP_RUPEE1;
-    case GRANT_ARROWS: return PICKUP_ARROW;
-    case GRANT_BOMBS: return PICKUP_BOMB;
-    case GRANT_MAGIC: return PICKUP_MAGIC;
-    case GRANT_HEART_CONTAINER: return PICKUP_HEART_CONTAINER;
-    default: return -1;  // items/keys: drawn as a medallion
-    }
+    if (kind < 0 || kind >= GRANT_KIND_COUNT) return -1;
+    return GRANT_RULES[kind].pickupFrame;
 }
 
 static void buildGrantText(int kind, int param)
 {
-    switch (kind)
+    if (kind < 0 || kind >= GRANT_KIND_COUNT)
     {
-    case GRANT_ITEM:
+        snprintf(itemGetText, sizeof(itemGetText), "It's empty...");
+        return;
+    }
+    const GrantRule& rule = GRANT_RULES[kind];
+    int amount = param > 0 ? param : 1;
+    switch (rule.effect)
+    {
+    case GRANTEFFECT_GIVE_ITEM:
         if (param >= 0 && param < ITEM_COUNT)
-            snprintf(itemGetText, sizeof(itemGetText), "You got the %s!", ITEMS[param].label);
+            snprintf(itemGetText, sizeof(itemGetText), rule.text, ITEMS[param].label);
         else
             snprintf(itemGetText, sizeof(itemGetText), "You got... something?");
         break;
-    case GRANT_RUPEES:
-        snprintf(itemGetText, sizeof(itemGetText), "You found %d rupees!", param > 0 ? param : 1);
-        break;
-    case GRANT_ARROWS:
-        snprintf(itemGetText, sizeof(itemGetText), "You got %d arrows!", param > 0 ? param : 1);
-        break;
-    case GRANT_BOMBS:
-        snprintf(itemGetText, sizeof(itemGetText), "You got %d bombs!", param > 0 ? param : 1);
-        break;
-    case GRANT_MAGIC:
-        snprintf(itemGetText, sizeof(itemGetText), "Your magic power was restored!");
-        break;
-    case GRANT_HEART_CONTAINER:
-        snprintf(itemGetText, sizeof(itemGetText), "You got a heart container! Your life force grew!");
-        break;
-    case GRANT_SMALL_KEY:
-        snprintf(itemGetText, sizeof(itemGetText), "You got a small key!");
-        break;
-    case GRANT_BIG_KEY:
-        snprintf(itemGetText, sizeof(itemGetText), "You got the big key! It opens the biggest chest.");
+    case GRANTEFFECT_ADD_RUPEES:
+    case GRANTEFFECT_ADD_ARROWS:
+    case GRANTEFFECT_ADD_BOMBS:
+        snprintf(itemGetText, sizeof(itemGetText), rule.text, amount);
         break;
     default:
-        snprintf(itemGetText, sizeof(itemGetText), "It's empty...");
+        snprintf(itemGetText, sizeof(itemGetText), "%s", rule.text);
         break;
     }
 }
@@ -2238,6 +2632,9 @@ static void updateItemGet(float dt)
         itemGetLines[0].warpRoom = -1;
         itemGetLines[0].warpTileX = 0;
         itemGetLines[0].warpTileY = 0;
+        itemGetLines[0].ifItem = -1;
+        itemGetLines[0].unlessItem = -1;
+        itemGetLines[0].giveItem = -1;
         itemGetLines[0].choiceCount = 0;
         itemGetLines[0].choices = 0;
         itemGet.dialogueOpened = true;
@@ -2265,7 +2662,69 @@ static void updateNpcs(float dt)
         npc.animTime += dt;
         npc.modeTime += dt;
 
-        if (npc.wander)
+        if (npc.path && npc.pathCount > 0)
+        {
+            // Path-follower: walks the tile waypoints in a loop (the path
+            // beats the wander flag). Blocked waypoints get retried, so a
+            // shove only stalls the stroll momentarily.
+            float targetX = (float)(npc.path[npc.pathIndex * 2] * TILE_SIZE);
+            float targetY = (float)(npc.path[npc.pathIndex * 2 + 1] * TILE_SIZE);
+            float toX = targetX - npc.x;
+            float toY = targetY - npc.y;
+            float dist = sqrtf(toX * toX + toY * toY);
+
+            if (dist < 2.0f)
+            {
+                npc.x = targetX;
+                npc.y = targetY;
+                npc.pathIndex = (npc.pathIndex + 1) % npc.pathCount;
+                npc.moving = false;
+            }
+            else
+            {
+                npc.moving = true;
+                float step = NPC_WALK_SPEED * dt;
+                if (step > dist) step = dist;
+                float dx = toX / dist;
+                float dy = toY / dist;
+                Rectangle box = npcBox(npc);
+                Rectangle nextX = { box.x + dx * step, box.y, box.width, box.height };
+                Rectangle nextY = { box.x, box.y + dy * step, box.width, box.height };
+                bool blocked = false;
+                if (dx != 0.0f && !npcBlocked(npc, nextX)) npc.x += dx * step;
+                else if (dx != 0.0f) blocked = true;
+                if (dy != 0.0f && !npcBlocked(npc, nextY)) npc.y += dy * step;
+                else if (dy != 0.0f) blocked = true;
+                if (blocked && npc.modeTime > 1.0f)
+                {
+                    // Stuck against something: skip the waypoint and move
+                    // on rather than grinding into it forever.
+                    npc.pathIndex = (npc.pathIndex + 1) % npc.pathCount;
+                    npc.modeTime = 0.0f;
+                }
+
+                // Face the dominant axis of travel.
+                if (fabsf(toX) >= fabsf(toY))
+                {
+                    if (toX > 1.0f) npc.facing = DIR_RIGHT;
+                    else if (toX < -1.0f) npc.facing = DIR_LEFT;
+                }
+                else
+                {
+                    if (toY > 1.0f) npc.facing = DIR_DOWN;
+                    else if (toY < -1.0f) npc.facing = DIR_UP;
+                }
+            }
+
+            // Face the hero while standing on a waypoint near them.
+            if (!npc.moving)
+            {
+                float dx = heroCenter.x - (npc.x + 16.0f);
+                float dy = heroCenter.y - (npc.y + 16.0f);
+                if (dx * dx + dy * dy < 48.0f * 48.0f) faceHero(npc);
+            }
+        }
+        else if (npc.wander)
         {
             if (npc.moving)
             {
@@ -2372,7 +2831,7 @@ static bool updateObjectActions()
         for (int i = 0; i < MAX_OBJECTS; i++)
         {
             const WorldObject& o = objects[i];
-            if (!o.active || o.type != OBJECT_SIGN) continue;
+            if (!o.active || !objInteracts(o, OBJINT_READABLE)) continue;
             if (o.state != OBJ_GROUND) continue;
             if (o.aux1 < 0 || o.aux1 >= DIALOGUE_COUNT) continue;
             if (!overlap(probe, objectBox(o))) continue;
@@ -2389,24 +2848,27 @@ static bool updateObjectActions()
         for (int i = 0; i < MAX_OBJECTS; i++)
         {
             WorldObject& o = objects[i];
-            if (!o.active || o.type != OBJECT_CHEST) continue;
+            if (!o.active || !objInteracts(o, OBJINT_CHEST)) continue;
             if (o.state != OBJ_GROUND) continue;
             if (!overlap(probe, objectBox(o))) continue;
 
             if (o.opened) return false;  // nothing left inside
-            if (o.aux1 == CHEST_LOCKED && inventory.smallKeys <= 0)
+            int keyCost = 0;
+            if (o.aux1 >= 0 && o.aux1 < CHEST_KIND_COUNT)
+                keyCost = CHEST_RULES[o.aux1].keyCost;
+            if (keyCost == 1 && inventory.smallKeys <= 0)
             {
                 PlaySound(sndError);  // rattles, no key
                 return true;
             }
-            if (o.aux1 == CHEST_BIG && inventory.bigKeys <= 0)
+            if (keyCost == 2 && inventory.bigKeys <= 0)
             {
                 PlaySound(sndError);
                 return true;
             }
 
-            if (o.aux1 == CHEST_LOCKED) inventory.smallKeys--;
-            if (o.aux1 == CHEST_BIG) inventory.bigKeys--;
+            if (keyCost == 1) inventory.smallKeys--;
+            if (keyCost == 2) inventory.bigKeys--;
 
             o.opened = true;
             {
@@ -2414,7 +2876,7 @@ static bool updateObjectActions()
                 if (slot >= 0 && slot < MAX_CHEST_SLOTS) chestOpened[slot] = true;
             }
             PlaySound(sndChestOpen);
-            PlaySound(sndFanfare);
+            playJingle(sndFanfare);
 
             // Grant rises from the chest to over the hero's head.
             Vector2 heroCenter = hero.center();
@@ -2455,6 +2917,20 @@ static bool updateObjectActions()
     }
     if (best < 0) return false;
 
+    // Pot ambush ("hides" enemy): lifting reveals what was living
+    // underneath — the room's shutter logic sees it too, like LttP.
+    if (objInteracts(objects[best], OBJINT_HIDES) && objects[best].aux1 >= 0
+        && enemyCount < 16 && objects[best].aux1 < ENEMY_COUNT)
+    {
+        enemies[enemyCount].spawn(ENEMIES[objects[best].aux1],
+                                  enemySheets[objects[best].aux1],
+                                  (int)(objects[best].x / TILE_SIZE),
+                                  (int)(objects[best].y / TILE_SIZE));
+        enemyCount++;
+        PlaySound(sndBoomerangHit);
+        spawnPoof(objects[best].x + 16.0f, objects[best].y + 16.0f);
+    }
+
     objects[best].state = OBJ_LIFTING;
     objects[best].groundX = objects[best].x;
     objects[best].groundY = objects[best].y;
@@ -2472,7 +2948,7 @@ static void updatePushBlocks(float dt)
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         WorldObject& o = objects[i];
-        if (!o.active || o.type != OBJECT_BLOCK) continue;
+        if (!o.active || !objInteracts(o, OBJINT_PUSHABLE)) continue;
         if (o.state != OBJ_GROUND) { o.pushTimer = 0.0f; continue; }
         if (hero.carrying() || hero.busy() || hero.dead())
         {
@@ -2529,7 +3005,7 @@ static WorldObject* switchAtTile(int tileX, int tileY)
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         WorldObject& s = objects[i];
-        if (!s.active || s.type != OBJECT_SWITCH) continue;
+        if (!s.active || !objInteracts(s, OBJINT_SWITCH)) continue;
         int sx = (int)((s.x + TILE_SIZE * 0.5f) / TILE_SIZE);
         int sy = (int)((s.y + TILE_SIZE * 0.5f) / TILE_SIZE);
         if (sx == tileX && sy == tileY) return &s;
@@ -2545,7 +3021,7 @@ static void updateSwitches()
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         WorldObject& s = objects[i];
-        if (!s.active || s.type != OBJECT_SWITCH) continue;
+        if (!s.active || !objInteracts(s, OBJINT_SWITCH)) continue;
 
         Rectangle trigger = { s.x + 5.0f, s.y + 5.0f, 22.0f, 22.0f };
         bool weight = overlap(trigger, heroBox);
@@ -2554,7 +3030,7 @@ static void updateSwitches()
             for (int j = 0; j < MAX_OBJECTS; j++)
             {
                 WorldObject& b = objects[j];
-                if (!b.active || b.type != OBJECT_BLOCK) continue;
+                if (!b.active || !objInteracts(b, OBJINT_WEIGHT)) continue;
                 if (b.state != OBJ_GROUND && b.state != OBJ_SUNK) continue;
                 if (overlap(trigger, objectBox(b))) { weight = true; break; }
             }
@@ -2577,20 +3053,54 @@ static void updateSwitches()
     }
 
     // Barriers lower while any switch in their link group is active.
+    // Colored barriers (blue/red) follow the crystal-switch state instead.
+    bool crystalRed = (WORLD_FLAG_CRYSTAL_RED >= 0
+                       && WORLD_FLAG_CRYSTAL_RED < WORLD_FLAG_COUNT
+                       && gWorldFlags[WORLD_FLAG_CRYSTAL_RED]);
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         WorldObject& b = objects[i];
-        if (!b.active || b.type != OBJECT_BARRIER) continue;
+        if (!b.active || !objInteracts(b, OBJINT_BARRIER)) continue;
+
+        if (b.aux3 == BARRIER_BLUE || b.aux3 == BARRIER_RED)
+        {
+            // Crystal barrier: lowered while the crystal matches its color.
+            bool lowered = (b.aux3 == BARRIER_BLUE) ? !crystalRed : crystalRed;
+
+            if (lowered && b.state == OBJ_GROUND)
+            {
+                b.state = OBJ_SUNK;
+                PlaySound(sndDoorOpen);
+            }
+            else if (!lowered && b.state == OBJ_SUNK)
+            {
+                b.state = OBJ_GROUND;
+                PlaySound(sndDoorClose);
+            }
+
+            // Wrong approach: touching a raised crystal barrier shocks.
+            if (b.state == OBJ_GROUND)
+            {
+                Rectangle shock = { b.x + 2.0f, b.y + 2.0f, 28.0f, 28.0f };
+                if (overlap(shock, hero.box()))
+                {
+                    Vector2 hc = hero.center();
+                    hero.hurt(1, Vector2{ hc.x - (b.x + TILE_SIZE * 0.5f),
+                                          hc.y - (b.y + TILE_SIZE * 0.5f) });
+                }
+            }
+            continue;
+        }
 
         bool lowered = false;
         for (int j = 0; j < MAX_OBJECTS && !lowered; j++)
         {
             const WorldObject& s = objects[j];
             if (!s.active) continue;
-            if (s.type == OBJECT_SWITCH && s.aux2 == b.aux2 && s.switchActive)
+            if (objInteracts(s, OBJINT_SWITCH) && s.aux2 == b.aux2 && s.switchActive)
                 lowered = true;
             // Lit torches latch their link group open.
-            if (s.type == OBJECT_TORCH && s.aux2 == b.aux2 && s.opened)
+            if (objInteracts(s, OBJINT_TORCH) && s.aux2 == b.aux2 && s.opened)
                 lowered = true;
         }
 
@@ -2609,7 +3119,7 @@ static void updateSwitches()
 
 static void updateObjects()
 {
-    float dt = GetFrameTime();
+    float dt = frameDt();
 
     // Push blocks: wind up, slide, settle.
     updatePushBlocks(dt);
@@ -2741,7 +3251,7 @@ static void updateObjects()
             {
                 PlaySound(sndEnemyDie);
                 spawnPoof(ec.x, ec.y);
-                int drop = rollDrop(worldRng);
+                int drop = rollEnemyDrop(enemies[e]);
                 if (drop != PICKUP_NONE)
                     spawnPickup(drop, ec.x - 8.0f, ec.y - 8.0f);
             }
@@ -2771,6 +3281,8 @@ static void updateObjects()
             {
                 objects[i].active = false;
                 PlaySound(sndItemWater);
+                spawnParticles(o.x + 16.0f, o.y + 12.0f, 8, 140, 180, 235,
+                               70.0f, 130.0f);
             }
             else
             {
@@ -2795,23 +3307,27 @@ static void updateEnemies()
         Enemy& enemy = enemies[i];
         if (!enemy.alive()) continue;
 
-        enemy.update(room, heroCenter, worldRng, GetFrameTime());
+        enemy.update(room, heroCenter, worldRng, frameDt());
 
         // Offensive contact (sword arc, spin radius, dash): knockback away
         // from the hero; one hit per action id.
         Vector2 enemyCenter = enemy.center();
         float dx = enemyCenter.x - heroCenter.x;
         float dy = enemyCenter.y - heroCenter.y;
+        int hitsBefore = enemy.hitsLanded();
         if (enemy.tryHit(attack, swing, Vector2{ dx, dy }))
         {
+            // The killing blow lands heavier; boss armor rings loudest.
+            hitPause = enemy.isBoss() ? HIT_PAUSE_BOSS : HIT_PAUSE_KILL;
             if (enemy.isBoss())
             {
                 // Boss defeat: big blast, the arena unlocks, a heart
                 // container rises, and the boss stays dead.
                 PlaySound(sndBossDies);
-                PlaySound(sndFanfare);
+                playJingle(sndFanfare);
                 shakeTime = 0.5f;
                 shakeStrength = 6.0f;
+                screenFlash(0.30f, Color{ 255, 255, 255, 255 }, 0.50f);
                 spawnExplosion(enemyCenter.x, enemyCenter.y);
                 spawnExplosion(enemyCenter.x - 28.0f, enemyCenter.y - 18.0f);
                 spawnExplosion(enemyCenter.x + 28.0f, enemyCenter.y + 18.0f);
@@ -2836,10 +3352,16 @@ static void updateEnemies()
             }
             PlaySound(sndEnemyDie);
             spawnPoof(enemyCenter.x, enemyCenter.y);
-            int drop = rollDrop(worldRng);
+            int drop = rollEnemyDrop(enemy);
             if (drop != PICKUP_NONE)
                 spawnPickup(drop, enemyCenter.x - 8.0f, enemyCenter.y - 8.0f);
             continue;
+        }
+
+        // Non-lethal connect: a lighter hit-pause beat.
+        if (enemy.hitsLanded() > hitsBefore)
+        {
+            hitPause = enemy.isBoss() ? HIT_PAUSE_BOSS : HIT_PAUSE_CONNECT;
         }
 
         // Octorok spit.
@@ -2871,8 +3393,8 @@ static void updateProjectiles()
         Projectile& p = projectiles[i];
         if (!p.active) continue;
 
-        p.x += p.dx * p.speed * GetFrameTime();
-        p.y += p.dy * p.speed * GetFrameTime();
+        p.x += p.dx * p.speed * frameDt();
+        p.y += p.dy * p.speed * frameDt();
 
         Rectangle rock = { p.x, p.y, 16.0f, 16.0f };
 
@@ -2922,7 +3444,7 @@ static void updateProjectiles()
             for (int i = 0; i < MAX_OBJECTS; i++)
             {
                 WorldObject& torch = objects[i];
-                if (!torch.active || torch.type != OBJECT_TORCH) continue;
+                if (!torch.active || !objInteracts(torch, OBJINT_TORCH)) continue;
                 if (torch.state != OBJ_GROUND || torch.opened) continue;
                 if (!overlap(rock, objectBox(torch))) continue;
                 torch.opened = true;
@@ -2967,7 +3489,7 @@ static void updateProjectiles()
                 {
                     PlaySound(sndEnemyDie);
                     spawnPoof(enemyCenter.x, enemyCenter.y);
-                    int drop = rollDrop(worldRng);
+                    int drop = rollEnemyDrop(enemies[e]);
                     if (drop != PICKUP_NONE)
                         spawnPickup(drop, enemyCenter.x - 8.0f, enemyCenter.y - 8.0f);
                 }
@@ -2993,7 +3515,7 @@ static void updateProjectiles()
                     {
                         PlaySound(sndEnemyDie);
                         spawnPoof(enemyCenter.x, enemyCenter.y);
-                        int drop = rollDrop(worldRng);
+                        int drop = rollEnemyDrop(enemies[e]);
                         if (drop != PICKUP_NONE)
                             spawnPickup(drop, enemyCenter.x - 8.0f, enemyCenter.y - 8.0f);
                     }
@@ -3025,10 +3547,10 @@ static void updatePickups()
         Pickup& p = pickups[i];
         if (!p.active) continue;
 
-        p.bobTime += GetFrameTime();
+        p.bobTime += frameDt();
         if (p.life > 0.0f)
         {
-            p.life -= GetFrameTime();
+            p.life -= frameDt();
             if (p.life <= 0.0f)
             {
                 p.active = false;
@@ -3044,7 +3566,7 @@ static void updatePickups()
 static void updateBoomerang()
 {
     if (!boomer.active) return;
-    float dt = GetFrameTime();
+    float dt = frameDt();
     boomer.time += dt;
 
     if (!boomer.returning)
@@ -3106,14 +3628,16 @@ static void updatePoofs()
     for (int i = 0; i < 32; i++)
     {
         if (!poofs[i].active) continue;
-        poofs[i].age += GetFrameTime();
+        poofs[i].age += frameDt();
         if (poofs[i].age >= 0.4f) poofs[i].active = false;
     }
 }
 
 static void drawGroundFx()
 {
-    // Draw inside the camera transform: pickups, poofs, rocks, boomerang.
+    // Draw inside the camera transform: pickups, poofs, particles, rocks,
+    // boomerang.
+    drawParticles();
     for (int i = 0; i < MAX_PICKUPS; i++)
     {
         const Pickup& p = pickups[i];
@@ -3225,12 +3749,13 @@ static void drawGroundFx()
 
 static void drawFloorObjects()
 {
-    // Floor switches and sunk objects render under everything that stands.
+    // Floor switches, warp pads and sunk objects render under everything
+    // that stands.
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         const WorldObject& o = objects[i];
         if (!o.active) continue;
-        if (o.type == OBJECT_SWITCH)
+        if (objInteracts(o, OBJINT_SWITCH))
         {
             Rectangle src = { 0.0f, 0.0f, 32.0f, 32.0f };
             Rectangle dest = { o.x, o.y, 32.0f, 32.0f };
@@ -3242,6 +3767,19 @@ static void drawFloorObjects()
                 DrawRectangle((int)(o.x + 10.0f), (int)(o.y + 10.0f), 12, 12,
                               Color{ 96, 90, 82, 255 });
             }
+            continue;
+        }
+        if (objInteracts(o, OBJINT_WARP))
+        {
+            // Warp pad: gently pulsing so it reads as a step-on trigger.
+            Rectangle src = { 0.0f, 0.0f, 32.0f, 32.0f };
+            Rectangle dest = { o.x, o.y, 32.0f, 32.0f };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(objectSheets[o.type], src, dest, origin, 0.0f, WHITE);
+            float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 4.0f);
+            unsigned char alpha = (unsigned char)(int)(90 + 100 * pulse);
+            DrawRectangle((int)(o.x + 8.0f), (int)(o.y + 8.0f), 16, 16,
+                          Color{ 120, 200, 255, alpha });
             continue;
         }
         if (o.state == OBJ_SUNK)
@@ -3291,7 +3829,7 @@ static void drawEntitiesSorted()
         const WorldObject& o = objects[i];
         if (!o.active) continue;
         if (o.state != OBJ_GROUND && o.state != OBJ_SLIDING) continue;
-        if (o.type == OBJECT_SWITCH) continue;
+        if (!objInteracts(o, OBJINT_SOLID)) continue;
         Rectangle b = objectBox(o);
         list[n].kind = 2;
         list[n].index = i;
@@ -3376,14 +3914,14 @@ static void drawEntitiesSorted()
         {
             const WorldObject& o = objects[d.index];
             // Chests have a two-frame sheet: closed / lid open.
-            float srcX = (o.type == OBJECT_CHEST && o.opened) ? 32.0f : 0.0f;
+            float srcX = (objInteracts(o, OBJINT_TWO_FRAME) && o.opened) ? 32.0f : 0.0f;
             Rectangle src = { srcX, 0.0f, 32.0f, 32.0f };
             Rectangle dest = { o.x, o.y, 32.0f, 32.0f };
             Vector2 origin = { 0.0f, 0.0f };
             DrawTexturePro(objectSheets[o.type], src, dest, origin, 0.0f, WHITE);
 
             // Lit torches burn with a flickering flame over the bowl.
-            if (o.type == OBJECT_TORCH && o.opened)
+            if (objInteracts(o, OBJINT_TORCH) && o.opened)
             {
                 float flicker = sinf((float)GetTime() * 22.0f + o.x) * 1.5f;
                 float fx = o.x + 16.0f;
@@ -3392,6 +3930,20 @@ static void drawEntitiesSorted()
                 DrawCircle((int)fx, (int)(fy - 2.0f), 3.5f + flicker * 0.7f,
                            Color{ 255, 220, 120, 245 });
                 DrawCircle((int)fx, (int)(fy - 3.5f), 1.8f, Color{ 255, 250, 220, 255 });
+            }
+
+            // Crystal switch: the gem glows blue or red with the state.
+            if (objInteracts(o, OBJINT_CRYSTAL))
+            {
+                bool red = (WORLD_FLAG_CRYSTAL_RED >= 0
+                            && WORLD_FLAG_CRYSTAL_RED < WORLD_FLAG_COUNT
+                            && gWorldFlags[WORLD_FLAG_CRYSTAL_RED]);
+                float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 6.0f);
+                Color core = red ? Color{ 235, 90, 90, 255 } : Color{ 110, 150, 235, 255 };
+                Color halo = core;
+                halo.a = (unsigned char)(int)(110 + 90 * pulse);
+                DrawCircle((int)(o.x + 16.0f), (int)(o.y + 8.0f), 5.0f, halo);
+                DrawCircle((int)(o.x + 16.0f), (int)(o.y + 8.0f), 3.0f, core);
             }
         }
     }
@@ -3500,8 +4052,17 @@ static void maybeStartRoomTransition()
     // press.
     if (!doorIsOpen(currentRoom, edge))
     {
+        // Door rules are data (DOOR_RULES): keys, push-open slabs, and
+        // everything else the kind's rule composes.
         int kind = doorKind(currentRoom, edge);
-        if (kind == DOOR_LOCKED)
+        int keyCost = 0;
+        bool pushOpen = false;
+        if (kind >= 0 && kind < DOOR_KIND_COUNT)
+        {
+            keyCost = DOOR_RULES[kind].keyCost;
+            pushOpen = DOOR_RULES[kind].pushOpen;
+        }
+        if (keyCost == 1)
         {
             if (inventory.smallKeys > 0)
             {
@@ -3512,7 +4073,7 @@ static void maybeStartRoomTransition()
             }
             else PlaySound(sndError);
         }
-        else if (kind == DOOR_BIG)
+        else if (keyCost == 2)
         {
             if (inventory.bigKeys > 0)
             {
@@ -3523,7 +4084,7 @@ static void maybeStartRoomTransition()
             }
             else PlaySound(sndError);
         }
-        else if (kind == DOOR_CLOSED)
+        else if (pushOpen)
         {
             markDoorOpened(currentRoom, edge);
             PlaySound(sndDoorOpen);
@@ -3569,7 +4130,9 @@ static void drawDoorways()
     for (int edge = 0; edge < 4; edge++)
     {
         int kind = doorKind(currentRoom, edge);
-        if (kind == DOOR_NONE || kind == DOOR_OPEN) continue;
+        if (kind == DOOR_NONE || kind >= DOOR_KIND_COUNT) continue;
+        const DoorRule& rule = DOOR_RULES[kind];
+        if (rule.startsOpen) continue;
 
         float cx = mapW * 0.5f;
         float cy = mapH * 0.5f;
@@ -3598,22 +4161,23 @@ static void drawDoorways()
 
         Color base = Color{ 150, 104, 52, 255 };
         Color trim = Color{ 100, 66, 30, 255 };
-        if (kind == DOOR_SHUTTER)
+        if (rule.liveEnemiesDead)
         {
+            // Shutter-style: metal slats instead of a wooden slab.
             base = Color{ 120, 120, 134, 255 };
             trim = Color{ 70, 70, 84, 255 };
         }
         DrawRectangleRec(slab, base);
         DrawRectangleLinesEx(slab, 3.0f, trim);
 
-        if (kind == DOOR_LOCKED || kind == DOOR_BIG)
+        if (rule.keyCost > 0)
         {
             // Gold keyhole plate.
             DrawRectangle((int)(cx - 5.0f), (int)(cy - 6.0f), 10, 12,
                           Color{ 216, 168, 60, 255 });
             DrawCircle((int)cx, (int)cy, 2.5f, Color{ 70, 46, 22, 255 });
         }
-        else if (kind == DOOR_BOMBABLE)
+        else if (rule.bombable)
         {
             // Crack marks over the slab.
             for (int i = 0; i < 5; i++)
@@ -3623,7 +4187,7 @@ static void drawDoorways()
                          (int)(cy + 8.0f), Color{ 40, 30, 24, 255 });
             }
         }
-        else if (kind == DOOR_SHUTTER)
+        else if (rule.liveEnemiesDead)
         {
             // Horizontal shutter slats.
             for (int i = 1; i < 4; i++)
@@ -3640,6 +4204,14 @@ static void updateAndDraw(void)
 {
     if (musicLoaded) UpdateMusicStream(music);
 
+    // Jingle ducking: once the fanfare/secret sting finishes, the bgm
+    // picks up where it was paused.
+    if (jingleDucking && !IsSoundPlaying(jingleSound))
+    {
+        jingleDucking = false;
+        if (musicLoaded) ResumeMusicStream(music);
+    }
+
     if (gameState == STATE_TITLE)
     {
         updateTitle();
@@ -3654,7 +4226,7 @@ static void updateAndDraw(void)
 
     if (roomFade > 0.0f)
     {
-        roomFade -= GetFrameTime() / ROOM_FADE_DURATION;
+        roomFade -= frameDt() / ROOM_FADE_DURATION;
         if (roomFade < 0.0f) roomFade = 0.0f;
     }
 
@@ -3668,34 +4240,55 @@ static void updateAndDraw(void)
     {
         if (!paused) dialogue.update();
 
-        // Scripted music switches drain here (once per request).
+        // Scripted music switches and item grants drain here (once per
+        // request). "give" lines hand the item over with a toast.
         const char* musicRequest = dialogue.takeMusicRequest();
         if (musicRequest) startMusic(musicRequest);
+
+        int giveItem = -1;
+        if (dialogue.takeGiveRequest(giveItem))
+        {
+            inventory.give(giveItem);
+            static char giveText[96];
+            snprintf(giveText, sizeof(giveText), "GOT %s", ITEMS[giveItem].label);
+            showToast(giveText);
+            PlaySound(sndItemGet);
+        }
     }
     else if (!paused)
     {
         if (roomTransition.active)
         {
             // Scroll-in: world frozen while the hero walks in.
-            updateRoomTransition(GetFrameTime());
+            updateRoomTransition(frameDt());
         }
         else if (itemGet.active && !itemGet.dialogueOpened)
         {
             // Item-get rise: world frozen while the grant floats up.
-            updateItemGet(GetFrameTime());
+            updateItemGet(frameDt());
         }
         else if (hero.dead())
         {
             // Death sequence: world frozen, waiting on the continue prompt
             // (handled in drawGameOver flow below).
-            hero.update(room, GetFrameTime());
+            hero.update(room, frameDt());
         }
         else
         {
+            // Hit-pause: the world holds its breath for a beat after an
+            // impactful strike connects (set by updateEnemies).
+            if (hitPause > 0.0f)
+            {
+                hitPause -= frameDt();
+                if (hitPause < 0.0f) hitPause = 0.0f;
+            }
+            else
+            {
             int healthBefore = hero.healthHalves();
             HeroState stateBefore = hero.state();
 
-            hero.update(room, GetFrameTime());
+            updateDashSmash();  // pegasus boots shatter pots/bushes pre-move
+            hero.update(room, frameDt());
             bool actionUsed = updateObjectActions();
             updateEncounters(!actionUsed);
             updateGrass();
@@ -3705,24 +4298,37 @@ static void updateAndDraw(void)
                 useEquippedItem();
             }
             updateBoomerang();
-            updateNpcs(GetFrameTime());
-            updateLantern(GetFrameTime());
-            updateBombs(GetFrameTime());
+            updateNpcs(frameDt());
+            updateLantern(frameDt());
+            updateHealTiles(frameDt());
+            updateBombs(frameDt());
             updateObjects();
             updateEnemies();
             updateProjectiles();
             updatePickups();
             updatePoofs();
+            updateParticles(frameDt());
 
-            // Feedback: damage taken -> screen shake; low health -> beeping.
+            // Feedback: damage taken -> screen shake; a deep-water dive
+            // kicks up droplets; low health -> beeping.
             if (hero.healthHalves() < healthBefore || (stateBefore != HERO_HURT && hero.state() == HERO_HURT))
             {
                 shakeTime = 0.25f;
                 shakeStrength = 3.0f;
             }
+            if (stateBefore != HERO_SPLASH && hero.state() == HERO_SPLASH)
+            {
+                Vector2 c = hero.center();
+                spawnParticles(c.x, c.y - 4.0f, 10, 140, 180, 235,
+                               85.0f, 160.0f);
+            }
+
+            // Warp pads underfoot (after the move so step-ons register).
+            updateWarps();
 
             // Walking off a linked map edge glides into the next room.
             maybeStartRoomTransition();
+            }
         }
     }
 
@@ -3753,12 +4359,17 @@ static void updateAndDraw(void)
         itemGet.active = false;
     }
 
-    if (shakeTime > 0.0f) shakeTime -= GetFrameTime();
+    if (shakeTime > 0.0f) shakeTime -= frameDt();
+    if (flashTime > 0.0f)
+    {
+        flashTime -= frameDt();
+        if (flashTime < 0.0f) flashTime = 0.0f;
+    }
 
     // Low-health beeping (flashing handled in the HUD).
     if (hero.healthHalves() > 0 && hero.healthHalves() <= 2 && !paused)
     {
-        lowHpBeepTimer += GetFrameTime();
+        lowHpBeepTimer += frameDt();
         if (lowHpBeepTimer >= 0.42f)
         {
             lowHpBeepTimer = 0.0f;
@@ -3826,6 +4437,15 @@ static void updateAndDraw(void)
         DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{ 0, 0, 0, alpha });
     }
 
+    // Screen flash pulses (bomb blasts, boss deaths), under the HUD.
+    if (flashTime > 0.0f)
+    {
+        float t = flashDuration > 0.0f ? flashTime / flashDuration : 0.0f;
+        Color c = flashColor;
+        c.a = (unsigned char)(int)(clampf(flashPeak * t, 0.0f, 1.0f) * 255.0f);
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), c);
+    }
+
     drawHud();
     drawToasts();
     drawPauseOverlay();
@@ -3874,7 +4494,7 @@ int main(int argc, char** argv)
         SetTextureFilter(enemySheets[i], TEXTURE_FILTER_POINT);
     }
 
-    for (int i = 0; i < OBJECT_COUNT && i < 8; i++)
+    for (int i = 0; i < OBJECT_COUNT && i < 16; i++)
     {
         objectSheets[i] = LoadTexture(OBJECTS[i].image);
         SetTextureFilter(objectSheets[i], TEXTURE_FILTER_POINT);
@@ -3890,7 +4510,6 @@ int main(int argc, char** argv)
     sndLowHp = LoadSound("assets/audio/low hp.wav");
     sndShot = LoadSound("assets/audio/fireball.wav");
     sndShotWall = LoadSound("assets/audio/arrow hit wall.wav");
-    sndBoomerang = LoadSound("assets/audio/boomerang.wav");
     sndBoomerangHit = LoadSound("assets/audio/small enemy hit.wav");
     sndTink = LoadSound("assets/audio/tink.wav");
     sndSwordBeam = LoadSound("assets/audio/sword beam.wav");
@@ -3903,17 +4522,17 @@ int main(int argc, char** argv)
     sndDoorClose = LoadSound("assets/audio/door close.wav");
     sndBombExplode = LoadSound("assets/audio/bomb explode.wav");
     sndBombWall = LoadSound("assets/audio/bombable wall.wav");
-    sndLayBomb = LoadSound("assets/audio/lay bomb.wav");
     sndItemGet = LoadSound("assets/audio/item get 1.wav");
     sndError = LoadSound("assets/audio/error.wav");
     sndUiCursor = LoadSound("assets/audio/cursor.wav");
     sndUiButton = LoadSound("assets/audio/button.wav");
     sndChestOpen = LoadSound("assets/audio/chest open.wav");
     sndFanfare = LoadSound("assets/audio/item get 2.wav");
-    sndFireRod = LoadSound("assets/audio/fire rod.wav");
     sndUseKey = LoadSound("assets/audio/use key.wav");
     sndBossDies = LoadSound("assets/audio/boss dies.wav");
-    sndIceRod = LoadSound("assets/audio/ice rod.wav");
+    sndSecret = LoadSound("assets/audio/secret.wav");
+    sndWarp = LoadSound("assets/audio/warp.wav");
+    sndCrystal = LoadSound("assets/audio/crystal.wav");
     sndFire = LoadSound("assets/audio/fire.wav");
 
     lightGradient = LoadTexture("assets/effects/light.png");
@@ -3921,6 +4540,7 @@ int main(int argc, char** argv)
     lightRT = LoadRenderTexture(GetScreenWidth(), GetScreenHeight());
 
     dialogue.init();
+    gDialogueItemOwned = itemOwnedQuery;
 
     if (ENCOUNTER_TOTAL > 0)
     {
@@ -4002,7 +4622,7 @@ int main(int argc, char** argv)
     {
         if (enemySheets[i].id != 0) UnloadTexture(enemySheets[i]);
     }
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 16; i++)
     {
         if (objectSheets[i].id != 0) UnloadTexture(objectSheets[i]);
     }
@@ -4013,7 +4633,6 @@ int main(int argc, char** argv)
     UnloadSound(sndLowHp);
     UnloadSound(sndShot);
     UnloadSound(sndShotWall);
-    UnloadSound(sndBoomerang);
     UnloadSound(sndBoomerangHit);
     UnloadSound(sndTink);
     UnloadSound(sndSwordBeam);
@@ -4026,18 +4645,19 @@ int main(int argc, char** argv)
     UnloadSound(sndDoorClose);
     UnloadSound(sndBombExplode);
     UnloadSound(sndBombWall);
-    UnloadSound(sndLayBomb);
     UnloadSound(sndItemGet);
     UnloadSound(sndError);
     UnloadSound(sndUiCursor);
     UnloadSound(sndUiButton);
     UnloadSound(sndChestOpen);
     UnloadSound(sndFanfare);
-    UnloadSound(sndFireRod);
     UnloadSound(sndUseKey);
     UnloadSound(sndBossDies);
-    UnloadSound(sndIceRod);
+    UnloadSound(sndSecret);
+    UnloadSound(sndWarp);
+    UnloadSound(sndCrystal);
     UnloadSound(sndFire);
+    shutdownNamedSfx();
     UnloadTexture(lightGradient);
     if (lightRT.texture.id != 0) UnloadRenderTexture(lightRT);
 

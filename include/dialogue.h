@@ -2,6 +2,10 @@
 
 #include "engine.h"
 
+// Inventory query for "if_item"/"unless_item" line conditions: the game
+// installs this at boot (dialogue stays decoupled from the inventory).
+extern bool (*gDialogueItemOwned)(int item);
+
 class DialogueBox
 {
 public:
@@ -21,6 +25,7 @@ public:
     // Returns true/pointer once per queued request.
     const char* takeMusicRequest();   // 0 = none; "" = stop the bgm
     bool takeWarpRequest(int& room, int& tileX, int& tileY);
+    bool takeGiveRequest(int& item);  // "give" lines queue one grant per line
 
 private:
     struct Row
@@ -55,6 +60,8 @@ private:
 
     char musicRequest[128];
     bool musicPending;
+    int giveItem;
+    bool givePending;
     int warpRoom;
     int warpTileX;
     int warpTileY;

@@ -1,0 +1,7 @@
+{
+    "label": "BOOMERANG",
+    "use": {
+        "kind": "boomerang",
+        "sfx": "boomerang.wav"
+    }
+}

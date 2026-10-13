@@ -8,7 +8,7 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Native (macOS/clang++) build script
 - [x] Web (Emscripten) build with `emscripten_set_main_loop`
 - [x] Console-port sanity build (Dreamcast) kept compiling via `build-dreamcast.sh` (KallistiOS + raylib4Consoles in Docker; Gamecube/N64 were evaluated and dropped — their raylib ports ship without the audio module, so they'd be missing-feature targets)
-- [ ] Fixed-timestep or delta-time audit so gameplay speed is resolution/framerate independent
+- [x] Fixed-timestep or delta-time audit so gameplay speed is resolution/framerate independent (all systems already scale by the real delta; `frameDt()` clamps pathological frame gaps to 1/20s so alt-tabs/window drags can't teleport entities)
 - [x] Deterministic RNG (seeded, saveable) for drops and enemy behavior (seeded xorshift in `engine.h`; save integration pending the save system)
 - [x] Input remapping layer beyond the hardcoded `ACTION_KEY` (action, sword, item, dash, pause bindings; a map button pending the map screen)
 
@@ -30,7 +30,7 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Ledge hopping: jumping down predefined ledge edges with a hop animation and landing dust (`"ledge"` tile metadata; vault-over collider tiles, one-way)
 - [x] Conveyor belt tiles pushing the player (`"push": [dx, dy]` tile metadata, 4-direction placeholder tiles)
 - [x] Wind/current tiles pushing the player (for water flow) (same push mechanism; test current channel in room 01 feeding the pond)
-- [x] Pegasus boots: charge dash, breaking pots/plants, crashing into walls (stun), dashing over gaps, damage on contact (dash + wall-crash stun + grass trample + contact damage; pots/gap-jumping pending those systems)
+- [x] Pegasus boots: charge dash, breaking pots/plants, crashing into walls (stun), dashing over gaps, damage on contact (dash + wall-crash stun + grass trample + pot/bush dash-smash + contact damage; gap-jumping pending a gap system)
 - [x] Carrying state: lifting pots/bushes/rocks over head, walking with them, throwing them (rocks pending gloves)
 - [ ] Grabbing and pulling objects (statues, lever blocks) with a pull animation
 - [x] Death sequence: spin collapse, hearts drain, game-over screen, respawn flow
@@ -47,9 +47,9 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Enemy contact damage to player (hearts/quarters-of-hearts), knockback, i-frames
 - [x] Player attack resolution: single-hit-per-swing against an enemy, hitstun, knockback, death poof
 - [x] Enemy death effects: cloud poof (explosion for bomb-vulnerable enemies pending bombs)
-- [x] Hit-pause / screen shake feedback for impactful hits (screen shake; hit-pause pending)
+- [x] Hit-pause / screen shake feedback for impactful hits (light beat on connect, heavier on kills/boss hits, on top of the screen shake)
 - [x] Grass cutting: slash removes grass tiles, spawns drop + rustle sfx
-- [ ] Bush cutting (only after they've been made liftable-or-cuttable per tile data)
+- [x] Bush cutting (bushes are liftable-or-cuttable objects: sword swings/spins smash standing bushes with leaves + a drop, once per swing)
 
 ## Items & Inventory
 
@@ -72,7 +72,7 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [ ] Flute: bird summon fast-travel points
 - [ ] Bottles: fill with potions/fairies/bugs, use contents
 - [ ] Bug-catching net: catches bees/fairies, agitates enemies
-- [x] Magic meter: capacity, consumption per item, refill potions/fountains (meter + HUD + drop refills + rod consumption in; potions/fountains pending)
+- [x] Magic meter: capacity, consumption per item, refill potions/fountains (meter + HUD + drop refills + rod consumption + fairy-fountain water refills in; potions pending)
 - [x] Heart containers/pieces: pickup, health max increase, chest fanfare (container pickup + max-raise in; pieces + chest grant pending)
 - [x] Rupee wallets and rupee counting with loss-on-damage (wallet cap + counting in; LttP doesn't drop rupees on hit — intentionally omitted)
 - [x] Item-get sequence: hold-up pose, fanfare, description dialogue, inventory update
@@ -89,10 +89,10 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Projectiles blocked by shield depending on facing (octorok rocks deflect off the passive shield)
 - [x] Stun mechanic (boomerang), grab-and-throw some stunned enemies (throw pending)
 - [ ] Element interactions: fire (burn), ice (freeze/thaw), bombs (explode), powder (transform) (fire/ice/bombs in via rods + bombs item; powder pending)
-- [ ] Ambush/spawn-from-object enemies (wall hide, pots popping out)
+- [x] Ambush/spawn-from-object enemies (pot-swap in: pots with a "hides" enemy pop it out on lift; wall-hide ambushes pending)
 - [ ] Zora-in-water, wall-crawling and diving enemy types (depth quirks)
 - [x] Enemy drop table: hearts, rupees (1/5) with weighted rolls (fairies, magic, bombs/arrows + LttP persistent drop cycling pending)
-- [ ] Placed-item entities: hearts in grass, buried rupees, rupee-crab decoys
+- [x] Placed-item entities: hearts in grass, buried rupees (room "pickups" list, fresh per entry; rupee-crab decoys pending a crab enemy)
 
 ## Bosses
 
@@ -109,7 +109,7 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] One-shot encounter memory (process-lifetime) with `repeat` bypass
 - [x] Room interconnection data model (map graph): doors, edges, stairs, warps defined in the editor (`"exits"` per-edge links baked as room indices; door/stair/warp entities pending)
 - [x] Edge-scroll transitions: hero exits screen edge, camera + hero glide into adjacent room (the LttP signature) (scroll-in glide with unclamped camera follow; both-rooms seam scroll pending)
-- [x] Fade transitions for warp/door tiles and house entrances (fade-in from black on non-scroll loads; warp/door tiles pending)
+- [x] Fade transitions for warp/door tiles and house entrances (fade-in from black on non-scroll loads; warp pads in as step-on objects)
 - [x] Door entities: open, closed (opens from either side), locked (small key), big-key, bombable, treasure-chest-triggered, shutter doors that close for fights (all kinds but treasure-chest-triggered in; doors pair-sync across rooms and persist in the save)
 - [ ] Staircases / pit-landing transitions between vertically-stacked room layers
 - [ ] Overworld <-> dungeon room treatment (persistent enemies vs. respawn-on-reentry)
@@ -120,7 +120,7 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Dark rooms: lighting masks, lantern radius, torch-lighting reveals (lightmap: ambient gloom + additive radial lights, multiplied blend; lantern + lit torches reveal)
 - [ ] Weather/ambience overlays (rain, lightning flashes, fog)
 - [ ] Light/Dark world: mirror transform, parallel world data pairing, mirror-warps
-- [ ] Dynamic tiles: bombable walls, cracked floors with holes, burned-open entrances, permanently destructible in save state (bombable walls/floors blast open at runtime; permanence pending the save system)
+- [x] Dynamic tiles: bombable walls, cracked floors with holes, burned-open entrances, permanently destructible in save state (blasted-tile registry re-applies on room load and persists in the save, v5 schema)
 - [ ] Water current routing (river pushing hero toward specific edges)
 
 ## Objects & Interactive Entities
@@ -131,18 +131,18 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Push blocks: pushable one tile, sink into floor when on a switch; session vs. permanent states (sustain-push + slide + sink; session-only until the save system)
 - [ ] Statues: pullable, pushable onto floor switches (pushable via the block mechanic; pulling pending)
 - [x] Floor switches: hold-weight type, latch type, linked to doors/barriers (barriers in; doors pending)
-- [ ] Crystal switch: toggles blue/red barrier blocks dungeon-wide
-- [ ] Blue/red barrier blocks (raised/lowered state, damage on wrong approach)
+- [x] Crystal switch: toggles blue/red barrier blocks dungeon-wide (state as a saved world flag; any sword/spin/dash strike toggles)
+- [x] Blue/red barrier blocks (raised/lowered state, damage on wrong approach)
 - [x] Torch posts and lanterns: ignite with fire items, timers, light contribution (fire-rod lighting + barrier link groups in; timers/light radius pending dark rooms)
-- [x] Pots: liftable, throwable (smash + drops), swap out for enemies occasionally (pot-swap enemies pending)
+- [x] Pots: liftable, throwable (smash + drops), swap out for enemies occasionally (pot-swap via the "hides" enemy field)
 - [x] Bushes: liftable, sometimes hide enemies/rupees (liftable + throw-smash in; hidden enemies/rupees pending)
 - [ ] Rocks: hammer/smashable, big rocks need gloves
 - [x] Signs: readable via action button, includes directional orientation (readable via dialogue; directional orientation art pending)
 - [ ] Levers/valves: pull to open gates, drain water, move platforms
 - [ ] Moving platforms: rail-based, water-surface, carry the hero (and thrown objects)
 - [ ] Spinner/vane tiles, pressure-plate timed puzzles
-- [ ] Warp tiles, warp pads, telepathic story tiles
-- [ ] Fairy fountains (heal), sand hourglass / timed challenge rooms
+- [x] Warp tiles, warp pads, telepathic story tiles (warp pads as "warp" objects: step-on fade warp + autosave; tile-triggered story text = instant encounters)
+- [x] Fairy fountains (heal), sand hourglass / timed challenge rooms ("heal" water tiles refill hearts + magic; timed challenge rooms pending)
 - [x] Range-exchange system for thrown/liftable objects (physics arc, tile collision on land, splash in water)
 - [ ] Rupee-like pickups: heart, rupee, fairy, magic, keys, bombs/arrows, with magnet-ish pull from boomerang/hookshot
 
@@ -151,10 +151,10 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] LttP-style typewriter dialogue: nine-patch border, word wrap, ~30 cps, skip/advance via action key
 - [x] Per-letter and per-line completion sfx
 - [x] Movement freeze during dialogue
-- [x] Action scripting in dialogue files (the future feature NOTES calls out): commands for setting flags, giving items, playing sfx/music, warping, camera control, branch on story state (flags/sfx/music/warp/labels/branches in; give-items + camera pending the item/cutscene systems)
+- [x] Action scripting in dialogue files (the future feature NOTES calls out): commands for setting flags, giving items, playing sfx/music, warping, camera control, branch on story state (flags/sfx/music/warp/labels/branches/give-items in; camera pending the cutscene system)
 - [x] Dialogue choice branches (yes/no selections with a cursor)
-- [x] Conditional dialogue lines based on world flags/inventory (world flags in; inventory conditions pending the item system)
-- [x] NPC entities: idle, wander, path-following, facing hero when talked to (idle + wander + talk-facing in; path-following pending)
+- [x] Conditional dialogue lines based on world flags/inventory (world flags + if_item/unless_item inventory conditions in)
+- [x] NPC entities: idle, wander, path-following, facing hero when talked to (idle + wander + talk-facing + tile-waypoint path loops in)
 - [x] NPC schedules and position by story state (spawn conditions on world flags — presence by story state in; schedules pending)
 - [ ] Shop system: rupee exchanges, item purchase, robbing and consequences
 - [x] Chest/held-item dialogue coupling (item descriptions on pickup)
@@ -187,8 +187,8 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 - [x] Walk sfx per room, letter sfx in dialogue
 - [ ] Sfx bank convention (hurt, slash, dash, explosion, rupee, secrets, fanfares)
 - [ ] Ambient world sfx (birds, rain) and layered ambience
-- [ ] Fanfare handling: temporarily duck/pause bgm for item-get, resume properly
-- [ ] LttP "secret discovered" jingle convention
+- [x] Fanfare handling: temporarily duck/pause bgm for item-get, resume properly (`playJingle` pauses the music stream, resumes where it left off when the jingle ends; wired to chest + boss fanfares)
+- [x] LttP "secret discovered" jingle convention (`secret.wav` ducks the bgm when a bomb blasts a passage open)
 - [ ] Dynamic music layers / crossfade for danger states if desired
 - [ ] Web build: memory-conscious audio loading strategy (lazy streaming, prioritized bake order)
 
@@ -196,9 +196,9 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 
 - [x] Depth/y-sort pass for entities and hero vs. tall tiles (entity baseline sort; tall tiles pending tile metadata)
 - [x] Sweep/arc visual for sword slash with directional variants (4-direction arc sheet)
-- [ ] Sprite effects: flash on hit (tint), freeze frames, dust/leaves/grass-chunk particles, splashes (enemy hit flash in; particles pending)
+- [x] Sprite effects: flash on hit (tint), freeze frames, dust/leaves/grass-chunk particles, splashes (hit flash + hit-pause freeze + landing dust rings + grass/leaf/shard chips + water droplets in)
 - [x] Bomb and explosion animation entities (fuse-blink bomb + expanding explosion rings + white flash)
-- [ ] Screen-space effects: shake, flash, fade in/out helper (shake + death fade in; flash/fade helpers pending)
+- [x] Screen-space effects: shake, flash, fade in/out helper (shake + death fade + `screenFlash` pulse helper in; wired to bomb blasts and boss death; fade helpers covered by the room fade)
 - [ ] LttP-style palette: master palette with swap-on-room-change fade for screen transitions
 - [ ] Night palette or ambient tint states
 - [x] Reflections in shallow water, tree-blob shadows under entities (blob shadows under hero/enemies; reflections pending)
@@ -223,12 +223,27 @@ A complete backlog for fleshing this engine out into something capable of re-cre
 
 - [x] `.json` room/tileset data baked into `include_auto`/`src_auto`, binary-only runtime loads from `assets/`
 - [x] Optional-field handling with defaults (spawn, music, walk_sfx, dialogue, repeat)
-- [ ] Bake pipeline for new data families: enemies, items, objects, room links, tile metadata, flags, save schema
+- [x] Bake pipeline for new data families: enemies, items, objects, room links, tile metadata, flags, save schema (all families bake; items/objects/enemies are per-game content with generator-assigned ids)
 - [x] Generator-side validation: frame index bounds, missing-dialogue references, orphan rooms, tile id sanity, unique encounter ids (anim frames, layer tile ids, orphan rooms, all name refs warn; encounter ids unique by construction)
 - [ ] Baked asset indexing for fast lookup by name (rooms by name/stem, strings, etc.)
 - [x] Deterministic generator output (no churn on rebuild) (verified by the soak test's double-bake hash)
 - [ ] Generated-code size management as data scales (web build memory budget)
 - [x] Editor saves JSON in a canonical, generator-compatible format (save round-trips the full file: unknown keys like enemies/objects are preserved)
+
+## Open-Engine Migration (resources/ = the game)
+
+- [x] Game-defined ids (items, object types, door/chest/grant kinds, barrier colors) generated per game into include_auto; engine.h owns only vocabulary
+- [x] Per-game save identity: game slug baked into the save blob (schema v6), validated on load
+- [x] Items as content: resources/items/*.json with use-actions (kind/element/cost/sfx) + passives; useEquippedItem is an interpreter
+- [x] Enemies as composition: component params baked from presets (soldier/octorok/boss) or explicit components; boss phases are a data table; per-enemy drop tables
+- [x] Objects as composition: resources/objects/types.json composes the OBJINT_* interaction vocabulary; engine branches on interactions, never type identity
+- [x] Door/chest/grant rules as data tables (DOOR_RULES/CHEST_RULES/GRANT_RULES); no per-kind code branches
+- [x] Game-local C++ seam: resources/code/*.cpp compiled by all three build scripts, static-init gamecode registry, manifest.json bake validation, enemy "custom:<name>" behaviors verified end to end
+- [x] Generator budget validation (pool sizes, save caps) with bake warnings
+- [ ] Editor forms for the data vocabularies (object types, item use-actions, enemy components/drops, door kinds)
+- [ ] Editor: custom-behavior scaffolding + compile-error surfacing
+- [ ] Game-folder picker polish (a new resources folder = a new game, selectable from the editor)
+- [ ] resources/game.json surface in the editor (title/slug editing)
 
 ## Testing & Verification
 

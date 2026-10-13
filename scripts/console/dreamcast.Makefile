@@ -5,8 +5,11 @@ TARGET := ltop.elf
 
 SRCS := $(wildcard ../../src/*.cpp)
 AUTOSRCS := $(wildcard ../../src_auto/*.cpp)
-OBJS := $(patsubst %.cpp,%.o,$(notdir $(SRCS))) $(patsubst %.cpp,%.o,$(notdir $(AUTOSRCS))) dreamcast_shim.o romdisk.o
-vpath %.cpp ../../src ../../src_auto
+# Game-local C++ (resources/code/*.cpp) compiles into the binary with the
+# engine — the layer-4 seam (see NOTES.md "Custom behaviors").
+GAMESRCS := $(wildcard ../../resources/code/*.cpp)
+OBJS := $(patsubst %.cpp,%.o,$(notdir $(SRCS))) $(patsubst %.cpp,%.o,$(notdir $(AUTOSRCS))) $(patsubst %.cpp,%.o,$(notdir $(GAMESRCS))) dreamcast_shim.o romdisk.o
+vpath %.cpp ../../src ../../src_auto ../../resources/code
 vpath %.c ../../scripts/console
 
 KOS_ROMDISK_DIR := romdisk

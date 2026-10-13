@@ -14,7 +14,8 @@
             "water": "deep"
         },
         "60": {
-            "water": "shallow"
+            "water": "shallow",
+            "heal": true
         },
         "61": {
             "ice": true

@@ -1,0 +1,44 @@
+{
+    "types": [
+        {
+            "name": "pot",
+            "interactions": ["solid", "liftable", "dash_smash", "hides"]
+        },
+        {
+            "name": "bush",
+            "interactions": ["solid", "liftable", "dash_smash", "cut", "leaves"]
+        },
+        {
+            "name": "block",
+            "interactions": ["solid", "pushable", "sinks", "weight"]
+        },
+        {
+            "name": "switch",
+            "interactions": ["floor", "switch"]
+        },
+        {
+            "name": "barrier",
+            "interactions": ["solid", "barrier"]
+        },
+        {
+            "name": "sign",
+            "interactions": ["solid", "readable"]
+        },
+        {
+            "name": "chest",
+            "interactions": ["solid", "chest", "two_frame"]
+        },
+        {
+            "name": "torch",
+            "interactions": ["solid", "torch"]
+        },
+        {
+            "name": "warp",
+            "interactions": ["floor", "warp"]
+        },
+        {
+            "name": "crystal",
+            "interactions": ["solid", "crystal"]
+        }
+    ]
+}

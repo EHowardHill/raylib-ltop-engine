@@ -1,0 +1,11 @@
+{
+    "label": "BOW",
+    "use": {
+        "kind": "arrow",
+        "cost": {
+            "ammo": "arrow",
+            "amount": 1,
+            "rupee_fallback": true
+        }
+    }
+}

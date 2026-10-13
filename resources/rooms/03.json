@@ -590,5 +590,21 @@
                 6
             ]
         }
+    ],
+    "pickups": [
+        {
+            "kind": "heart",
+            "location": [
+                2,
+                2
+            ]
+        },
+        {
+            "kind": "magic",
+            "location": [
+                17,
+                11
+            ]
+        }
     ]
 }

@@ -43,9 +43,11 @@ struct DialogueChoice
 };
 
 // One line of dialogue with optional scripting. Effects:
-// - if/unless: the line is only shown when the flag matches (skipped
-//   lines never execute anything).
-// - set/clear/sfx/music: applied when the line is SHOWN.
+// - if/unless (flags) and if_item/unless_item (inventory): the line is
+//   only shown when the condition matches (skipped lines never execute
+//   anything).
+// - set/clear/sfx/music/give: applied when the line is SHOWN (give hands
+//   the named item over via the game's give-request drain).
 // - goto: jump when the line completes (action press after typing).
 // - warp: queued when the line completes; the game executes it once the
 //   dialogue closes (loading the room at the tile).
@@ -66,6 +68,9 @@ struct DialogueLine
     int warpRoom;           // -1 = none
     int warpTileX;
     int warpTileY;
+    int ifItem;             // game-defined item id or -1 = no condition
+    int unlessItem;         // game-defined item id or -1 = no condition
+    int giveItem;           // item id granted when shown, -1 = none
     int choiceCount;
     const DialogueChoice* choices;
 };
@@ -86,13 +91,24 @@ struct Encounter
     bool repeat;
 };
 
-// Enemy behavior archetypes, baked from the "behavior" stat in
-// resources/enemies/*.json. Numbers are generator-side constants; keep both
-// sides in sync (BEHAVIORS in scripts/generate_assets.py).
-constexpr int BEHAVIOR_NONE = 0;
-constexpr int BEHAVIOR_SOLDIER = 1;  // patrol, charges on sight
-constexpr int BEHAVIOR_OCTOROK = 2; // walks, stops, spits rocks
-constexpr int BEHAVIOR_BOSS = 3;    // arena boss: phased charges, doors lock
+// Enemy component vocabulary. The engine interprets these parameters
+// (composed by the generator from behavior presets or explicit
+// "components" in the enemy json); no archetype ids exist at runtime.
+// Presets are game data; the interpreter in src/enemy.cpp is engine
+// vocabulary.
+struct EnemyPhase
+{
+    float hpBelow;    // phase active at or below this hp ratio
+    float speedScale; // charger speed multiplier while in the phase
+};
+
+// Per-enemy drop table entry (kind = pickups-sheet frame, weight = roll
+// weight). No table = the engine's default drop roll.
+struct DropEntry
+{
+    int kind;
+    int weight;
+};
 
 struct EnemyConfig
 {
@@ -105,10 +121,18 @@ struct EnemyConfig
     int hp;
     int speed;              // px/s while walking
     int contactDamage;      // half-hearts
-    int behavior;
-    int sight;              // px; soldier charge radius
-    int shootPeriod;        // tenths of a second between shots; 0 = never
-    bool boss;              // arena boss: bigger sprite, phased AI, defeat
+    float chargeSight;      // charger: px radius to notice the hero (0 = never)
+    float chargeSpeedScale; // charger: speed multiplier while charging
+    bool chargeStunOnWall;  // charger: wall impact stuns
+    int shootPeriod;        // shooter: cadence knob (0 = never shoots)
+    float walkSegment;      // mover: seconds per wander leg (0 = engine default)
+    bool turnInPlace;       // mover: occasional random course change
+    const EnemyPhase* phases; // boss phase table (ascending hpBelow)
+    int phaseCount;
+    bool boss;              // arena boss: bigger sprite, room seal, banked defeat
+    const char* customBehavior; // gamecode "custom:<name>" behavior, 0 = none
+    const DropEntry* drops; // per-enemy drop table, 0 = engine default
+    int dropCount;
 };
 
 struct EnemySpawn
@@ -118,62 +142,94 @@ struct EnemySpawn
     int enemy;
 };
 
-// Object types, generator-side constants (OBJECT_TYPES in
-// scripts/generate_assets.py). Keep both sides in sync when adding kinds
-// (chests, statues...).
-constexpr int OBJECT_POT = 0;      // liftable, throwable
-constexpr int OBJECT_BUSH = 1;     // liftable, throwable
-constexpr int OBJECT_BLOCK = 2;    // pushable one tile; sinks onto latch switches
-constexpr int OBJECT_SWITCH = 3;   // floor switch: hold (aux1 0) or latch (aux1 1)
-constexpr int OBJECT_BARRIER = 4;  // raised gate; lowers while linked (aux2) switches are active
-constexpr int OBJECT_SIGN = 5;    // readable: aux1 = dialogue index
-constexpr int OBJECT_CHEST = 6;   // treasure chest: aux1 = kind, aux2/aux3 = grant
-constexpr int OBJECT_TORCH = 7;   // torch post: aux2 = link group; fire lights it (latched)
-
-// Chest kinds (aux1 on chest spawns).
-constexpr int CHEST_NORMAL = 0;
-constexpr int CHEST_LOCKED = 1;   // consumes a small key to open
-constexpr int CHEST_BIG = 2;      // consumes a big key to open
-
-// Chest grant kinds (aux2 on chest spawns; aux3 = item index or amount).
-constexpr int GRANT_ITEM = 0;            // aux3 = ITEM_* index
-constexpr int GRANT_RUPEES = 1;         // aux3 = amount
-constexpr int GRANT_ARROWS = 2;          // aux3 = amount
-constexpr int GRANT_BOMBS = 3;          // aux3 = amount
-constexpr int GRANT_MAGIC = 4;          // aux3 = half-units
-constexpr int GRANT_HEART_CONTAINER = 5;
-constexpr int GRANT_SMALL_KEY = 6;
-constexpr int GRANT_BIG_KEY = 7;
+// Object interaction vocabulary (engine-owned; a game's object types
+// compose these in resources/objects/types.json). The engine branches on
+// these flags, never on type identity, so new game-defined types get the
+// composed behavior for free. Interactions marked with the aux field they
+// consume on spawns (see ObjectSpawn below).
+constexpr unsigned OBJINT_SOLID = 0x1;         // blocks movement while grounded
+constexpr unsigned OBJINT_FLOOR = 0x2;         // walkable plate, drawn under entities
+constexpr unsigned OBJINT_LIFTABLE = 0x4;      // action button hoists it overhead
+constexpr unsigned OBJINT_CUT = 0x8;           // sword swings smash it (grass-style)
+constexpr unsigned OBJINT_DASH_SMASH = 0x10;   // pegasus dash shatters it
+constexpr unsigned OBJINT_PUSHABLE = 0x20;     // sustained push slides it one tile
+constexpr unsigned OBJINT_SINKS = 0x40;        // push-block sinks onto latch switches
+constexpr unsigned OBJINT_WEIGHT = 0x80;       // counts as weight on floor switches
+constexpr unsigned OBJINT_SWITCH = 0x100;      // floor plate: aux1 hold/latch, aux2 link
+constexpr unsigned OBJINT_BARRIER = 0x200;     // linked gate: aux2 link, aux3 color
+constexpr unsigned OBJINT_READABLE = 0x400;    // sign: aux1 dialogue index
+constexpr unsigned OBJINT_CHEST = 0x800;       // container: aux1 kind, aux2/aux3 grant
+constexpr unsigned OBJINT_TORCH = 0x1000;      // lightable post: aux2 link
+constexpr unsigned OBJINT_WARP = 0x2000;       // warp pad: aux1 room, aux2/aux3 tile
+constexpr unsigned OBJINT_CRYSTAL = 0x4000;    // sword strikes toggle the crystal state
+constexpr unsigned OBJINT_LEAVES = 0x8000;     // smashes into leaves instead of shards
+constexpr unsigned OBJINT_TWO_FRAME = 0x10000; // two-frame sheet (frame 2 once opened)
+constexpr unsigned OBJINT_HIDES = 0x20000;    // hides an enemy (aux1) until lifted
 
 struct ObjectConfig
 {
     const char* name;
     const char* image;  // single 32x32 frame
+    unsigned interactions;  // OBJINT_* composition (the engine's behavior seam)
 };
 
-// Door kinds on map-graph edges ("doors" in room json). A door gates its
-// edge: the hero can't scroll through until it's open.
+// Door rule vocabulary: how a door kind (game-defined id) behaves. The
+// engine consults this table; kinds are data, not code branches.
+struct DoorRule
+{
+    bool startsOpen;      // always passable (cosmetic when open)
+    bool pushOpen;        // a push from either side opens it, stays open
+    int keyCost;          // 0 = none, 1 = small key, 2 = big key
+    bool bombable;        // a blast at the wall midpoint blows it open
+    bool liveEnemiesDead; // open only while no enemies live in the room
+};
+
+// Sentinel for "no door on this edge" (engine-level; kind ids are game
+// data and resolve through DOOR_RULES).
 constexpr int DOOR_NONE = -1;
-constexpr int DOOR_OPEN = 0;      // always passable (cosmetic archway)
-constexpr int DOOR_CLOSED = 1;    // pushes open from either side, stays open
-constexpr int DOOR_LOCKED = 2;   // small key, stays open
-constexpr int DOOR_BIG = 3;      // big key, stays open
-constexpr int DOOR_BOMBABLE = 4; // bomb blast opens it
-constexpr int DOOR_SHUTTER = 5;  // shutters while enemies live in the room
+
+// Chest kind rule: what opening a chest of this kind costs.
+struct ChestRule
+{
+    int keyCost;  // 0 = none, 1 = small key, 2 = big key
+};
+
+// Grant effects (trigger-vocabulary "grant" action, e.g. chest payloads).
+constexpr int GRANTEFFECT_GIVE_ITEM = 0;
+constexpr int GRANTEFFECT_ADD_RUPEES = 1;
+constexpr int GRANTEFFECT_ADD_ARROWS = 2;
+constexpr int GRANTEFFECT_ADD_BOMBS = 3;
+constexpr int GRANTEFFECT_ADD_MAGIC = 4;
+constexpr int GRANTEFFECT_ADD_HEARTS = 5;   // heart container: max +1 heart
+constexpr int GRANTEFFECT_ADD_SMALL_KEY = 6;
+constexpr int GRANTEFFECT_ADD_BIG_KEY = 7;
+
+// Grant rule: the engine applies `effect` (with param = item index or
+// amount), shows the item-get rise with `pickupFrame` (pickups sheet
+// frame, -1 = medallion), and describes it with `text` (%s = item label,
+// %d = amount).
+struct GrantRule
+{
+    int effect;
+    int pickupFrame;
+    const char* text;
+};
 
 struct ObjectSpawn
 {
     int tileX;
     int tileY;
     int type;
-    int aux1;  // switch: 0 hold / 1 latch; sign: dialogue index; chest: kind
-    int aux2;  // switch/barrier: link group; chest: grant kind
-    int aux3;  // chest: grant item index or amount
+    // Aux payloads; which apply depends on the type's interactions:
+    int aux1;  // switch: 0 hold / 1 latch; readable: dialogue; chest: kind; hides: enemy; warp: room
+    int aux2;  // switch/barrier/torch: link group; chest: grant kind; warp: tile x
+    int aux3;  // barrier: color; chest: grant item index or amount; warp: tile y
 };
 
 // NPCs: character-driven townsfolk. Idle NPCs turn to face the hero when
-// nearby; wanderers stroll with pauses; talking opens their dialogue.
-// Spawn conditions gate presence on world flags (story state).
+// nearby; wanderers stroll with pauses; path-followers walk a loop of tile
+// waypoints (path beats wander). Talking opens their dialogue. Spawn
+// conditions gate presence on world flags (story state).
 struct NpcSpawn
 {
     int tileX;
@@ -181,8 +237,19 @@ struct NpcSpawn
     int character;     // CHARACTER index
     int dialogue;      // DIALOGUE index, -1 = silent
     bool wander;       // idle/stroll when false/true
+    const short* path;   // tile waypoints as x,y pairs, 0 = none
+    int pathCount;       // waypoint count (pairs), 0 = none
     int ifFlag;        // only spawned when the flag is set (-1 = always)
     int unlessFlag;    // ...or when the flag is NOT set
+};
+
+// Placed pickups (room "pickups" list): world items lying around, spawned
+// fresh on every room entry like LttP field hearts. kind = pickups-sheet frame.
+struct PickupSpawn
+{
+    int tileX;
+    int tileY;
+    int kind;
 };
 
 struct RoomConfig
@@ -204,8 +271,10 @@ struct RoomConfig
     int objectCount;
     const NpcSpawn* npcs;
     int npcCount;
+    const PickupSpawn* pickups;  // placed world items (hearts in grass...)
+    int pickupCount;
     bool dark;       // darkness mask: lantern + lit torches reveal
-    int doorN;      // DOOR_* kind on each edge (-1 = no door)
+    int doorN;      // door kind id on each edge (-1 = no door)
     int doorS;
     int doorE;
     int doorW;
@@ -243,6 +312,7 @@ struct TileMeta
     signed char pushX;      // px/s conveyor/current/wind drift
     signed char pushY;
     unsigned char ledgeDir; // Direction when TILE_FLAG_LEDGE is set
+    unsigned char heal;     // 1 = fairy-fountain water: refills hearts/magic
 };
 
 constexpr unsigned char TILE_FLAG_PIT = 0x01;      // hole: hero falls in
@@ -264,6 +334,17 @@ inline float clampf(float value, float low, float high)
     if (value < low) return low;
     if (value > high) return high;
     return value;
+}
+
+// Frame delta with a safety clamp. Every dt-driven system already scales by
+// the real delta (so gameplay speed is framerate independent); the clamp
+// caps pathological one-frame deltas (window drags, alt-tabs, debugger
+// pauses) so nothing teleports across the map. One frame of gameplay never
+// advances more than 1/20s this way.
+inline float frameDt()
+{
+    float dt = GetFrameTime();
+    return (dt > 0.05f) ? 0.05f : dt;
 }
 
 // Input remapping layer: every logical button maps to one keyboard key plus
@@ -382,25 +463,37 @@ constexpr int PICKUP_BOMB = 5;
 constexpr int PICKUP_MAGIC = 6;
 constexpr int PICKUP_HEART_CONTAINER = 7;
 
-// Item button items, generator-side constants (ITEMS in
-// scripts/generate_assets.py); the index order is baked as ITEM_* here.
-// Keep both sides in sync when adding items (hookshot, rods, shovel...).
-constexpr int ITEM_BOOMERANG = 0;
-constexpr int ITEM_BOW = 1;
-constexpr int ITEM_BOMBS = 2;
-constexpr int ITEM_FIRE_ROD = 3;
-constexpr int ITEM_ICE_ROD = 4;
-constexpr int ITEM_LANTERN = 5;  // passive: light in dark rooms, slow magic drain
+// Item use-action vocabulary (engine-owned; a game's items compose these
+// in resources/items/*.json). The engine interprets these; the per-item
+// switch is gone.
+constexpr int ITEM_USE_NONE = 0;
+constexpr int ITEM_USE_BOOMERANG = 1;  // boomerang flight: arc out, homing return
+constexpr int ITEM_USE_ARROW = 2;      // arrow projectile
+constexpr int ITEM_USE_BOMB = 3;       // placed bomb at the hero's feet
+constexpr int ITEM_USE_BOLT = 4;       // element bolt (fire/ice rod)
 
 // Projectile elements (rods, future medallions).
 constexpr int ELEMENT_NONE = 0;
 constexpr int ELEMENT_FIRE = 1;  // burns: kills grunts, lights torches, thaws+shatters
 constexpr int ELEMENT_ICE = 2;   // freezes enemies solid
 
+// Item configuration, baked per game from resources/items/<name>.json.
+// The use-action composes the vocabulary above with costs and an sfx cue;
+// passives are always-on effects (the lantern's dark-room light). An item
+// with useKind ITEM_USE_NONE is passive-only (using it plays the error cue).
 struct ItemConfig
 {
     const char* name;
     const char* label;  // subscreen display label
+    int useKind;        // ITEM_USE_*
+    int element;        // ELEMENT_* (bolts)
+    int magicCost;      // half-units consumed per use (0 = none)
+    int bombCost;       // bombs consumed per use (0 = none)
+    int arrowCost;       // arrows consumed per use (0 = none)
+    bool arrowRupeeFallback; // dry quiver consumes a rupee instead (LttP bow)
+    const char* useSfx;  // audio file played on a successful use, 0 = none
+    bool hasLight;       // passive: light radius in dark rooms
+    int lightRadius;     // px
 };
 
 // Inventory: quantities + owned items + the equipped item (the item
@@ -410,7 +503,7 @@ struct Inventory
 {
     static const int MAX_ITEMS = 16;
 
-    int equippedItem;    // ITEM_* or -1 (empty hands)
+    int equippedItem;    // game-defined item id or -1 (empty hands)
     bool owned[MAX_ITEMS];
 
     int rupees;
@@ -467,4 +560,21 @@ inline int rollDrop(Rng& rng)
     if (roll < 95) return PICKUP_ARROW;
     if (roll < 98) return PICKUP_BOMB;
     return PICKUP_MAGIC;
+}
+
+// Weighted roll over a content drop table (per-enemy tables baked by the
+// generator; the engine default above applies when a table is absent).
+inline int rollDrop(Rng& rng, const DropEntry* table, int count)
+{
+    if (!table || count <= 0) return rollDrop(rng);
+    int total = 0;
+    for (int i = 0; i < count; i++) total += table[i].weight;
+    if (total <= 0) return PICKUP_NONE;
+    int roll = rng.range(total);
+    for (int i = 0; i < count; i++)
+    {
+        roll -= table[i].weight;
+        if (roll < 0) return table[i].kind;
+    }
+    return PICKUP_NONE;
 }

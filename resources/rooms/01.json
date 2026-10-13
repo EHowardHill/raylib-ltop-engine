@@ -1279,7 +1279,8 @@
             "location": [
                 9,
                 12
-            ]
+            ],
+            "hides": "octorok"
         },
         {
             "type": "bush",
@@ -1287,6 +1288,43 @@
                 12,
                 5
             ]
+        },
+        {
+            "type": "warp",
+            "location": [
+                2,
+                13
+            ],
+            "warp": {
+                "room": "02.json",
+                "tile": [
+                    8,
+                    6
+                ]
+            }
+        },
+        {
+            "type": "crystal",
+            "location": [
+                17,
+                2
+            ]
+        },
+        {
+            "type": "barrier",
+            "location": [
+                18,
+                2
+            ],
+            "color": "blue"
+        },
+        {
+            "type": "barrier",
+            "location": [
+                18,
+                3
+            ],
+            "color": "red"
         },
         {
             "type": "sign",
@@ -2008,6 +2046,22 @@
     "exits": {
         "east": "02.json"
     },
+    "pickups": [
+        {
+            "kind": "heart",
+            "location": [
+                7,
+                10
+            ]
+        },
+        {
+            "kind": "rupee",
+            "location": [
+                15,
+                17
+            ]
+        }
+    ],
     "npcs": [
         {
             "character": "villager",
@@ -2025,6 +2079,32 @@
             ],
             "wander": true,
             "if": "demo_met"
+        },
+        {
+            "character": "villager",
+            "location": [
+                3,
+                16
+            ],
+            "path": [
+                [
+                    3,
+                    16
+                ],
+                [
+                    16,
+                    16
+                ],
+                [
+                    16,
+                    9
+                ],
+                [
+                    3,
+                    9
+                ]
+            ],
+            "unless": "demo_refused"
         }
     ],
     "doors": {

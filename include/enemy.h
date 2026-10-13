@@ -22,6 +22,12 @@ public:
         ENEMY_MODE_COUNT
     };
 
+    // Game-code custom behaviors (resources/code/) implement the whole AI
+    // for enemies whose config references "custom:<name>"; the engine
+    // still owns hurt/stun/frozen recovery around them.
+    typedef void (*CustomBehaviorFn)(Enemy& self, const Room& room,
+                                     Vector2 heroCenter, Rng& rng, float dt);
+
     Enemy();
 
     void spawn(const EnemyConfig& config, Texture2D sheet, int tileX, int tileY);
@@ -32,6 +38,10 @@ public:
     bool isBoss() const { return cfg && cfg->boss; }
     int health() const { return hp; }
     int maxHealth() const { return cfg ? cfg->hp : 0; }
+    const EnemyConfig& config() const { return *cfg; }
+    // Registered hits so far (lethal or not); lets the caller tell "no
+    // connect" apart from a non-lethal strike (hit-pause feedback).
+    int hitsLanded() const { return hits; }
     Rectangle box() const;
     Vector2 center() const;
     int contactDamage() const { return cfg ? cfg->contactDamage : 0; }
@@ -52,11 +62,23 @@ public:
     // Event drains: the room systems read these once per frame.
     bool popShot(float& dirX, float& dirY);
 
-private:
-    void setMode(Mode mode);
-    void pickDirection(Rng& rng);
+    // --- Custom behavior API (gamecode layer 4) ---
+    // Movement/mode primitives custom behaviors drive the enemy with. The
+    // engine handles ENEMY_HURT/STUN/FROZEN recovery on its own; a custom
+    // behavior runs in the AI states (idle/walk/pause/charge).
+    void setMode(Mode next);
+    Mode modeState() const { return mode; }
     bool slide(const Room& room, float dx, float dy);
     void faceVector(float dx, float dy);
+    void pickDirection(Rng& rng);
+    void setPosition(float px, float py) { x = px; y = py; }
+    float modeElapsed() const { return modeTime; }
+    float aiTimer() const { return timer; }
+    void setAiTimer(float seconds) { timer = seconds; }
+    Direction facingDirection() const { return facing; }
+    void setFacing(Direction dir) { facing = dir; }
+
+private:
     void drawFrame(int frame) const;
 
     const EnemyConfig* cfg;
@@ -68,6 +90,7 @@ private:
     float modeTime;
     float timer;
     int hp;
+    int hits;
     float knockX;
     float knockY;
     int lastSwing;
@@ -75,4 +98,5 @@ private:
     float shotDirX;
     float shotDirY;
     float animTime;
+    CustomBehaviorFn customFn;
 };

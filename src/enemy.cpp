@@ -1,5 +1,6 @@
 #include "enemy.h"
 #include "room.h"
+#include "gamecode.h"
 
 #include <math.h>
 
@@ -12,12 +13,18 @@ static const float BOX_X = 8.0f;
 static const float BOX_Y = 12.0f;
 static const float BOX_W = 16.0f;
 static const float BOX_H = 16.0f;
+// Mover feel-constants (engine vocabulary defaults; the walk segment
+// length is content, the beat lengths are feel).
+static const float DEFAULT_WALK_SEGMENT = 2.0f;
+static const float PRE_SHOT_PAUSE = 0.5f;
+static const float BUMP_PAUSE = 0.4f;
+static const float IDLE_PAUSE = 0.3f;
 
 Enemy::Enemy()
     : cfg(0), sheet(), x(0.0f), y(0.0f), facing(DIR_DOWN), mode(ENEMY_IDLE),
-      modeTime(0.0f), timer(0.0f), hp(0), knockX(0.0f), knockY(0.0f),
+      modeTime(0.0f), timer(0.0f), hp(0), hits(0), knockX(0.0f), knockY(0.0f),
       lastSwing(-1), shotPending_(false),
-      shotDirX(0.0f), shotDirY(0.0f), animTime(0.0f)
+      shotDirX(0.0f), shotDirY(0.0f), animTime(0.0f), customFn(0)
 {
 }
 
@@ -29,12 +36,16 @@ void Enemy::spawn(const EnemyConfig& config, Texture2D spriteSheet, int tileX, i
     y = (float)(tileY * TILE_SIZE);
     facing = DIR_DOWN;
     hp = config.hp;
+    hits = 0;
     lastSwing = -1;
     shotPending_ = false;
     knockX = 0.0f;
     knockY = 0.0f;
     animTime = 0.0f;
     timer = 0.0f;
+    // Layer-4 seam: game-code behaviors resolve by name at spawn (bake-time
+    // linked registry; missing names degrade to the built-in components).
+    customFn = config.customBehavior ? gamecodeFindEnemyBehavior(config.customBehavior) : 0;
     setMode(ENEMY_IDLE);
 }
 
@@ -138,6 +149,7 @@ bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir)
     {
         if (swingId == lastSwing) return false;
         lastSwing = swingId;
+        hits++;
         hp = 0;
         return true;
     }
@@ -152,6 +164,7 @@ bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir)
     // Single hit per swing.
     if (swingId == lastSwing) return false;
     lastSwing = swingId;
+    hits++;
 
     hp--;
     if (hp <= 0)
@@ -189,6 +202,18 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
 
     modeTime += dt;
     animTime += dt;
+
+    // Layer-4 seam: a registered custom behavior owns the whole AI in the
+    // AI states. The engine keeps handling hurt/stun/frozen recovery (and
+    // the built-in component AI below degrades gracefully if a registered
+    // name was not found).
+    if (customFn
+        && (mode == ENEMY_IDLE || mode == ENEMY_WALK
+            || mode == ENEMY_PAUSE || mode == ENEMY_CHARGE))
+    {
+        customFn(*this, room, heroCenter, rng, dt);
+        return;
+    }
 
     switch (mode)
     {
@@ -232,19 +257,28 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
 
     case ENEMY_CHARGE:
     {
-        // Soldiers run the hero down; hitting a wall stuns them.
-        // Arena bosses charge too, in phases: they speed up and shorten
-        // their recovery as their health drops.
+        // Chargers run the hero down (component: chargeSight > 0); hitting
+        // a wall stuns them when the component asks for it. Boss phase
+        // tables (component: phases) speed the charge up as health drops —
+        // the first threshold matched wins, so the generator emits them
+        // in ascending hpBelow order.
         Vector2 c = center();
         float dx = heroCenter.x - c.x;
         float dy = heroCenter.y - c.y;
         float len = sqrtf(dx * dx + dy * dy);
-        float speedScale = SOLDIER_CHARGE_SPEED;
-        if (cfg->behavior == BEHAVIOR_BOSS)
+        float speedScale = (cfg->chargeSpeedScale > 0.0f)
+                               ? cfg->chargeSpeedScale : SOLDIER_CHARGE_SPEED;
+        if (cfg->phaseCount > 0 && cfg->phases)
         {
             float hpRatio = (cfg->hp > 0) ? (float)hp / (float)cfg->hp : 1.0f;
-            if (hpRatio <= 0.34f) speedScale = 3.4f;
-            else if (hpRatio <= 0.67f) speedScale = 2.6f;
+            for (int i = 0; i < cfg->phaseCount; i++)
+            {
+                if (hpRatio <= cfg->phases[i].hpBelow)
+                {
+                    speedScale = cfg->phases[i].speedScale;
+                    break;
+                }
+            }
         }
         if (len > 1.0f)
         {
@@ -254,12 +288,12 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
             float speed = (float)cfg->speed * speedScale;
             if (!slide(room, dx * speed * dt, dy * speed * dt))
             {
-                stun(0.5f);
+                if (cfg->chargeStunOnWall) stun(0.5f);
                 break;
             }
         }
         // Lost sight: back to patrol.
-        if (len > (float)cfg->sight * 1.5f) setMode(ENEMY_IDLE);
+        if (len > cfg->chargeSight * 1.5f) setMode(ENEMY_IDLE);
         break;
     }
 
@@ -272,10 +306,12 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
 
         if (timer > 0.0f) timer -= dt;
 
-        if (cfg->behavior == BEHAVIOR_OCTOROK && timer <= 0.0f)
+        // Shooter cadence (component: shootPeriod > 0): the walk leg lasts
+        // one cadence, then a pre-shot pause.
+        if (cfg->shootPeriod > 0 && timer <= 0.0f)
         {
             setMode(ENEMY_PAUSE);
-            timer = 0.5f;
+            timer = PRE_SHOT_PAUSE;
             break;
         }
 
@@ -283,14 +319,15 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
         {
             // Bump into something: pause, then turn.
             setMode(ENEMY_PAUSE);
-            timer = 0.4f;
+            timer = BUMP_PAUSE;
         }
-        else if (modeTime >= 2.0f && cfg->behavior != BEHAVIOR_OCTOROK)
+        else if (modeTime >= (cfg->walkSegment > 0.0f ? cfg->walkSegment : DEFAULT_WALK_SEGMENT)
+                 && cfg->shootPeriod <= 0)
         {
             setMode(ENEMY_IDLE);
-            timer = 0.3f;
+            timer = IDLE_PAUSE;
         }
-        else if (cfg->behavior == BEHAVIOR_OCTOROK)
+        else if (cfg->turnInPlace)
         {
             // Occasionally change course even in the open.
             if (rng.range(100) == 0) pickDirection(rng);
@@ -304,22 +341,23 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
         if (timer > 0.0f) timer -= dt;
         if (timer > 0.0f) break;
 
-        if (cfg->behavior == BEHAVIOR_SOLDIER || cfg->behavior == BEHAVIOR_BOSS)
+        // Charger (component: chargeSight): notice the hero and charge.
+        if (cfg->chargeSight > 0.0f)
         {
-            // Notice the hero and charge.
             Vector2 c = center();
             float dx = heroCenter.x - c.x;
             float dy = heroCenter.y - c.y;
-            if (sqrtf(dx * dx + dy * dy) <= (float)cfg->sight)
+            if (sqrtf(dx * dx + dy * dy) <= cfg->chargeSight)
             {
                 setMode(ENEMY_CHARGE);
                 break;
             }
         }
 
-        if (cfg->behavior == BEHAVIOR_OCTOROK && cfg->shootPeriod > 0 && rng.range(cfg->shootPeriod) == 0)
+        // Shooter (component: shootPeriod): spit a rock toward the facing
+        // direction on the cadence roll.
+        if (cfg->shootPeriod > 0 && rng.range(cfg->shootPeriod) == 0)
         {
-            // Spit a rock toward the facing direction.
             shotDirX = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
             shotDirY = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
             shotPending_ = true;
@@ -327,7 +365,9 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
 
         pickDirection(rng);
         setMode(ENEMY_WALK);
-        timer = (cfg->behavior == BEHAVIOR_OCTOROK) ? (float)cfg->shootPeriod : 0.0f;
+        // Shooter walk legs last one cadence; other movers walk until
+        // their segment ends.
+        timer = (cfg->shootPeriod > 0) ? (float)cfg->shootPeriod : 0.0f;
         break;
     }
 }

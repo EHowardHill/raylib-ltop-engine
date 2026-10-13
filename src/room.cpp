@@ -86,7 +86,7 @@ bool Room::solidBox(Rectangle box) const
 
 TileMeta Room::tileMetaAt(int tileX, int tileY) const
 {
-    TileMeta meta = { 0, 0, 0, 255, 0, 0, 0 };
+    TileMeta meta = { 0, 0, 0, 255, 0, 0, 0, 0 };
     if (!cfg || TILE_META_COUNT <= 0) return meta;
     if (tileX < 0 || tileY < 0 || tileX >= cfg->mapWidth || tileY >= cfg->mapHeight) return meta;
 
@@ -113,6 +113,7 @@ TileMeta Room::tileMetaAt(int tileX, int tileY) const
         meta.pushX = (signed char)pushX;
         meta.pushY = (signed char)pushY;
         if (tile.ledgeDir != 0 && meta.ledgeDir == 0) meta.ledgeDir = tile.ledgeDir;
+        if (tile.heal > meta.heal) meta.heal = tile.heal;
     }
     return meta;
 }
