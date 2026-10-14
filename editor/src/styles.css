@@ -46,6 +46,14 @@ button.tool { padding: 4px 10px; border: 1px solid #c5c5c5; background: #fff; bo
   cursor: pointer; font-size: 12px; }
 button.tool.marker { border-color: #b8c6e6; }
 button.tool.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+/* Character animation picker: one kind per row — a label column plus four
+   equal direction cells, so the matrix never wraps raggedly in the side panel. */
+.animGrid { margin: 2px 0 6px; }
+.animRow { display: grid; grid-template-columns: 56px repeat(4, 1fr); gap: 4px; align-items: center; margin: 3px 0; }
+.animRow > span { font-size: 12px; color: #555; }
+.animRow button { width: 100%; padding: 4px 2px; }
+/* Checkbox groups: a fixed two-column grid instead of a wrapping flex row. */
+.checkGrid { display: grid; grid-template-columns: repeat(2, min-content); gap: 6px 14px; align-items: center; margin: 4px 0; }
 .layerToggle { display: inline-flex; align-items: center; gap: 3px; margin-right: 4px; }
 .scrollWrap { overflow: auto; max-height: 68vh; background: #2a2a33; border: 1px solid #999; border-radius: 4px; }
 /* Full-height graph surfaces (world map, dialogue trees) that own their

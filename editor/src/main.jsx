@@ -1413,8 +1413,8 @@ function BehaviorSection({ scan, refresh }) {
             <div className="row" style={{ marginTop: 6 }}>
                 <input placeholder="name" value={name} style={{ width: 96 }} onChange={e => setName(e.target.value)} />
                 <button className="btn" onClick={create}>Scaffold</button>
-                <button className="btn" onClick={checkAll}>Compile check all</button>
             </div>
+            <button className="btn" style={{ marginTop: 6 }} onClick={checkAll}>Compile check all</button>
             {error && <p className="fail">{error}</p>}
             {check && (
                 <div style={{ marginTop: 8 }}>
@@ -1580,7 +1580,7 @@ function EnemyEditor({ enemy, scan, onSaved }) {
             </div>
 
             <h2>Components</h2>
-            <div className="row">
+            <div className="checkGrid">
                 <label title="Arena boss: seals the room, health bar, banked defeat">
                     <input type="checkbox" checked={!!components.boss} onChange={e => patchComponent('boss', e.target.checked || undefined)} /> boss</label>
                 <label title="Mid-fight: seals + health bar, room-local defeat">
@@ -1932,6 +1932,8 @@ function TilesTab({ scan, refresh }) {
                     <div className="row">
                         {checkField('cuttable', 'cuttable', 'Sword swings cut it (grass)')}
                         {numberField('Cut result', entry.cut_result, v => patch('cut_result', v), 'Tile left after cutting')}
+                    </div>
+                    <div className="row">
                         {checkField('bombable', 'bombable', 'Bombs blast it open')}
                         {numberField('Bomb result', entry.bomb_result, v => patch('bomb_result', v),
                             'Tile left after blasting (255 = open hole)')}
@@ -2785,16 +2787,18 @@ function CharacterEditor({ character, onSaved }) {
                         </div>
                         <div className="charSide">
                             <h2>Animation</h2>
-                            {CHAR_KINDS.map(kind => (
-                                <div className="field" key={kind} style={{ flexWrap: 'wrap' }}>
-                                    <label>{kind}</label>
-                                    {DIRECTIONS.map(dir => (
-                                        <button key={dir}
-                                            className={'tool' + (anim.kind === kind && anim.dir === dir ? ' active' : '')}
-                                            onClick={() => { setAnim({ kind, dir }); setSlot(null); }}>{dir}</button>
-                                    ))}
-                                </div>
-                            ))}
+                            <div className="animGrid">
+                                {CHAR_KINDS.map(kind => (
+                                    <div className="animRow" key={kind}>
+                                        <span>{kind}</span>
+                                        {DIRECTIONS.map(dir => (
+                                            <button key={dir}
+                                                className={'tool' + (anim.kind === kind && anim.dir === dir ? ' active' : '')}
+                                                onClick={() => { setAnim({ kind, dir }); setSlot(null); }}>{dir}</button>
+                                        ))}
+                                    </div>
+                                ))}
+                            </div>
                             <p className="dim">attack/lift/swim/hurt are optional — empty ones fall back to
                                 stand/move (duplicate stand frames there for placeholder art).</p>
                             <p className="dim">stand and lift play at {ANIM_FPS.stand} fps, the rest at {ANIM_FPS.move} fps — the engine's speeds.</p>
@@ -3009,13 +3013,13 @@ function CodeTab({ scan, refresh }) {
                 </p>
             </div>
             {file
-                ? <CodeEditor key={file} file={file} onSaved={refresh} onDirty={setDirty} />
+                ? <CodeEditor key={file} file={file} dirty={dirty} onSaved={refresh} onDirty={setDirty} />
                 : <p className="dim">Scaffold a behavior to start writing game code.</p>}
         </div>
     );
 }
 
-function CodeEditor({ file, onSaved, onDirty }) {
+function CodeEditor({ file, dirty, onSaved, onDirty }) {
     const [text, setText] = useState('');
     const [loaded, setLoaded] = useState(false);
     const [status, setStatus] = useState('');
