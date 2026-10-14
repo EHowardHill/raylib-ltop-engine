@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine.h"
+#include "sfx.h"
 
 // Inventory query for "if_item"/"unless_item" line conditions: the game
 // installs this at boot (dialogue stays decoupled from the inventory).
@@ -31,6 +32,12 @@ public:
     const char* takeMusicRequest();   // 0 = none; "" = stop the bgm
     bool takeWarpRequest(int& room, int& tileX, int& tileY);
     bool takeGiveRequest(int& item);  // "give" lines queue one grant per line
+    // Cutscene drains: camera pan/return, letterbox state, actor blocking,
+    // and the end-of-dialogue chain into the next script.
+    bool takeCameraRequest(int& action, int& tileX, int& tileY, float& seconds);
+    bool takeLetterboxRequest(int& state);
+    bool takeMoveRequest(int& actor, int& tileX, int& tileY, float& seconds);
+    bool takeNextRequest(int& dialogue);
 
 private:
     struct Row
@@ -50,9 +57,10 @@ private:
 
     Font font;
     Texture2D border;
-    Sound letterSfx;
-    Sound finishSfx;
-    Sound errorSfx;  // a pick the wallet can't afford (shop choices)
+    // Letter cues decode lazily through the shared cache (sfx.h).
+    LazySound letterSfx;
+    LazySound finishSfx;
+    LazySound errorSfx;  // a pick the wallet can't afford (shop choices)
 
     const Dialogue* current;
     int lineIndex;
@@ -72,4 +80,21 @@ private:
     int warpTileX;
     int warpTileY;
     bool warpPending;
+
+    // Cutscene cue queues (one of each per shown line, like music/warp).
+    bool camPending;
+    int camAction;
+    int camTileX;
+    int camTileY;
+    float camSeconds;
+    bool letterboxPending;
+    int letterboxState;
+    bool movePending;
+    int moveActor;
+    int moveTileX;
+    int moveTileY;
+    float moveSeconds;
+    int nextDialogue;
+    bool nextPending;
+    float waitTimer;  // auto-advance beat: counts past the full reveal
 };

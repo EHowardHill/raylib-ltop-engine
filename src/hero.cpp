@@ -83,6 +83,11 @@ static const float HOOK_PULL_SPEED = 420.0f;  // px/s
 const float Hero::SPRINKLE_WINDUP = 0.14f;
 const float Hero::SPRINKLE_DURATION = 0.34f;
 
+// Bug net: windup, then the swipe (main resolves catches/agitation),
+// then a recover beat — the same action shape as the powder flick.
+const float Hero::NET_WINDUP = 0.14f;
+const float Hero::NET_DURATION = 0.34f;
+
 static const float SPIN_CHARGE = 0.45f;   // held time before a release spins
 static const float SPIN_DURATION = 0.50f;
 static const float SPIN_RADIUS = 44.0f;   // 360-degree hitbox half-extent
@@ -92,30 +97,37 @@ static const float DASH_DURATION = 0.42f;
 static const float CRASH_DURATION = 0.65f;
 
 static const char* SWORD_SHEET = "assets/characters/link_sword.png";
-static const char* SWORD_SFX = "assets/audio/fighter sword 1.wav";
-static const char* HURT_SFX = "assets/audio/link hurt.wav";
-static const char* FALL_SFX = "assets/audio/link falls.wav";
-static const char* SPIN_CHARGE_SFX = "assets/audio/spin attack charge.wav";
-static const char* SPIN_SFX = "assets/audio/spin attack.wav";
-static const char* DASH_SFX = "assets/audio/pegasus boots.wav";
-static const char* CRASH_SFX = "assets/audio/ram.wav";
-static const char* DIE_SFX = "assets/audio/link dies.wav";
-static const char* SPLASH_SFX = "assets/audio/fall in water.wav";
-static const char* WADE_SFX = "assets/audio/walk water.wav";
-static const char* SWIM_SFX = "assets/audio/swim.wav";
-static const char* LAND_SFX = "assets/audio/land.wav";
-static const char* LIFT_SFX = "assets/audio/lift.wav";
+// Sfx names (assets/audio/): the hero's cue set decodes lazily through
+// the shared cache — no per-room re-decode, nothing loads until heard.
+static const char* SWORD_SFX = "fighter sword 1.wav";
+static const char* HURT_SFX = "link hurt.wav";
+static const char* FALL_SFX = "link falls.wav";
+static const char* SPIN_CHARGE_SFX = "spin attack charge.wav";
+static const char* SPIN_SFX = "spin attack.wav";
+static const char* DASH_SFX = "pegasus boots.wav";
+static const char* CRASH_SFX = "ram.wav";
+static const char* DIE_SFX = "link dies.wav";
+static const char* SPLASH_SFX = "fall in water.wav";
+static const char* WADE_SFX = "walk water.wav";
+static const char* SWIM_SFX = "swim.wav";
+static const char* LAND_SFX = "land.wav";
+static const char* LIFT_SFX = "lift.wav";
 
 Hero::Hero()
-    : cfg(0), sheet(), swordSheet(), swordSfx(), hurtSfx(), fallSfx(),
-      spinChargeSfx(), spinSfx(), dashSfx(), crashSfx(), dieSfx(),
-      splashSfx(), wadeSfx(), swimSfx(), landSfx(), liftSfx(), sfxLoaded(false),
+    : cfg(0), sheet(), swordSheet(),
+      swordSfx({ SWORD_SFX }), hurtSfx({ HURT_SFX }), fallSfx({ FALL_SFX }),
+      spinChargeSfx({ SPIN_CHARGE_SFX }), spinSfx({ SPIN_SFX }),
+      dashSfx({ DASH_SFX }), crashSfx({ CRASH_SFX }), dieSfx({ DIE_SFX }),
+      splashSfx({ SPLASH_SFX }), wadeSfx({ WADE_SFX }), swimSfx({ SWIM_SFX }),
+      landSfx({ LAND_SFX }), liftSfx({ LIFT_SFX }), sfxLoaded(false),
       x(0.0f), y(0.0f), facing(DIR_DOWN), moving(false),
       animTime(0.0f), stepDist(0.0f), state_(HERO_IDLE), stateTime(0.0f),
       invulnTime(0.0f), health_(START_HEARTS * 2), maxHealth_(START_HEARTS * 2),
       knockX(0.0f), knockY(0.0f), swordHeldTime(0.0f), chargeCuePlayed(false),
       dashX(0.0f), dashY(0.0f), swing_(0), safeTileX(-1), safeTileY(-1),
       velX(0.0f), velY(0.0f), splashX(0.0f), splashY(0.0f), wading_(false),
+      fallRedirectRoom(-1), fallRedirectX(0), fallRedirectY(0),
+      fallRedirectPending(false),
       canSwim_(false), strokeTime(0.0f), riding_(false),
       protected_(false), cloaked_(false),
       inputX(0.0f), inputY(0.0f),
@@ -138,19 +150,8 @@ void Hero::load(const CharacterConfig& config)
     swordSheet = LoadTexture(SWORD_SHEET);
     SetTextureFilter(swordSheet, TEXTURE_FILTER_POINT);
 
-    swordSfx = LoadSound(SWORD_SFX);
-    hurtSfx = LoadSound(HURT_SFX);
-    fallSfx = LoadSound(FALL_SFX);
-    spinChargeSfx = LoadSound(SPIN_CHARGE_SFX);
-    spinSfx = LoadSound(SPIN_SFX);
-    dashSfx = LoadSound(DASH_SFX);
-    crashSfx = LoadSound(CRASH_SFX);
-    dieSfx = LoadSound(DIE_SFX);
-    splashSfx = LoadSound(SPLASH_SFX);
-    wadeSfx = LoadSound(WADE_SFX);
-    swimSfx = LoadSound(SWIM_SFX);
-    landSfx = LoadSound(LAND_SFX);
-    liftSfx = LoadSound(LIFT_SFX);
+    // Sfx stay lazily cached (see the cue set above) — a room switch
+    // never re-decodes them.
     sfxLoaded = true;
 }
 
@@ -158,23 +159,7 @@ void Hero::unload()
 {
     if (cfg && sheet.id != 0) UnloadTexture(sheet);
     if (swordSheet.id != 0) UnloadTexture(swordSheet);
-    if (sfxLoaded)
-    {
-        UnloadSound(swordSfx);
-        UnloadSound(hurtSfx);
-        UnloadSound(fallSfx);
-        UnloadSound(spinChargeSfx);
-        UnloadSound(spinSfx);
-        UnloadSound(dashSfx);
-        UnloadSound(crashSfx);
-        UnloadSound(dieSfx);
-        UnloadSound(splashSfx);
-        UnloadSound(wadeSfx);
-        UnloadSound(swimSfx);
-        UnloadSound(landSfx);
-        UnloadSound(liftSfx);
-        sfxLoaded = false;
-    }
+    sfxLoaded = false;
     sheet = Texture2D();
     swordSheet = Texture2D();
     cfg = 0;
@@ -195,6 +180,24 @@ void Hero::place(int tileX, int tileY)
     animTime = 0.0f;
     stepDist = 0.0f;
     invulnTime = 0.0f;
+}
+
+void Hero::setFallRedirect(int room, int tileX, int tileY)
+{
+    fallRedirectRoom = room;
+    fallRedirectX = tileX;
+    fallRedirectY = tileY;
+    fallRedirectPending = false;
+}
+
+bool Hero::takeFallRedirect(int& room, int& tileX, int& tileY)
+{
+    if (!fallRedirectPending) return false;
+    fallRedirectPending = false;
+    room = fallRedirectRoom;
+    tileX = fallRedirectX;
+    tileY = fallRedirectY;
+    return true;
 }
 
 void Hero::setState(HeroState next)
@@ -294,15 +297,17 @@ void Hero::faceVector(float dx, float dy)
     }
 }
 
-void Hero::updateFootsteps(const Room& room, float movedDist, const Sound* overrideSfx)
+void Hero::updateFootsteps(const Room& room, float movedDist, const char* overrideSfx)
 {
     if (movedDist <= 0.0f) return;
     stepDist += movedDist;
     if (stepDist >= STEP_DISTANCE)
     {
         stepDist -= STEP_DISTANCE;
-        const Sound* sfx = overrideSfx ? overrideSfx : room.walkSfx();
-        if (sfx) PlaySound(*sfx);
+        // Footsteps cue by name through the shared lazy cache — no
+        // per-room decode, nothing loads until the hero walks.
+        const char* name = overrideSfx ? overrideSfx : room.walkSfx();
+        if (name && name[0]) playNamedSfx(name);
     }
 }
 
@@ -429,6 +434,15 @@ void Hero::startSprinkle()
 {
     setState(HERO_SPRINKLE);
     swing_++;  // one sprinkle per action id (main dedupes on it)
+    moving = false;
+    swordHeldTime = 0.0f;
+    chargeCuePlayed = false;
+}
+
+void Hero::startNet()
+{
+    setState(HERO_NET);
+    swing_++;  // one swipe per action id (main dedupes on it)
     moving = false;
     swordHeldTime = 0.0f;
     chargeCuePlayed = false;
@@ -576,6 +590,21 @@ Rectangle Hero::attackBox() const
         default: return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
         }
     }
+    if (state_ == HERO_SPRINKLE || state_ == HERO_NET)
+    {
+        // Powder flick / bug-net swipe: the effect lands only after the
+        // windup, in the facing (no hitbox while the hand is still back).
+        float windup = (state_ == HERO_NET) ? NET_WINDUP : SPRINKLE_WINDUP;
+        if (stateTime < windup) return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
+        switch (facing)
+        {
+        case DIR_DOWN:  return Rectangle{ x + 2.0f, y + TILE_SIZE, TILE_SIZE - 4.0f, ATTACK_REACH };
+        case DIR_UP:    return Rectangle{ x + 2.0f, y - ATTACK_REACH, TILE_SIZE - 4.0f, ATTACK_REACH };
+        case DIR_RIGHT: return Rectangle{ x + TILE_SIZE, y + 2.0f, ATTACK_REACH, TILE_SIZE - 4.0f };
+        case DIR_LEFT:  return Rectangle{ x - ATTACK_REACH, y + 2.0f, ATTACK_REACH, TILE_SIZE - 4.0f };
+        default: return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
+        }
+    }
     if (state_ != HERO_ATTACK) return Rectangle{ 0.0f, 0.0f, 0.0f, 0.0f };
 
     switch (facing)
@@ -674,12 +703,19 @@ void Hero::update(const Room& room, float dt)
 
     case HERO_FALL:
         // Frozen over the hole, shrinking into it. On completion: damage,
-        // then respawn on the last safe tile stood on (or die at 0 hearts).
+        // then respawn on the last safe tile stood on (or die at 0 hearts)
+        // — unless the room's pit-landing redirect is armed, in which
+        // case main warps the hero to the room below instead.
         if (stateTime >= FALL_DURATION)
         {
             health_ -= FALL_DAMAGE;
             if (health_ < 0) health_ = 0;
             if (health_ <= 0) startDeath();
+            else if (fallRedirectRoom >= 0)
+            {
+                fallRedirectPending = true;
+                setState(HERO_IDLE);  // main drains the warp this frame
+            }
             else place(safeTileX, safeTileY);
         }
         break;
@@ -794,6 +830,11 @@ void Hero::update(const Room& room, float dt)
     case HERO_SPRINKLE:
         // Windup, then the puff (main resolves the powder), then recover.
         if (stateTime >= SPRINKLE_DURATION) setState(HERO_IDLE);
+        break;
+
+    case HERO_NET:
+        // Windup, then the swipe (main resolves the net), then recover.
+        if (stateTime >= NET_DURATION) setState(HERO_IDLE);
         break;
 
     case HERO_SWIM:
@@ -936,7 +977,7 @@ void Hero::update(const Room& room, float dt)
         TileMeta meta = room.tileMetaAt(tileX, tileY);
         bool onIce = (meta.flags & TILE_FLAG_ICE) != 0;
         wading_ = (meta.flags & TILE_FLAG_WATER_SHALLOW) != 0;
-        const Sound* stepSfx = (wading_ && sfxLoaded) ? &wadeSfx : 0;
+        const char* stepSfx = wading_ ? WADE_SFX : 0;
 
         float beforeX = x;
         float beforeY = y;
@@ -1382,6 +1423,35 @@ void Hero::draw() const
                 DrawRectangle((int)tipX, (int)(tipY - 6.0f), 2, 12,
                               Color{ 214, 210, 198, 255 });
             }
+        }
+    }
+
+    if (state_ == HERO_NET)
+    {
+        // Bug net placeholder (code-drawn, like the mallet): swept in an
+        // arc through the facing during the action — a hoop with a mesh.
+        float cx = x + TILE_SIZE * 0.5f;
+        float cy = y + TILE_SIZE * 0.5f;
+        float fdx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
+        float fdy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
+        // The swing sweeps from rest to full reach and back.
+        float t = stateTime / NET_DURATION;
+        float reach = 12.0f + 14.0f * sinf(PI * clampf(t, 0.0f, 1.0f));
+        float netX = cx + fdx * (reach + 6.0f) - fdy * 2.0f;
+        float netY = cy + fdy * (reach + 6.0f) - fdx * 2.0f;
+
+        // Handle from the hands to the hoop.
+        DrawLine((int)cx, (int)cy, (int)netX, (int)netY, Color{ 120, 84, 52, 255 });
+        // Hoop + crosshatch mesh.
+        DrawCircleLines((int)netX, (int)netY, 8, Color{ 196, 176, 120, 255 });
+        for (int i = -1; i <= 1; i++)
+        {
+            DrawLine((int)(netX - 6.0f), (int)(netY + i * 4.0f),
+                     (int)(netX + 6.0f), (int)(netY + i * 4.0f),
+                     Color{ 226, 214, 170, 160 });
+            DrawLine((int)(netX + i * 4.0f), (int)(netY - 6.0f),
+                     (int)(netX + i * 4.0f), (int)(netY + 6.0f),
+                     Color{ 226, 214, 170, 160 });
         }
     }
 

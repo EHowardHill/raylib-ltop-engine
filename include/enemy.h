@@ -54,6 +54,16 @@ public:
     // Stun (boomerang, wall crashes): freeze AI for the given seconds.
     void stun(float seconds);
 
+    // Bug net agitation: the swished enemy dashes about, faster and
+    // erratic, for the given seconds (no damage — it's a net).
+    void agitate(float seconds);
+    bool agitated() const { return agitateTimer > 0.0f; }
+    // Net-catchable critter (bees): the bug net bottles it.
+    bool catchable() const { return cfg && cfg->catchable; }
+    // Caught (or otherwise lifted out of the room) without dying: no
+    // poof, no drop — the slot simply frees up for the room-clear check.
+    void despawn() { if (hp > 0) hp = 0; }
+
     // Ice rod: encase in ice for the given seconds (AI stops; a sword
     // strike or fire shatters it instantly).
     void freeze(float seconds);
@@ -88,6 +98,25 @@ public:
     void setPosition(float px, float py) { x = px; y = py; }
     float modeElapsed() const { return modeTime; }
     float aiTimer() const { return timer; }
+
+    // --- Segmented-body vocabulary (Moldorm-style worms, Lanmolas) ---
+    // A distance-sampled position trail the engine records and draws as
+    // shrinking segments behind the sprite; the oldest sample is the
+    // "tail" (count <= 12, spacing in px between samples). Recorded
+    // automatically once enabled; cleared at spawn.
+    void enableTrail(int count, float spacing);
+    bool tailPosition(float& x, float& y) const;
+
+    // Weak point (the tail): when armed (w > 0), only strikes landing
+    // inside the sub-box at the given world position connect; everything
+    // else bounces off harmlessly (one bounce per swing id). Behaviors
+    // re-arm it every frame; cleared at spawn.
+    void setWeakPointAt(float worldX, float worldY, float w, float h);
+
+    // Layer-4 scratch: a few private floats per instance for game-code
+    // behaviors to keep arbitrary state in (headings, phases, sentinels).
+    // Zeroed at spawn; the engine never reads them.
+    float& scratch(int i) { return scratch_[i & 3]; }
     void setAiTimer(float seconds) { timer = seconds; }
     Direction facingDirection() const { return facing; }
     void setFacing(Direction dir) { facing = dir; }
@@ -112,5 +141,22 @@ private:
     float shotDirX;
     float shotDirY;
     float animTime;
+    float agitateTimer;
+    // Segmented-body trail: distance-sampled positions, oldest first.
+    static const int TRAIL_MAX = 12;
+    float trailX[TRAIL_MAX];
+    float trailY[TRAIL_MAX];
+    int trailCount;
+    float trailSpacing;
+    float trailDist;       // px accumulated since the last sample
+    float lastSampleX;
+    float lastSampleY;
+    // Weak point (armed by behaviors; see setWeakPointAt).
+    float weakX;
+    float weakY;
+    float weakW;
+    float weakH;
+    // Layer-4 scratch (see scratch()).
+    float scratch_[4];
     CustomBehaviorFn customFn;
 };

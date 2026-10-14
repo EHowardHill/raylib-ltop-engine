@@ -8,7 +8,11 @@ const COMMANDS = {
   '/api/delete': b => ['delete', { path: b.path }],
   '/api/upload': b => ['upload', { dir: b.dir, name: b.name, data: b.data }],
   '/api/build': () => ['build', {}],
-  '/api/set_project': b => ['set_project', { path: b.path }]
+  '/api/play': b => ['play', { room: b.room, tile: b.tile }],
+  '/api/set_project': b => ['set_project', { path: b.path }],
+  '/api/new_game': b => ['new_game', { name: b.name }],
+  '/api/list_flags': () => ['list_flags', {}],
+  '/api/check_code': b => ['check_code', { file: b.file }]
 };
 
 export async function api(url, body) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine.h"
+#include "sfx.h"
 
 class Room;
 
@@ -25,6 +26,7 @@ enum HeroState
     HERO_DIG,      // shovel: windup, turn over the tile ahead, recover
     HERO_HOOKSHOT, // firing the chained hook: locked while it flies, yanked on latch
     HERO_SPRINKLE, // magic powder: flick into the facing (main resolves the puff)
+    HERO_NET,      // bug net: swipe in the facing (main catches fairies/bees, agitates)
     HERO_DEAD,
     HERO_STATE_COUNT
 };
@@ -45,12 +47,21 @@ public:
 
     void tileUnder(int& tileX, int& tileY) const;
     Vector2 center() const;
+
+    // Pit-landing: arm the room+tile a fall-through warps to (room < 0 =
+    // the usual safe-tile respawn); main arms it at room load from the
+    // RoomConfig and drains the pending warp right after the fall.
+    void setFallRedirect(int room, int tileX, int tileY);
+    bool takeFallRedirect(int& room, int& tileX, int& tileY);
     // Direction the hero is currently pressing (cardinal-dominant), zero
     // while busy or idle-with-no-input. Pushable blocks read this.
     Vector2 inputDir() const { return Vector2{ inputX, inputY }; }
     // Escape hatch for overlap resolution (settle-shoves): raw position
     // move ignoring collision.
     void nudge(float dx, float dy) { x += dx; y += dy; }
+    // Face a vector (cardinal-dominant): the cutscene blocking glide
+    // steers the hero's sprite while it walks.
+    void faceVector(float dx, float dy);
 
     HeroState state() const { return state_; }
     float stateElapsed() const { return stateTime; }
@@ -119,6 +130,12 @@ public:
     static const float SPRINKLE_DURATION;
     void startSprinkle();
     bool sprinkling() const { return state_ == HERO_SPRINKLE; }
+    // Bug net (use-action item): windup, then the swipe in the facing
+    // (main resolves catches/agitation at NET_WINDUP).
+    static const float NET_WINDUP;
+    static const float NET_DURATION;
+    void startNet();
+    bool netting() const { return state_ == HERO_NET; }
     void startHookPull(float targetX, float targetY);
     void endHookshot();  // the chain resolved (main calls it)
     bool hookshotting() const { return state_ == HERO_HOOKSHOT; }
@@ -158,7 +175,6 @@ public:
 
 private:
     void setState(HeroState next);
-    void faceVector(float dx, float dy);
     void startFall();
     void startSplash();
     void startSwim();
@@ -167,25 +183,27 @@ private:
     void startSpin();
     void startDash(float dx, float dy);
     bool slideWithCollision(const Room& room, float dx, float dy);
-    void updateFootsteps(const Room& room, float movedDist, const Sound* overrideSfx = 0);
+    void updateFootsteps(const Room& room, float movedDist, const char* overrideSfx = 0);
     void drawFrame(int frame, float scaleX, float scaleY, float yOff = 0.0f) const;
 
     const CharacterConfig* cfg;
     Texture2D sheet;
     Texture2D swordSheet;
-    Sound swordSfx;
-    Sound hurtSfx;
-    Sound fallSfx;
-    Sound spinChargeSfx;
-    Sound spinSfx;
-    Sound dashSfx;
-    Sound crashSfx;
-    Sound dieSfx;
-    Sound splashSfx;
-    Sound wadeSfx;
-    Sound swimSfx;
-    Sound landSfx;
-    Sound liftSfx;
+    // Sfx decode lazily through the shared cache (memory-conscious: no
+    // per-room re-decode, nothing decodes until first heard).
+    LazySound swordSfx;
+    LazySound hurtSfx;
+    LazySound fallSfx;
+    LazySound spinChargeSfx;
+    LazySound spinSfx;
+    LazySound dashSfx;
+    LazySound crashSfx;
+    LazySound dieSfx;
+    LazySound splashSfx;
+    LazySound wadeSfx;
+    LazySound swimSfx;
+    LazySound landSfx;
+    LazySound liftSfx;
     bool sfxLoaded;
     float x;
     float y;
@@ -215,6 +233,11 @@ private:
     float splashX;
     float splashY;
     bool wading_;
+    // Pit-landing redirect (see setFallRedirect / takeFallRedirect).
+    int fallRedirectRoom;
+    int fallRedirectX;
+    int fallRedirectY;
+    bool fallRedirectPending;
     // Deep-water swimming (granted by a passive item): stroke impulses
     // glide against water drag; ripples mark each stroke.
     bool canSwim_;

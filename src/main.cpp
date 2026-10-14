@@ -24,6 +24,14 @@ static Music music = {};
 static bool musicLoaded = false;
 static char musicFile[512] = "";
 
+// Danger layer: a room's alternate track that swells over the bgm while
+// an arena fight (boss or mini-boss) lives — the dynamic music crossfade.
+// Same no-restart convention as the bgm; the mix lerps ~1.2s each way.
+static Music dangerMusic = {};
+static bool dangerLoaded = false;
+static char dangerFile[512] = "";
+static float dangerMix = 0.0f;   // 0 = calm bgm, 1 = full danger
+
 static Texture2D tilesetTexture = {};
 
 static int prevTileX = -1;
@@ -174,9 +182,9 @@ static bool buriedDug[MAX_BURIED] = {};
 // fetches pickups. One in the air at a time.
 static Texture2D beamTexture = {};
 static Texture2D boomerangTexture = {};
-static Sound sndBoomerangHit = {};
-static Sound sndTink = {};
-static Sound sndSwordBeam = {};
+static LazySound sndBoomerangHit = { "small enemy hit.wav" };
+static LazySound sndTink = { "tink.wav" };
+static LazySound sndSwordBeam = { "sword beam.wav" };
 
 struct Boomerang
 {
@@ -211,7 +219,7 @@ struct Hookshot
     float dirY;
 };
 static Hookshot hook = {};
-static Sound sndHookshot = {};
+static LazySound sndHookshot = { "hookshot.wav" };
 static const float HOOK_SPEED = 420.0f;   // px/s chain flight
 static const float HOOK_RANGE = 176.0f;   // px of chain before recoil
 
@@ -267,15 +275,15 @@ static int carriedIndex = -1;   // objects[] index riding overhead
 static int liftingIndex = -1;   // objects[] index mid-hoist
 static int grabbedIndex = -1;   // objects[] index held in a grab (pullable)
 static int nextThrowId = -2000; // unique negative ids, like beam hits
-static Sound sndThrow = {};
-static Sound sndBreak = {};
-static Sound sndItemWater = {};
-static Sound sndMoveObject = {};
-static Sound sndButton = {};
-static Sound sndDoorOpen = {};
-static Sound sndDoorClose = {};
-static Sound sndHammerPound = {};
-static Sound sndDig = {};
+static LazySound sndThrow = { "throw.wav" };
+static LazySound sndBreak = { "break.wav" };
+static LazySound sndItemWater = { "item in water.wav" };
+static LazySound sndMoveObject = { "move object.wav" };
+static LazySound sndButton = { "button.wav" };
+static LazySound sndDoorOpen = { "door open.wav" };
+static LazySound sndDoorClose = { "door close.wav" };
+static LazySound sndHammerPound = { "quake 1.wav" };
+static LazySound sndDig = { "dig.wav" };
 
 static Rectangle objectBox(const WorldObject& o);
 
@@ -297,7 +305,7 @@ static float capeDrain = 0.0f;
 static const float BOSS_INTRO_DURATION = 1.5f;
 static float bossIntroTime = 0.0f;
 static char bossIntroName[64] = "";
-static Sound sndBossIntro = {};
+static LazySound sndBossIntro = { "boss hit.wav" };
 
 static float shakeTime = 0.0f;
 static float shakeStrength = 0.0f;
@@ -410,16 +418,17 @@ static void playJingle(Sound sound)
     jingleDucking = true;
     PlaySound(sound);
     if (musicLoaded) PauseMusicStream(music);
+    if (dangerLoaded) PauseMusicStream(dangerMusic);
 }
 
 // World sfx bank.
-static Sound sndGrass = {};
-static Sound sndEnemyDie = {};
-static Sound sndHeart = {};
-static Sound sndRupee = {};
-static Sound sndLowHp = {};
-static Sound sndShot = {};
-static Sound sndShotWall = {};
+static LazySound sndGrass = { "grass destroyed.wav" };
+static LazySound sndEnemyDie = { "enemy dies.wav" };
+static LazySound sndHeart = { "heart.wav" };
+static LazySound sndRupee = { "rupee.wav" };
+static LazySound sndLowHp = { "low hp.wav" };
+static LazySound sndShot = { "fireball.wav" };
+static LazySound sndShotWall = { "arrow hit wall.wav" };
 
 static Texture2D pickupsTexture = {};
 
@@ -510,6 +519,153 @@ struct Npc
 };
 static Npc npcs[MAX_NPCS] = {};
 static Texture2D characterSheets[16] = {};
+
+// --- Cutscenes (the framework) -------------------------------------------
+// Scripted camera pans, letterbox bars, and actor blocking, all queued by
+// the dialogue interpreter's cutscene vocabulary and resolved here while
+// the world holds still. The cues compose with everything else a script
+// can do (music stingers, flags, warps, chains).
+struct CutsceneCamera
+{
+    bool active;    // off the hero: gliding to, or holding at, the target
+    bool panning;
+    float fromX;
+    float fromY;
+    float toX;
+    float toY;
+    float t;
+    float duration;
+};
+static CutsceneCamera cutsceneCam = {};
+
+struct CutsceneMove
+{
+    bool active;
+    int actor;   // -2 = the hero, else a room npc index
+    float fromX;
+    float fromY;
+    float toX;
+    float toY;
+    float t;
+    float duration;
+};
+static CutsceneMove cutsceneMove = {};
+
+static int letterboxWanted = 0;  // target state: 1 = bars on
+static float letterboxT = 0.0f;  // eased slide (0..1)
+
+static void updateCutscene(float dt)
+{
+    // Camera pan: glide, then hold at the target.
+    if (cutsceneCam.active && cutsceneCam.panning)
+    {
+        cutsceneCam.t += dt;
+        if (cutsceneCam.duration <= 0.0f
+            || cutsceneCam.t >= cutsceneCam.duration)
+        {
+            cutsceneCam.panning = false;
+        }
+    }
+
+    // Actor blocking: hero and npc glides (the world is frozen while the
+    // script runs; the glide animates across it).
+    if (cutsceneMove.active)
+    {
+        cutsceneMove.t += dt;
+        float u = (cutsceneMove.duration > 0.0f)
+                      ? clampf(cutsceneMove.t / cutsceneMove.duration, 0.0f, 1.0f)
+                      : 1.0f;
+        float x = cutsceneMove.fromX + (cutsceneMove.toX - cutsceneMove.fromX) * u;
+        float y = cutsceneMove.fromY + (cutsceneMove.toY - cutsceneMove.fromY) * u;
+        if (cutsceneMove.actor == -2)
+        {
+            float dx = x - hero.center().x;
+            float dy = y - hero.center().y;
+            hero.nudge(x - hero.center().x, y - hero.center().y);
+            if (fabsf(dx) > 0.5f || fabsf(dy) > 0.5f) hero.faceVector(dx, dy);
+        }
+        else if (cutsceneMove.actor >= 0 && cutsceneMove.actor < MAX_NPCS
+                 && npcs[cutsceneMove.actor].active)
+        {
+            Npc& npc = npcs[cutsceneMove.actor];
+            float dx = x - npc.x;
+            float dy = y - npc.y;
+            npc.x = x;
+            npc.y = y;
+            npc.moving = true;
+            npc.animTime += dt;
+            if (fabsf(dx) > 0.5f || fabsf(dy) > 0.5f)
+            {
+                if (fabsf(dx) >= fabsf(dy))
+                    npc.facing = (dx > 0.0f) ? DIR_RIGHT : DIR_LEFT;
+                else
+                    npc.facing = (dy > 0.0f) ? DIR_DOWN : DIR_UP;
+            }
+        }
+        if (u >= 1.0f)
+        {
+            if (cutsceneMove.actor >= 0 && cutsceneMove.actor < MAX_NPCS
+                && npcs[cutsceneMove.actor].active)
+                npcs[cutsceneMove.actor].moving = false;
+            cutsceneMove.active = false;
+        }
+    }
+
+    // Letterbox bars ease toward the scripted state.
+    float target = (float)letterboxWanted;
+    if (letterboxT < target) letterboxT += dt / 0.25f;
+    else if (letterboxT > target) letterboxT -= dt / 0.25f;
+    if (letterboxT < 0.0f) letterboxT = 0.0f;
+    if (letterboxT > 1.0f) letterboxT = 1.0f;
+}
+
+static void applyCutsceneCameraRequest(int action, int tileX, int tileY, float seconds)
+{
+    if (action == 2)
+    {
+        // Back to the hero.
+        cutsceneCam.active = false;
+        cutsceneCam.panning = false;
+        return;
+    }
+    if (action != 1) return;
+    Vector2 c = hero.center();
+    cutsceneCam.active = true;
+    cutsceneCam.panning = true;
+    cutsceneCam.fromX = c.x;
+    cutsceneCam.fromY = c.y;
+    cutsceneCam.toX = (float)tileX * TILE_SIZE + TILE_SIZE * 0.5f;
+    cutsceneCam.toY = (float)tileY * TILE_SIZE + TILE_SIZE * 0.5f;
+    cutsceneCam.t = 0.0f;
+    cutsceneCam.duration = seconds > 0.0f ? seconds : 1.0f;
+}
+
+static void applyCutsceneMoveRequest(int actor, int tileX, int tileY, float seconds)
+{
+    cutsceneMove.active = false;
+    if (actor == -2)
+    {
+        Vector2 c = hero.center();
+        cutsceneMove.actor = -2;
+        cutsceneMove.fromX = c.x;
+        cutsceneMove.fromY = c.y;
+    }
+    else if (actor >= 0 && actor < MAX_NPCS && npcs[actor].active)
+    {
+        cutsceneMove.actor = actor;
+        cutsceneMove.fromX = npcs[actor].x + TILE_SIZE * 0.5f;
+        cutsceneMove.fromY = npcs[actor].y + TILE_SIZE * 0.5f;
+    }
+    else
+    {
+        return;
+    }
+    cutsceneMove.toX = (float)tileX * TILE_SIZE + TILE_SIZE * 0.5f;
+    cutsceneMove.toY = (float)tileY * TILE_SIZE + TILE_SIZE * 0.5f;
+    cutsceneMove.t = 0.0f;
+    cutsceneMove.duration = seconds > 0.0f ? seconds : 1.0f;
+    cutsceneMove.active = true;
+}
 
 static Rectangle npcBox(const Npc& npc)
 {
@@ -701,21 +857,21 @@ struct Explosion
 };
 static Explosion explosions[MAX_EXPLOSIONS] = {};
 
-static Sound sndBombExplode = {};
-static Sound sndBombWall = {};
-static Sound sndItemGet = {};
-static Sound sndError = {};
-static Sound sndUiCursor = {};
-static Sound sndUiButton = {};
-static Sound sndChestOpen = {};
-static Sound sndFanfare = {};
-static Sound sndFire = {};  // element vocabulary: fire ignites torches
-static Sound sndUseKey = {};
-static Sound sndFairy = {};
-static Sound sndBossDies = {};
-static Sound sndSecret = {};
-static Sound sndWarp = {};
-static Sound sndCrystal = {};
+static LazySound sndBombExplode = { "bomb explode.wav" };
+static LazySound sndBombWall = { "bombable wall.wav" };
+static LazySound sndItemGet = { "item get 1.wav" };
+static LazySound sndError = { "error.wav" };
+static LazySound sndUiCursor = { "cursor.wav" };
+static LazySound sndUiButton = { "button.wav" };
+static LazySound sndChestOpen = { "chest open.wav" };
+static LazySound sndFanfare = { "item get 2.wav" };
+static LazySound sndFire = { "fire.wav" };  // element vocabulary: fire ignites torches
+static LazySound sndUseKey = { "use key.wav" };
+static LazySound sndFairy = { "fairy.wav" };
+static LazySound sndBossDies = { "boss dies.wav" };
+static LazySound sndSecret = { "secret.wav" };
+static LazySound sndWarp = { "warp.wav" };
+static LazySound sndCrystal = { "crystal.wav" };
 
 // Darkness masks (dark rooms): a lightmap rendered additively (ambient
 // gloom + radial lights) then multiplied over the frame.
@@ -748,6 +904,12 @@ static bool bossDefeated[MAX_BOSS_SLOTS] = {};
 static const int MAX_ROOM_MARKS = 128;
 static bool roomVisited[MAX_ROOM_MARKS] = {};
 
+// Dungeon treatment: per-room bitmask of defeated spawn slots (rooms cap
+// at 16 spawns, so one ushort holds a room's set). Snapshotted on the way
+// out of a dungeon room, consulted on the way back in — session-lifetime;
+// overworld rooms respawn fresh on every entry.
+static unsigned short dungeonDead[MAX_ROOM_MARKS] = {};
+
 // Blasted-tile registry (bombable walls/floors blown open): keyed by room
 // + tile; re-applied on room load so passages stay open, and persisted in
 // the save so they stay open across sessions too.
@@ -770,6 +932,107 @@ static void recordBlastedTile(int roomIndex, int tileX, int tileY)
     blastX[blastCount] = (short)tileX;
     blastY[blastCount] = (short)tileY;
     blastCount++;
+}
+
+// Settled-object registry (room-local state, bake-slot keyed, saved):
+// moved or sunk push blocks, latched latch-switches, pulled levers, and
+// lit torches persist across room reloads and sessions — the puzzle
+// stays solved, LttP dungeon style. Snapshotted on the way out of a
+// room, re-applied on the way back in (see loadRoom). Transient states
+// (hold/timed plates, thrown pots, conjured Somaria blocks) stay local
+// by design.
+static const int MAX_SETTLED_SLOTS = 256;
+static const unsigned char SETTLED_SUNK = 0x1;     // block sank onto a latch
+static const unsigned char SETTLED_LATCHED = 0x2;  // switch/lever/torch on
+static short settledRoom[MAX_SETTLED_SLOTS] = {};
+static short settledSlot[MAX_SETTLED_SLOTS] = {};
+static short settledTileX[MAX_SETTLED_SLOTS] = {};
+static short settledTileY[MAX_SETTLED_SLOTS] = {};
+static unsigned char settledFlags[MAX_SETTLED_SLOTS] = {};
+static int settledCount = 0;
+
+// While a save loads, the outgoing world's snapshot must not contaminate
+// the just-restored registry (the load's own room switch is the arrival,
+// not a departure).
+static bool suppressSettleSnapshot = false;
+
+static void settleObject(int room, int slot, int tileX, int tileY,
+                         bool sunk, bool latched)
+{
+    for (int i = 0; i < settledCount; i++)
+    {
+        if (settledRoom[i] != (short)room || settledSlot[i] != (short)slot)
+            continue;
+        settledTileX[i] = (short)tileX;
+        settledTileY[i] = (short)tileY;
+        if (sunk) settledFlags[i] |= SETTLED_SUNK;
+        else settledFlags[i] &= (unsigned char)~SETTLED_SUNK;
+        if (latched) settledFlags[i] |= SETTLED_LATCHED;
+        else settledFlags[i] &= (unsigned char)~SETTLED_LATCHED;
+        return;
+    }
+    if (settledCount >= MAX_SETTLED_SLOTS) return;
+    settledRoom[settledCount] = (short)room;
+    settledSlot[settledCount] = (short)slot;
+    settledTileX[settledCount] = (short)tileX;
+    settledTileY[settledCount] = (short)tileY;
+    settledFlags[settledCount] = (unsigned char)((sunk ? SETTLED_SUNK : 0)
+                                                 | (latched ? SETTLED_LATCHED : 0));
+    settledCount++;
+}
+
+// Capture the room being left: which persistable objects sit away from
+// their baked spawn, sunk, latched, or lit.
+static void snapshotRoomState(int room)
+{
+    if (suppressSettleSnapshot) return;
+    if (room < 0 || room >= ROOM_COUNT) return;
+    const RoomConfig& cfg = ROOMS[room];
+    int objectTotal = cfg.objectCount < MAX_OBJECTS ? cfg.objectCount : MAX_OBJECTS;
+    for (int i = 0; i < objectTotal; i++)
+    {
+        const WorldObject& o = objects[i];
+        if (!o.active) continue;
+        // Only the baked object itself counts: dynamically-spawned pool
+        // squatters (conjured Somaria blocks) must not settle over a
+        // room-data object's slot.
+        if (o.type != cfg.objects[i].type) continue;
+
+        if (objInteracts(o, OBJINT_SWITCH) && o.aux1 == 1)
+        {
+            // Latch switch: stays pressed once solved.
+            int tileX = (int)((o.x + TILE_SIZE * 0.5f) / TILE_SIZE);
+            int tileY = (int)((o.y + TILE_SIZE * 0.5f) / TILE_SIZE);
+            settleObject(room, i, tileX, tileY, false, o.switchActive);
+            continue;
+        }
+        if (objInteracts(o, OBJINT_LEVER))
+        {
+            int tileX = (int)((o.x + TILE_SIZE * 0.5f) / TILE_SIZE);
+            int tileY = (int)((o.y + TILE_SIZE * 0.5f) / TILE_SIZE);
+            settleObject(room, i, tileX, tileY, false, o.switchActive);
+            continue;
+        }
+        if (objInteracts(o, OBJINT_TORCH))
+        {
+            int tileX = (int)((o.x + TILE_SIZE * 0.5f) / TILE_SIZE);
+            int tileY = (int)((o.y + TILE_SIZE * 0.5f) / TILE_SIZE);
+            settleObject(room, i, tileX, tileY, false, o.opened);
+            continue;
+        }
+        if (objInteracts(o, OBJINT_PUSHABLE))
+        {
+            // Blocks and statues: where they ended up, sunk or not. Only
+            // worth an entry once they left their baked tile.
+            int tileX = (int)((o.x + TILE_SIZE * 0.5f) / TILE_SIZE);
+            int tileY = (int)((o.y + TILE_SIZE * 0.5f) / TILE_SIZE);
+            bool sunk = (o.state == OBJ_SUNK);
+            if (tileX == cfg.objects[i].tileX && tileY == cfg.objects[i].tileY
+                && !sunk)
+                continue;
+            settleObject(room, i, tileX, tileY, sunk, false);
+        }
+    }
 }
 
 static bool bossAliveInRoom()
@@ -884,6 +1147,7 @@ static void clearWorldSystems();
 static void loadRoom(int index, int enterMotion = -1, int tileX = -1, int tileY = -1);
 static void startMusic(const char* file);
 static void startAmbient(const char* file);
+static void startDangerMusic(const char* file);
 static void updateTitle();
 static void drawTitleScreen();
 
@@ -893,7 +1157,8 @@ static void drawTitleScreen();
 // the browser.
 static void loadRoomFromSave(int room, int tileX, int tileY);
 static const int SAVE_MAGIC = 0x4C544F50;  // "LTOP"
-static const int SAVE_VERSION = 7;  // v7: 20 item slots (owned[] widened)
+static const int SAVE_VERSION = 9;  // v9: settled-object registry (room-local
+                                     // blocks/switches/levers/torches persist)
 static const int SAVE_SLOT_COUNT = 3;     // selectable once a title screen exists
 static const int SAVE_FLAG_CAP = 256;
 static const int SAVE_ENCOUNTER_CAP = 512;
@@ -915,6 +1180,8 @@ struct SaveData
     int rupees, rupeeMax, arrows, arrowsMax, bombs, bombsMax;
     int magicMeter, magicMax;
     int smallKeys, bigKeys;
+    int bottles;                            // owned bottle slots
+    int bottleContents[Inventory::BOTTLE_MAX];
     unsigned int rngState;
     bool flags[SAVE_FLAG_CAP];
     bool chests[MAX_CHEST_SLOTS];
@@ -926,6 +1193,14 @@ struct SaveData
     short blastTilesX[SAVE_BLAST_CAP];
     short blastTilesY[SAVE_BLAST_CAP];
     int blastTotal;
+    // Settled-object registry (v9): room-local puzzle state, bake-slot
+    // keyed, capped like the other registries.
+    short settledRooms[256];
+    short settledSlots[256];
+    short settledTilesX[256];
+    short settledTilesY[256];
+    unsigned char settledFlags[256];
+    int settledTotal;
 };
 
 static int saveSlotInUse = 0;
@@ -954,6 +1229,14 @@ static void applySave(const SaveData& data)
     inventory.magicMax = data.magicMax;
     inventory.smallKeys = data.smallKeys;
     inventory.bigKeys = data.bigKeys;
+    inventory.bottles = data.bottles;
+    if (inventory.bottles < 0) inventory.bottles = 0;
+    if (inventory.bottles > Inventory::BOTTLE_MAX) inventory.bottles = Inventory::BOTTLE_MAX;
+    for (int i = 0; i < Inventory::BOTTLE_MAX; i++)
+    {
+        inventory.bottleContents[i] = (i < inventory.bottles)
+            ? data.bottleContents[i] : Inventory::BOTTLE_EMPTY;
+    }
 
     for (int i = 0; i < SAVE_FLAG_CAP; i++)
         if (WORLD_FLAG_COUNT > 0 && i < WORLD_FLAG_COUNT && i < SAVE_FLAG_CAP)
@@ -962,6 +1245,10 @@ static void applySave(const SaveData& data)
     for (int i = 0; i < MAX_DOOR_SLOTS; i++) doorOpened[i] = data.doors[i];
     for (int i = 0; i < MAX_BOSS_SLOTS; i++) bossDefeated[i] = data.bosses[i];
     for (int i = 0; i < MAX_ROOM_MARKS; i++) roomVisited[i] = data.visited[i];
+    // Session-lifetime dungeon clears don't travel between save files:
+    // restoring a slot starts its rooms fresh (LttP dungeons repopulate
+    // on a new session; banked boss defeats come through the save).
+    for (int i = 0; i < MAX_ROOM_MARKS; i++) dungeonDead[i] = 0;
     if (encounterFired)
     {
         int total = ENCOUNTER_TOTAL < SAVE_ENCOUNTER_CAP ? ENCOUNTER_TOTAL : SAVE_ENCOUNTER_CAP;
@@ -978,10 +1265,28 @@ static void applySave(const SaveData& data)
         blastY[i] = data.blastTilesY[i];
     }
 
-    // Land in the saved room at the saved tile (fade in).
+    // Settled-object registry (v9): the loaded file's puzzle state
+    // replaces whatever the outgoing world had.
+    settledCount = data.settledTotal > MAX_SETTLED_SLOTS ? MAX_SETTLED_SLOTS
+                                                         : data.settledTotal;
+    if (settledCount < 0) settledCount = 0;
+    for (int i = 0; i < settledCount; i++)
+    {
+        settledRoom[i] = data.settledRooms[i];
+        settledSlot[i] = data.settledSlots[i];
+        settledTileX[i] = data.settledTilesX[i];
+        settledTileY[i] = data.settledTilesY[i];
+        settledFlags[i] = data.settledFlags[i];
+    }
+
+    // Land in the saved room at the saved tile (fade in). The arrival is
+    // not a departure: the outgoing world must not snapshot over the
+    // registry that was just restored.
     if (data.room >= 0 && data.room < ROOM_COUNT)
     {
+        suppressSettleSnapshot = true;
         loadRoomFromSave(data.room, data.tileX, data.tileY);
+        suppressSettleSnapshot = false;
         hero.setHealth(data.health, data.maxHealth);
     }
 }
@@ -1016,8 +1321,14 @@ static bool loadFromFile(int slot)
     return true;
 }
 
+// Test-from-here (editor hook): launching with --room/--tile suppresses
+// saving — a throwaway session banking nothing, so quick previews never
+// clobber the real slots.
+static bool testMode = false;
+
 static void saveToFile(int slot)
 {
+    if (testMode) return;
     SaveData data;
     memset(&data, 0, sizeof(data));
     data.magic = SAVE_MAGIC;
@@ -1043,6 +1354,9 @@ static void saveToFile(int slot)
     data.magicMax = inventory.magicMax;
     data.smallKeys = inventory.smallKeys;
     data.bigKeys = inventory.bigKeys;
+    data.bottles = inventory.bottles;
+    for (int i = 0; i < Inventory::BOTTLE_MAX; i++)
+        data.bottleContents[i] = inventory.bottleContents[i];
     data.rngState = worldRng.rawState();
 
     for (int i = 0; i < SAVE_FLAG_CAP; i++)
@@ -1064,6 +1378,15 @@ static void saveToFile(int slot)
         data.blastTilesY[i] = blastY[i];
     }
     data.blastTotal = blastCount;
+    data.settledTotal = settledCount;
+    for (int i = 0; i < settledCount && i < 256; i++)
+    {
+        data.settledRooms[i] = settledRoom[i];
+        data.settledSlots[i] = settledSlot[i];
+        data.settledTilesX[i] = settledTileX[i];
+        data.settledTilesY[i] = settledTileY[i];
+        data.settledFlags[i] = settledFlags[i];
+    }
 
     char path[128];
     if (slot < 0 || slot >= SAVE_SLOT_COUNT) return;
@@ -1139,6 +1462,7 @@ static void quitToTitle()
     gameState = STATE_TITLE;
     startMusic(NULL);
     startAmbient(NULL);
+    startDangerMusic(NULL);
 }
 
 static void updateTitle()
@@ -1516,6 +1840,106 @@ static void castMedallion(int element)
 // Somaria-style block conjuring (defined later, beside the object pool).
 static void toggleSomariaBlock(const ItemConfig& item);
 
+// Flute fast travel (defined later, beside the pause subscreen): the
+// item button opens the destination picker over the visited-room map.
+static bool fluteMenu = false;
+static int fluteCursor = 0;
+static void fluteWarp();  // defined beside the warp pads it banks like
+
+// Mirror (use-kind "mirror", defined later beside the warp pads): the
+// reflection slips the hero into the parallel-world pair.
+static void useMirror();
+
+// Mirror landing: the parallel room's paired tile — layouts may differ,
+// so clamp to its bounds and spiral out to the nearest free ground (the
+// same conditions the edge placement uses).
+static bool mirrorTileBlocked(const RoomConfig& cfg, int tileX, int tileY)
+{
+    int w = cfg.mapWidth;
+    int h = cfg.mapHeight;
+    if (tileX < 0 || tileY < 0 || tileX >= w || tileY >= h) return true;
+    if (cfg.colliders[tileY * w + tileX] != 0) return true;
+    int ids[2] = { cfg.decor[tileY * w + tileX],
+                   cfg.colliders[tileY * w + tileX] };
+    for (int i = 0; i < 2; i++)
+    {
+        int id = ids[i];
+        if (id <= 0 || id > TILE_META_COUNT) continue;
+        unsigned short flags = TILE_META[id - 1].flags;
+        if (flags & TILE_FLAG_PIT) return true;
+        // Deep water is fine with the flippers, a dunk without.
+        if ((flags & TILE_FLAG_WATER_DEEP) && !swimItemOwned()) return true;
+    }
+    return false;
+}
+
+// Bottle use: standing in fountain water dips an empty bottle in;
+// otherwise the first filled slot pours out its contents (the fairy
+// spirals out with a full refill, the bee simply departs).
+static void useBottle()
+{
+    int tileX = 0;
+    int tileY = 0;
+    hero.tileUnder(tileX, tileY);
+    TileMeta meta = room.tileMetaAt(tileX, tileY);
+
+    // Fountain water: an empty bottle fills first (LttP bottles hold
+    // whatever the water offers).
+    if (meta.heal)
+    {
+        int slot = inventory.firstEmptyBottle();
+        if (slot >= 0)
+        {
+            inventory.bottleContents[slot] = Inventory::BOTTLE_WATER;
+            playNamedSfx("item in water.wav");
+            return;
+        }
+    }
+
+    int contents = Inventory::BOTTLE_EMPTY;
+    int slot = inventory.firstFilledBottle(contents);
+    if (slot < 0)
+    {
+        PlaySound(sndError);  // nothing to drink, nothing to fill with
+        return;
+    }
+
+    Vector2 c = hero.center();
+    switch (contents)
+    {
+    case Inventory::BOTTLE_WATER:
+        hero.heal(2);  // a heart's worth of fountain water
+        PlaySound(sndHeart);
+        break;
+    case Inventory::BOTTLE_POTION_RED:
+        hero.heal(hero.maxHealthHalves());
+        playNamedSfx("life refill.wav");
+        break;
+    case Inventory::BOTTLE_POTION_GREEN:
+        inventory.addMagic(inventory.magicMax);
+        playNamedSfx("magic meter 1.wav");
+        break;
+    case Inventory::BOTTLE_POTION_BLUE:
+        hero.heal(hero.maxHealthHalves());
+        inventory.addMagic(inventory.magicMax);
+        playNamedSfx("life refill.wav");
+        break;
+    case Inventory::BOTTLE_FAIRY:
+        hero.heal(hero.maxHealthHalves());
+        inventory.addMagic(inventory.magicMax);
+        PlaySound(sndFairy);
+        spawnParticles(c.x, c.y, 12, 255, 200, 220, 70.0f, 120.0f);
+        break;
+    case Inventory::BOTTLE_BEE:
+        playNamedSfx("bee.wav");
+        spawnParticles(c.x, c.y - 8.0f, 6, 230, 200, 60, 60.0f, 100.0f);
+        break;
+    default:
+        break;
+    }
+    inventory.bottleContents[slot] = Inventory::BOTTLE_EMPTY;
+}
+
 static void useEquippedItem()
 {
     if (inventory.equippedItem < 0 || inventory.equippedItem >= ITEM_COUNT) return;
@@ -1663,6 +2087,27 @@ static void useEquippedItem()
         // SPRINKLE_WINDUP: stuns, torches, shrines).
         hero.startSprinkle();
         break;
+    case ITEM_USE_FLUTE:
+        // Open the destination picker (updateFluteMenu flies the bird).
+        if (!fluteMenu)
+        {
+            fluteCursor = currentRoom;
+            fluteMenu = true;
+        }
+        break;
+    case ITEM_USE_NET:
+        // The hero swipes: windup, then the sweep in the facing
+        // (updateNet resolves catches/agitation at NET_WINDUP).
+        hero.startNet();
+        break;
+    case ITEM_USE_BOTTLE:
+        useBottle();
+        break;
+    case ITEM_USE_MIRROR:
+        // Reflection: slip through to the parallel-world pair (defined
+        // beside the warp pads, where the landing machinery lives).
+        useMirror();
+        break;
     default:
         PlaySound(sndError);
         break;
@@ -1691,10 +2136,24 @@ static void clearWorldSystems()
     for (int i = 0; i < MAX_BOMBS_LIVE; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     for (int i = 0; i < MAX_NPCS; i++) npcs[i].active = false;
+    // Cutscene stragglers never survive a room change: pans release, a
+    // blocking glide stops mid-stride, the bars ease back out.
+    cutsceneCam.active = false;
+    cutsceneCam.panning = false;
+    cutsceneMove.active = false;
+    letterboxWanted = 0;
 }
 
 static bool encounterAvailable(const Encounter& encounter)
 {
+    // Story-flag conditions: the trigger only fires while they hold, and
+    // a failed condition never consumes the one-shot.
+    if (encounter.ifFlag >= 0 && encounter.ifFlag < WORLD_FLAG_COUNT
+        && !gWorldFlags[encounter.ifFlag])
+        return false;
+    if (encounter.unlessFlag >= 0 && encounter.unlessFlag < WORLD_FLAG_COUNT
+        && gWorldFlags[encounter.unlessFlag])
+        return false;
     if (encounter.repeat) return true;
     if (encounter.id < 0 || encounter.id >= ENCOUNTER_TOTAL) return true;
     return !encounterFired[encounter.id];
@@ -1743,6 +2202,51 @@ static void startMusic(const char* file)
     strcpy(musicFile, path);
     musicLoaded = true;
     PlayMusicStream(music);
+}
+
+// Danger layer (see the globals up top): loaded per room like the bgm
+// (same file keeps playing), volume driven by the fight state.
+static void startDangerMusic(const char* file)
+{
+    char path[600];
+    if (file && file[0])
+    {
+        snprintf(path, sizeof(path), "assets/music/%s", file);
+    }
+    else
+    {
+        path[0] = '\0';
+    }
+
+    if (path[0] == '\0')
+    {
+        if (dangerLoaded)
+        {
+            StopMusicStream(dangerMusic);
+            UnloadMusicStream(dangerMusic);
+            dangerLoaded = false;
+        }
+        dangerFile[0] = '\0';
+        dangerMix = 0.0f;
+        if (musicLoaded) SetMusicVolume(music, 1.0f);
+        return;
+    }
+
+    if (dangerLoaded && strcmp(dangerFile, path) == 0) return;
+
+    if (dangerLoaded)
+    {
+        StopMusicStream(dangerMusic);
+        UnloadMusicStream(dangerMusic);
+        dangerLoaded = false;
+    }
+
+    dangerMusic = LoadMusicStream(path);
+    dangerMusic.looping = true;
+    strcpy(dangerFile, path);
+    dangerLoaded = true;
+    SetMusicVolume(dangerMusic, 0.0f);
+    PlayMusicStream(dangerMusic);
 }
 
 // Room ambience (birds, rain): a second, quieter music stream that loops
@@ -1955,7 +2459,7 @@ struct RainDrop
 static RainDrop rain[RAIN_DROPS] = {};
 static bool rainSeeded = false;
 static float lightningTimer = 8.0f;
-static Sound sndThunder = {};
+static LazySound sndThunder = { "thunder.wav" };
 
 static void updateWeather(float dt)
 {
@@ -2211,16 +2715,16 @@ static void drawToasts()
 // opens a destination picker over the visited-room map; picking a room
 // flies the hero there on the bird (fade-in at the room's spawn tile,
 // banked like every warp).
-static bool fluteMenu = false;
-static int fluteCursor = 0;
-static Sound sndFlap = {};
-
 static void updateFluteMenu()
 {
     static float mapX[MAX_ROOM_MARKS];
     static float mapY[MAX_ROOM_MARKS];
     int roomTotal = ROOM_COUNT < MAX_ROOM_MARKS ? ROOM_COUNT : MAX_ROOM_MARKS;
     mapLayout(mapX, mapY, roomTotal);
+
+    // The cursor always rests on a visited room (the current one to start).
+    if (fluteCursor < 0 || fluteCursor >= roomTotal || !roomVisited[fluteCursor])
+        fluteCursor = currentRoom;
 
     // Anything but arrows/action cancels.
     if (swordPressed() || itemPressed() || dashPressed())
@@ -2230,11 +2734,195 @@ static void updateFluteMenu()
     }
 
     // Directional cursor: hop to the nearest visited room along the press.
-    int moveX = 0;
-    int moveY = 0;
-    if (IsKeyPressed(KEY_LEFT) || IsGamepadButtonPressed(...)) ...
-```
-Hmm let me just write it directly. Then drawFluteMenu and the wiring. Let me write the full code block.<tool_call>edit<arg_key>filePath</arg_key><arg_value>/Users/ehill/Documents/GitHub/raylib-ltop-engine/src/main.cpp
+    bool pressLeft = IsKeyPressed(KEY_LEFT);
+    bool pressRight = IsKeyPressed(KEY_RIGHT);
+    bool pressUp = IsKeyPressed(KEY_UP);
+    bool pressDown = IsKeyPressed(KEY_DOWN);
+    for (int i = 0; i < 4; i++)
+    {
+        if (!IsGamepadAvailable(i)) continue;
+        if (IsGamepadButtonPressed(i, GAMEPAD_BUTTON_LEFT_FACE_LEFT)) pressLeft = true;
+        if (IsGamepadButtonPressed(i, GAMEPAD_BUTTON_LEFT_FACE_RIGHT)) pressRight = true;
+        if (IsGamepadButtonPressed(i, GAMEPAD_BUTTON_LEFT_FACE_UP)) pressUp = true;
+        if (IsGamepadButtonPressed(i, GAMEPAD_BUTTON_LEFT_FACE_DOWN)) pressDown = true;
+    }
+    float dirX = 0.0f;
+    float dirY = 0.0f;
+    if (pressLeft) dirX -= 1.0f;
+    if (pressRight) dirX += 1.0f;
+    if (pressUp) dirY -= 1.0f;
+    if (pressDown) dirY += 1.0f;
+
+    if (dirX != 0.0f || dirY != 0.0f)
+    {
+        float len = sqrtf(dirX * dirX + dirY * dirY);
+        dirX /= len;
+        dirY /= len;
+
+        int bestRoom = -1;
+        float bestScore = 1e9f;
+        for (int i = 0; i < roomTotal; i++)
+        {
+            if (!roomVisited[i] || i == fluteCursor) continue;
+            float dx = mapX[i] - mapX[fluteCursor];
+            float dy = mapY[i] - mapY[fluteCursor];
+            float along = dx * dirX + dy * dirY;  // progress along the press
+            if (along <= 0.0f) continue;          // behind (or dead on) the cursor
+            float offX = dx - dirX * along;       // perpendicular offset
+            float offY = dy - dirY * along;
+            float score = along + (fabsf(offX) + fabsf(offY)) * 2.0f;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestRoom = i;
+            }
+        }
+        if (bestRoom >= 0)
+        {
+            fluteCursor = bestRoom;
+            PlaySound(sndUiCursor);
+        }
+    }
+
+    // Action: the bird takes off for the cursor room (the hero's own
+    // room just folds the menu; nothing to fly to).
+    if (actionPressed())
+    {
+        if (fluteCursor == currentRoom) fluteMenu = false;
+        else fluteWarp();
+    }
+}
+
+static void drawFluteMenu()
+{
+    if (!fluteMenu) return;
+
+    float scale = virtualScale();
+    float viewWidth = (float)GetScreenWidth() / scale;
+    float viewHeight = VIRTUAL_HEIGHT;
+
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{ 0, 0, 0, 170 });
+
+    // Panel, same nine-patch chrome as the pause subscreen.
+    float panelW = 200.0f;
+    float panelH = 108.0f;
+    Rectangle panel = { (viewWidth - panelW) * 0.5f, (viewHeight - panelH) * 0.5f,
+                        panelW, panelH };
+    if (uiBorderTexture.id != 0)
+    {
+        int patch = uiBorderTexture.width / 3;
+        if (patch < 1) patch = 1;
+        NPatchInfo npatch;
+        npatch.source = Rectangle{ 0.0f, 0.0f,
+                                   (float)uiBorderTexture.width, (float)uiBorderTexture.height };
+        npatch.left = patch;
+        npatch.top = patch;
+        npatch.right = patch;
+        npatch.bottom = patch;
+        npatch.layout = NPATCH_NINE_PATCH;
+        Rectangle dest = { panel.x * scale, panel.y * scale,
+                           panel.width * scale, panel.height * scale };
+        Vector2 origin = { 0.0f, 0.0f };
+        DrawTextureNPatch(uiBorderTexture, npatch, dest, origin, 0.0f, WHITE);
+    }
+    else
+    {
+        DrawRectangle((int)(panel.x * scale), (int)(panel.y * scale),
+                      (int)(panel.width * scale), (int)(panel.height * scale), Color{ 16, 24, 96, 255 });
+    }
+
+    int titleSize = (int)(12 * scale);
+    DrawText("FLUTE", (int)((panel.x + 8.0f) * scale), (int)((panel.y + 6.0f) * scale),
+             titleSize, RAYWHITE);
+    {
+        const char* hint = "ACTION:FLY  SWORD:BACK";
+        DrawText(hint, (int)((panel.x + panel.width - 8.0f) * scale)
+                     - MeasureText(hint, (int)(8 * scale)),
+                 (int)((panel.y + 8.0f) * scale), (int)(8 * scale),
+                 Color{ 170, 170, 190, 255 });
+    }
+
+    // The visited-room map, same geometry as the pause map tab.
+    static float mapX[MAX_ROOM_MARKS];
+    static float mapY[MAX_ROOM_MARKS];
+    int roomTotal = ROOM_COUNT < MAX_ROOM_MARKS ? ROOM_COUNT : MAX_ROOM_MARKS;
+    mapLayout(mapX, mapY, roomTotal);
+
+    float cellW = 18.0f;
+    float cellH = 14.0f;
+    float pitchX = 26.0f;
+    float pitchY = 22.0f;
+
+    // Center the visited bounds in the panel.
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (int i = 0; i < roomTotal; i++)
+    {
+        if (i < MAX_ROOM_MARKS && !roomVisited[i]) continue;
+        if (mapX[i] < minX) minX = mapX[i];
+        if (mapX[i] > maxX) maxX = mapX[i];
+        if (mapY[i] < minY) minY = mapY[i];
+        if (mapY[i] > maxY) maxY = mapY[i];
+    }
+    float originX = (minX + maxX) * 0.5f;
+    float originY = (minY + maxY) * 0.5f;
+    float baseX = panel.x + panel.width * 0.5f - originX * pitchX - cellW * 0.5f;
+    float baseY = panel.y + panel.height * 0.5f - originY * pitchY - cellH * 0.5f;
+
+    // Connections between visited rooms first (lines under boxes).
+    for (int i = 0; i < roomTotal; i++)
+    {
+        if (!roomVisited[i]) continue;
+        const RoomConfig& cfg = ROOMS[i];
+        const int edges[4] = { cfg.exitNorth, cfg.exitSouth, cfg.exitEast, cfg.exitWest };
+        for (int e = 0; e < 4; e++)
+        {
+            int target = edges[e];
+            if (target < 0 || target >= roomTotal || !roomVisited[target]) continue;
+            if (target < i) continue;  // draw each link once
+            int x0 = (int)((baseX + mapX[i] * pitchX + cellW * 0.5f) * scale);
+            int y0 = (int)((baseY + mapY[i] * pitchY + cellH * 0.5f) * scale);
+            int x1 = (int)((baseX + mapX[target] * pitchX + cellW * 0.5f) * scale);
+            int y1 = (int)((baseY + mapY[target] * pitchY + cellH * 0.5f) * scale);
+            DrawLine(x0, y0, x1, y1, Color{ 120, 130, 170, 255 });
+        }
+    }
+
+    // Visited room boxes; the cursor room wears the bird.
+    for (int i = 0; i < roomTotal; i++)
+    {
+        if (!roomVisited[i]) continue;
+        Rectangle cell = { (baseX + mapX[i] * pitchX) * scale,
+                           (baseY + mapY[i] * pitchY) * scale,
+                           cellW * scale, cellH * scale };
+        bool current = (i == currentRoom);
+        DrawRectangleRec(cell, current ? Color{ 90, 120, 200, 255 }
+                                       : Color{ 40, 50, 90, 255 });
+        DrawRectangleLinesEx(cell, 1.0f, current ? RAYWHITE : Color{ 120, 130, 170, 255 });
+        if (current)
+        {
+            DrawCircle((int)(cell.x + cell.width * 0.5f),
+                       (int)(cell.y + cell.height * 0.5f), 2.5f * scale, RAYWHITE);
+        }
+
+        if (i == fluteCursor)
+        {
+            // The bird: a flapping silhouette perched over the target.
+            float flap = sinf((float)GetTime() * 12.0f);
+            Vector2 bird = { cell.x + cell.width * 0.5f,
+                             cell.y + cell.height * 0.5f - 6.0f * scale };
+            Vector2 wingL = { bird.x - 7.0f * scale,
+                              bird.y - 1.0f * scale - flap * 3.0f * scale };
+            Vector2 wingR = { bird.x + 7.0f * scale,
+                              bird.y - 1.0f * scale - flap * 3.0f * scale };
+            DrawCircle((int)bird.x, (int)bird.y, (int)(2.0f * scale), RAYWHITE);
+            DrawLineEx(bird, wingL, 2.0f * scale, RAYWHITE);
+            DrawLineEx(bird, wingR, 2.0f * scale, RAYWHITE);
+        }
+    }
+}
+
+static void updatePauseMenu()
+{
     // Save-and-quit works from either tab.
     if (dashPressed())
     {
@@ -2461,10 +3149,33 @@ static void drawPauseOverlay()
              inventory.bigKeys > 0 ? "  BIG!" : "");
     DrawText(text, (int)(qx * scale), (int)((qy + 34.0f) * scale), size, RAYWHITE);
 
+    // Bottles: one letter per slot (W water, R/G/B potions, F fairy,
+    // b bee), dots while the set is short.
+    if (inventory.bottles > 0)
+    {
+        const char* letters[Inventory::BOTTLE_MAX] = {};
+        for (int i = 0; i < Inventory::BOTTLE_MAX; i++)
+        {
+            switch (inventory.bottleContents[i])
+            {
+            case Inventory::BOTTLE_WATER: letters[i] = "W"; break;
+            case Inventory::BOTTLE_POTION_RED: letters[i] = "R"; break;
+            case Inventory::BOTTLE_POTION_GREEN: letters[i] = "G"; break;
+            case Inventory::BOTTLE_POTION_BLUE: letters[i] = "B"; break;
+            case Inventory::BOTTLE_FAIRY: letters[i] = "F"; break;
+            case Inventory::BOTTLE_BEE: letters[i] = "b"; break;
+            default: letters[i] = "-"; break;
+            }
+        }
+        snprintf(text, sizeof(text), "BOTTLE %s%s%s%s",
+                 letters[0], letters[1], letters[2], letters[3]);
+        DrawText(text, (int)(qx * scale), (int)((qy + 46.0f) * scale), size, RAYWHITE);
+    }
+
     // Magic gauge.
-    DrawText("MAGIC", (int)(qx * scale), (int)((qy + 46.0f) * scale), size, RAYWHITE);
+    DrawText("MAGIC", (int)(qx * scale), (int)((qy + 58.0f) * scale), size, RAYWHITE);
     float barX = (qx + 30.0f) * scale;
-    float barY = (qy + 46.0f) * scale + size * 0.5f - 3.0f * scale;
+    float barY = (qy + 58.0f) * scale + size * 0.5f - 3.0f * scale;
     DrawRectangle((int)barX, (int)barY, (int)(40.0f * scale), (int)(6.0f * scale),
                   Color{ 40, 40, 60, 255 });
     if (inventory.magicMax > 0)
@@ -2544,6 +3255,25 @@ static void placeHeroAtEntry(const RoomConfig& cfg, int enterMotion)
 static void loadRoom(int index, int enterMotion, int tileX, int tileY)
 {
     assert(index >= 0 && index < ROOM_COUNT);  // callers resolve ids at bake
+
+    // Dungeon rooms keep their fallen: snapshot which spawn slots are dead
+    // before leaving, so re-entry skips them (session-lifetime; overworld
+    // rooms respawn fresh). Slot i in the mask is spawn i in the baked
+    // set — dead slots stay dead-empty so the identity holds.
+    if (currentRoom >= 0 && currentRoom < ROOM_COUNT
+        && ROOMS[currentRoom].dungeon && currentRoom < MAX_ROOM_MARKS)
+    {
+        unsigned short mask = 0;
+        for (int i = 0; i < enemyCount && i < 16; i++)
+            if (!enemies[i].alive()) mask |= (unsigned short)(1 << i);
+        dungeonDead[currentRoom] = mask;
+    }
+
+    // Settled-object registry: moved/sunk blocks, latched switches, pulled
+    // levers, lit torches persist across reloads and sessions — snapshot
+    // the room being left, re-apply to the room being entered.
+    snapshotRoomState(currentRoom);
+
     currentRoom = index;
     const RoomConfig& cfg = ROOMS[index];
     if (index >= 0 && index < MAX_ROOM_MARKS) roomVisited[index] = true;
@@ -2561,6 +3291,10 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
 
     if (cfg.hero >= 0 && cfg.hero < CHARACTER_COUNT)
         hero.load(CHARACTERS[cfg.hero]);
+
+    // Pit-landing: this room's pit tiles drop into another room layer
+    // (armed per room; the hero drains the redirect when a fall lands).
+    hero.setFallRedirect(cfg.pitRoom, cfg.pitTileX, cfg.pitTileY);
 
     if (tileX >= 0 && tileY >= 0)
     {
@@ -2606,6 +3340,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
 
     startMusic(cfg.music);
     startAmbient(cfg.ambient);
+    startDangerMusic(cfg.dangerMusic);
 
     prevTileX = -1;
     prevTileY = -1;
@@ -2619,6 +3354,10 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
     {
         const EnemySpawn& spawn = cfg.enemies[i];
         if (spawn.enemy < 0 || spawn.enemy >= ENEMY_COUNT) continue;
+        // Dungeon rooms keep their fallen across re-entries (the mask was
+        // snapshotted on the way out); the slot stays dead-empty.
+        if (cfg.dungeon && index < MAX_ROOM_MARKS
+            && (dungeonDead[index] & (1 << i))) continue;
         // Bosses stay dead: defeated ones don't respawn.
         int bossSlot = index * 16 + i;
         if (ENEMIES[spawn.enemy].boss
@@ -2669,6 +3408,25 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         objects[i].slideToY = objects[i].y;
         objects[i].slideT = 0.0f;
         objects[i].switchActive = false;
+        // Settled state (saved, bake-slot keyed): a moved or sunk block
+        // reappears where it was left, a latched switch or pulled lever
+        // stays solved, a lit torch stays lit.
+        for (int s = 0; s < settledCount; s++)
+        {
+            if (settledRoom[s] != (short)index || settledSlot[s] != (short)i)
+                continue;
+            objects[i].x = (float)settledTileX[s] * TILE_SIZE;
+            objects[i].y = (float)settledTileY[s] * TILE_SIZE;
+            objects[i].groundX = objects[i].x;
+            objects[i].groundY = objects[i].y;
+            if (settledFlags[s] & SETTLED_SUNK) objects[i].state = OBJ_SUNK;
+            if (settledFlags[s] & SETTLED_LATCHED)
+            {
+                objects[i].switchActive = true;
+                objects[i].opened = true;
+            }
+            break;
+        }
         // Platform rail (OBJINT_PLATFORM): start at the first waypoint.
         objects[i].path = spawn.path;
         objects[i].pathCount = spawn.pathCount;
@@ -2784,6 +3542,27 @@ static void mapLayout(float* xs, float* ys, int roomCount)
                 }
             }
         }
+    }
+
+    // Rooms off the exits graph (stair destinations, warp chambers,
+    // pit-landing basements) never got placed by the walk: shelf them to
+    // the lower right of the map, in room order, so visiting one keeps
+    // the map sane instead of blowing the bounds with the 1e9 sentinel.
+    float maxX = 0.0f;
+    float maxY = 0.0f;
+    for (int i = 0; i < roomCount; i++)
+    {
+        if (xs[i] > 1e8f) continue;
+        if (xs[i] > maxX) maxX = xs[i];
+        if (ys[i] > maxY) maxY = ys[i];
+    }
+    int shelf = 0;
+    for (int i = 0; i < roomCount; i++)
+    {
+        if (xs[i] < 1e8f) continue;
+        xs[i] = maxX + 1.0f + (float)shelf;
+        ys[i] = maxY + 1.0f;
+        shelf++;
     }
 }
 
@@ -2995,9 +3774,11 @@ static void updateDashSmash()
     }
 }
 
-// Warp pads: stepping onto one loads the target room at the target tile
-// (fade in) and banks the save, like dialogue warps. A short cooldown
-// keeps arrival pads from immediately re-triggering.
+// Warp pads and staircases: stepping onto one loads the target room at
+// the target tile (fade in) and banks the save, like dialogue warps. A
+// short cooldown keeps arrival pads from immediately re-triggering.
+// The arena seal holds: no warping or stair-crawling out while a boss or
+// mini-boss lives.
 static float warpCooldown = 0.0f;
 
 static void updateWarps()
@@ -3008,23 +3789,99 @@ static void updateWarps()
         return;
     }
     if (roomTransition.active || itemGet.active || hero.dead()) return;
+    if (bossAliveInRoom()) return;
 
     Rectangle heroBox = hero.box();
     for (int i = 0; i < MAX_OBJECTS; i++)
     {
         const WorldObject& o = objects[i];
-        if (!o.active || !objInteracts(o, OBJINT_WARP)) continue;
+        if (!o.active) continue;
+        bool stair = objInteracts(o, OBJINT_STAIR);
+        if (!stair && !objInteracts(o, OBJINT_WARP)) continue;
         Rectangle trigger = { o.x + 6.0f, o.y + 6.0f, 20.0f, 20.0f };
         if (!overlap(trigger, heroBox)) continue;
         if (o.aux1 < 0 || o.aux1 >= ROOM_COUNT) continue;
 
-        PlaySound(sndWarp);
+        if (stair) playNamedSfx("stairs down 1.wav");
+        else PlaySound(sndWarp);
         loadRoom(o.aux1, -1, o.aux2, o.aux3);
         saveToFile(saveSlotInUse);
         showToast("SAVED");
         warpCooldown = 0.6f;
         return;
     }
+}
+
+// The flute's bird flight: land at the chosen room's spawn tile, fade in,
+// and bank the save like the warp pads (arrival pads stay cool too).
+static void fluteWarp()
+{
+    const RoomConfig& cfg = ROOMS[fluteCursor];
+    int tileX = cfg.hasSpawn ? cfg.spawnTileX : 0;
+    int tileY = cfg.hasSpawn ? cfg.spawnTileY : 0;
+    fluteMenu = false;
+    playNamedSfx("flap.wav");
+    loadRoom(fluteCursor, -1, tileX, tileY);
+    saveToFile(saveSlotInUse);
+    showToast("SAVED");
+    warpCooldown = 0.6f;
+}
+
+// The mirror's reflection: slip through to the parallel-world pair. The
+// landing is the hero's tile in the paired room (nearest free ground —
+// layouts may differ); the arena seal holds like any warp, and the hop
+// banks the save.
+static void useMirror()
+{
+    const RoomConfig& current = room.config();
+    if (current.mirrorRoom < 0 || current.mirrorRoom >= ROOM_COUNT
+        || bossAliveInRoom())
+    {
+        PlaySound(sndError);  // no pair here / no fleeing the arena
+        return;
+    }
+
+    const RoomConfig& target = ROOMS[current.mirrorRoom];
+    int tileX = 0;
+    int tileY = 0;
+    hero.tileUnder(tileX, tileY);
+    if (tileX >= target.mapWidth) tileX = target.mapWidth - 1;
+    if (tileY >= target.mapHeight) tileY = target.mapHeight - 1;
+    if (tileX < 0) tileX = 0;
+    if (tileY < 0) tileY = 0;
+    if (mirrorTileBlocked(target, tileX, tileY))
+    {
+        bool found = false;
+        for (int r = 1; !found && r < 24; r++)
+        {
+            for (int dy = -r; !found && dy <= r; dy++)
+            {
+                for (int dx = -r; !found && dx <= r; dx++)
+                {
+                    int ax = (dx < 0) ? -dx : dx;
+                    int ay = (dy < 0) ? -dy : dy;
+                    if (ax != r && ay != r) continue;  // ring cells only
+                    if (!mirrorTileBlocked(target, tileX + dx, tileY + dy))
+                    {
+                        tileX += dx;
+                        tileY += dy;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if (!found)
+        {
+            // Whole neighborhood blocked (data problem): the spawn.
+            tileX = target.hasSpawn ? target.spawnTileX : 1;
+            tileY = target.hasSpawn ? target.spawnTileY : 1;
+        }
+    }
+
+    loadRoom(current.mirrorRoom, -1, tileX, tileY);
+    saveToFile(saveSlotInUse);
+    showToast("SAVED");
+    warpCooldown = 0.6f;
 }
 
 // Fairy-fountain tiles ("heal" tile metadata): standing on the water slowly
@@ -3087,6 +3944,11 @@ static void applyChestGrant(int kind, int param)
     case GRANTEFFECT_SET_FLAG:
         if (param >= 0 && param < WORLD_FLAG_COUNT) gWorldFlags[param] = true;
         break;
+    case GRANTEFFECT_GIVE_BOTTLE:
+        // A bottle slot with starting contents (param): a full set
+        // silently ignores it.
+        inventory.giveBottle(param);
+        break;
     default: break;
     }
 }
@@ -3118,6 +3980,10 @@ static void buildGrantText(int kind, int param)
     case GRANTEFFECT_ADD_ARROWS:
     case GRANTEFFECT_ADD_BOMBS:
         snprintf(itemGetText, sizeof(itemGetText), rule.text, amount);
+        break;
+    case GRANTEFFECT_GIVE_BOTTLE:
+        // The decanter-style rise carries the item-get text as-is.
+        snprintf(itemGetText, sizeof(itemGetText), "%s", rule.text);
         break;
     default:
         snprintf(itemGetText, sizeof(itemGetText), "%s", rule.text);
@@ -3910,6 +4776,63 @@ static void updatePowder()
     }
 }
 
+// Bug net (use-action item): once the windup lands, the swipe in the
+// facing bottles catchable critters and winged fairies (first empty
+// bottle) and agitates everything else — no damage, just a dither.
+// One sweep per action id.
+static void updateNet()
+{
+    static int lastNetSwing = -1;
+    if (!hero.netting()) return;
+    if (hero.stateElapsed() < Hero::NET_WINDUP) return;
+    if (lastNetSwing == hero.swingId()) return;
+    lastNetSwing = hero.swingId();
+
+    Rectangle box = hero.attackBox();
+    if (box.width <= 0.0f) return;
+
+    int slot = inventory.firstEmptyBottle();
+
+    for (int e = 0; e < enemyCount; e++)
+    {
+        Enemy& enemy = enemies[e];
+        if (!enemy.alive() || enemy.isArenaLock()) continue;
+        if (!overlap(box, enemy.box())) continue;
+
+        // Catchable critter (bee) with a bottle waiting: swept inside.
+        if (enemy.catchable() && slot >= 0)
+        {
+            Vector2 c = enemy.center();
+            spawnPoof(c.x, c.y);
+            enemy.despawn();
+            inventory.bottleContents[slot] = Inventory::BOTTLE_BEE;
+            slot = inventory.firstEmptyBottle();
+            playNamedSfx("bee.wav");
+            continue;
+        }
+
+        // Otherwise the swish just aggravates: it dithers about,
+        // faster and erratic, for a beat.
+        enemy.agitate(3.0f);
+        Vector2 c = enemy.center();
+        spawnParticles(c.x, c.y, 4, 255, 230, 120, 50.0f, 90.0f);
+    }
+
+    // Fairies on the wing get bottled too.
+    for (int i = 0; i < MAX_PICKUPS && slot >= 0; i++)
+    {
+        Pickup& p = pickups[i];
+        if (!p.active || p.kind != PICKUP_FAIRY) continue;
+        Rectangle item = { p.x, p.y, 16.0f, 16.0f };
+        if (!overlap(box, item)) continue;
+        p.active = false;
+        spawnParticles(p.x + 8.0f, p.y + 8.0f, 8, 255, 200, 220, 70.0f, 110.0f);
+        inventory.bottleContents[slot] = Inventory::BOTTLE_FAIRY;
+        slot = inventory.firstEmptyBottle();
+        PlaySound(sndFairy);
+    }
+}
+
 // Shovel (use-action item): once the windup lands, the tile ahead turns
 // over — a dirt burst + drop roll on soft soil, with the room's buried
 // items surfacing at their spots first. One dig turn per action id.
@@ -4295,6 +5218,11 @@ static void updateEnemies()
     bool dashContact = hero.dashing();
     Rectangle attack = dashContact ? hero.box() : hero.attackBox();
     int swing = hero.swingId();
+    // Only offensive states strike through the attack box (the powder
+    // flick and bug-net swipe expose a facing box for their own effect
+    // passes, not for sword-style damage).
+    bool offensive = hero.attacking() || hero.spinning() || hero.dashing()
+                     || hero.hammering();
 
     for (int i = 0; i < enemyCount; i++)
     {
@@ -4311,7 +5239,7 @@ static void updateEnemies()
         float dx = enemyCenter.x - heroCenter.x;
         float dy = enemyCenter.y - heroCenter.y;
         int hitsBefore = enemy.hitsLanded();
-        if (enemy.tryHit(attack, swing, Vector2{ dx, dy }))
+        if (offensive && enemy.tryHit(attack, swing, Vector2{ dx, dy }))
         {
             // The killing blow lands heavier; boss armor rings loudest.
             hitPause = enemy.isBoss() ? HIT_PAUSE_BOSS : HIT_PAUSE_KILL;
@@ -5214,7 +6142,23 @@ static void maybeStartRoomTransition()
 
     const RoomConfig& cfg = room.config();
     Vector2 dir = hero.inputDir();
-    if (dir.x == 0.0f && dir.y == 0.0f) return;
+    bool drifting = false;  // a push-tile drift, not a player press
+    if (dir.x == 0.0f && dir.y == 0.0f)
+    {
+        // Water current routing: a push tile drifts the hero with no
+        // input at all, and the drift carries it off a linked edge just
+        // like a walk — the river decides where the hero goes. A current
+        // presses the hero against a closed door but never works the
+        // door itself (no key spends, no slabs push open).
+        int tileX = 0;
+        int tileY = 0;
+        hero.tileUnder(tileX, tileY);
+        TileMeta meta = room.tileMetaAt(tileX, tileY);
+        dir.x = (float)meta.pushX / 48.0f;
+        dir.y = (float)meta.pushY / 48.0f;
+        if (dir.x == 0.0f && dir.y == 0.0f) return;
+        drifting = true;
+    }
 
     Rectangle hb = hero.box();
     float mapW = (float)(cfg.mapWidth * TILE_SIZE);
@@ -5254,9 +6198,11 @@ static void maybeStartRoomTransition()
 
     // Doors (and the boss arena lock) gate the edge. Pushing handles the
     // door first (it opens with a cue); walking through happens on the next
-    // press.
+    // press. A drift (push tile) can only ride through an already-open
+    // door — currents never work the lock.
     if (!doorIsOpen(currentRoom, edge))
     {
+        if (drifting) return;
         // Door rules are data (DOOR_RULES): keys, push-open slabs, and
         // everything else the kind's rule composes.
         int kind = doorKind(currentRoom, edge);
@@ -5409,6 +6355,22 @@ static void updateAndDraw(void)
 {
     if (musicLoaded) UpdateMusicStream(music);
     if (ambientLoaded) UpdateMusicStream(ambientMusic);
+    if (dangerLoaded) UpdateMusicStream(dangerMusic);
+
+    // Danger crossfade: while an arena fight lives in a room with a
+    // danger track, the layer swells in over the bgm (~1.2s each way);
+    // the fight ending settles the calm track back over it.
+    if (dangerLoaded)
+    {
+        float mixTarget = bossAliveInRoom() ? 1.0f : 0.0f;
+        float rate = frameDt() / 1.2f;
+        if (rate > 1.0f) rate = 1.0f;
+        dangerMix += (mixTarget - dangerMix) * rate;
+        if (dangerMix < 0.001f) dangerMix = 0.0f;
+        if (dangerMix > 0.999f) dangerMix = 1.0f;
+        if (musicLoaded) SetMusicVolume(music, 1.0f - dangerMix);
+        SetMusicVolume(dangerMusic, dangerMix);
+    }
 
     // Jingle ducking: once the fanfare/secret sting finishes, the bgm
     // picks up where it was paused.
@@ -5416,6 +6378,7 @@ static void updateAndDraw(void)
     {
         jingleDucking = false;
         if (musicLoaded) ResumeMusicStream(music);
+        if (dangerLoaded) ResumeMusicStream(dangerMusic);
     }
 
     if (gameState == STATE_TITLE)
@@ -5428,7 +6391,11 @@ static void updateAndDraw(void)
         return;
     }
 
-    if (pausePressed()) paused = !paused;
+    if (pausePressed())
+    {
+        if (fluteMenu) fluteMenu = false;
+        else paused = !paused;
+    }
 
     if (roomFade > 0.0f)
     {
@@ -5441,6 +6408,16 @@ static void updateAndDraw(void)
         // Item subscreen: cursor + equip (the world stays frozen).
         updatePauseMenu();
     }
+
+    // Cutscene machinery (pans, blocking, bars) runs even while the world
+    // is frozen behind a script.
+    updateCutscene(frameDt());
+
+    // Flute destination picker (world frozen while it's up). The freeze
+    // outlives a same-frame cancel so the close button can't re-fire the
+    // item use in the same press.
+    bool fluteWasOpen = fluteMenu;
+    if (fluteMenu) updateFluteMenu();
 
     if (dialogue.isActive())
     {
@@ -5460,8 +6437,30 @@ static void updateAndDraw(void)
             showToast(giveText);
             PlaySound(sndItemGet);
         }
+
+        // Cutscene cues: camera pans/returns, letterbox state, and actor
+        // blocking — one of each per shown line, like music/warp.
+        {
+            int camAction = 0;
+            int camTileX = 0;
+            int camTileY = 0;
+            float camSeconds = 0.0f;
+            if (dialogue.takeCameraRequest(camAction, camTileX, camTileY, camSeconds))
+                applyCutsceneCameraRequest(camAction, camTileX, camTileY, camSeconds);
+
+            int letterboxState = -1;
+            if (dialogue.takeLetterboxRequest(letterboxState))
+                letterboxWanted = letterboxState;
+
+            int actor = -1;
+            int moveTileX = 0;
+            int moveTileY = 0;
+            float moveSeconds = 0.0f;
+            if (dialogue.takeMoveRequest(actor, moveTileX, moveTileY, moveSeconds))
+                applyCutsceneMoveRequest(actor, moveTileX, moveTileY, moveSeconds);
+        }
     }
-    else if (!paused)
+    else if (!paused && !fluteWasOpen)
     {
         if (roomTransition.active)
         {
@@ -5504,9 +6503,19 @@ static void updateAndDraw(void)
             hero.setCanSwim(swimItemOwned());
             updatePlatforms(frameDt());  // rafts glide + carry before the walk
             hero.update(room, frameDt());
+            // Pit-landing: a completed fall-through warps the hero into
+            // the room layer below (fade-in at the landing tile).
+            {
+                int pitRoom = -1;
+                int pitX = 0;
+                int pitY = 0;
+                if (hero.takeFallRedirect(pitRoom, pitX, pitY))
+                    loadRoom(pitRoom, -1, pitX, pitY);
+            }
             updateHammer();  // the pound lands once the windup elapses
             updateShovel();  // the dig turns the tile ahead over
             updatePowder();   // the powder puff lands in the facing
+            updateNet();      // the bug-net sweep bottles or agitates
             bool actionUsed = updateObjectActions();
             updateEncounters(!actionUsed);
             updateGrass();
@@ -5572,6 +6581,16 @@ static void updateAndDraw(void)
             saveToFile(saveSlotInUse);
             showToast("SAVED");
         }
+
+        // Script chaining: a dialogue that ran out hands the baton to the
+        // linked one (the endgame cutscene rolls into its credits).
+        int nextDialogue = -1;
+        if (!dialogue.isActive() && !paused && !hero.dead()
+            && dialogue.takeNextRequest(nextDialogue)
+            && nextDialogue >= 0 && nextDialogue < DIALOGUE_COUNT)
+        {
+            dialogue.open(DIALOGUES[nextDialogue]);
+        }
     }
 
     // The item-get sequence ends when its description dialogue closes.
@@ -5617,6 +6636,23 @@ static void updateAndDraw(void)
     float camY = (mapHeight <= viewHeight) ? mapHeight * 0.5f
                                             : clampf(center.y, viewHeight * 0.5f, mapHeight - viewHeight * 0.5f);
 
+    if (cutsceneCam.active)
+    {
+        // Scripted pan: smoothstep from where the camera was taken to the
+        // scripted tile, then hold there until a line returns to the hero
+        // (clamped to the map like the hero-follow, so pans stay sane).
+        float u = (cutsceneCam.duration > 0.0f)
+                      ? clampf(cutsceneCam.t / cutsceneCam.duration, 0.0f, 1.0f)
+                      : 1.0f;
+        float e = u * u * (3.0f - 2.0f * u);
+        float px = cutsceneCam.fromX + (cutsceneCam.toX - cutsceneCam.fromX) * e;
+        float py = cutsceneCam.fromY + (cutsceneCam.toY - cutsceneCam.fromY) * e;
+        camX = (mapWidth <= viewWidth) ? mapWidth * 0.5f
+                                       : clampf(px, viewWidth * 0.5f, mapWidth - viewWidth * 0.5f);
+        camY = (mapHeight <= viewHeight) ? mapHeight * 0.5f
+                                         : clampf(py, viewHeight * 0.5f, mapHeight - viewHeight * 0.5f);
+    }
+
     if (shakeTime > 0.0f)
     {
         float amp = shakeStrength * (shakeTime / 0.25f);
@@ -5655,11 +6691,25 @@ static void updateAndDraw(void)
     drawTint();
     drawWeather();
 
-    // Room-load fade (spawns, death-continue, future warp tiles).
+    // Room-load fade (spawns, death-continue, warps, mirror travel):
+    // arrivals dip through the destination room's palette — its ambient
+    // tint, darkened — instead of plain black, the LttP screen-transition
+    // flavor. Neutral rooms (no tint) fade black.
     if (roomFade > 0.0f)
     {
         unsigned char alpha = (unsigned char)(int)(clampf(roomFade, 0.0f, 1.0f) * 255.0f);
-        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{ 0, 0, 0, alpha });
+        const RoomConfig& rc = room.config();
+        unsigned char fr = 0;
+        unsigned char fg = 0;
+        unsigned char fb = 0;
+        if (rc.tintR < 255 || rc.tintG < 255 || rc.tintB < 255)
+        {
+            fr = (unsigned char)(rc.tintR * 2 / 5);
+            fg = (unsigned char)(rc.tintG * 2 / 5);
+            fb = (unsigned char)(rc.tintB * 2 / 5);
+        }
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(),
+                      Color{ fr, fg, fb, alpha });
     }
 
     // Screen flash pulses (bomb blasts, boss deaths), under the HUD.
@@ -5674,6 +6724,7 @@ static void updateAndDraw(void)
     drawHud();
     drawToasts();
     drawPauseOverlay();
+    drawFluteMenu();
     drawGameOver();
 
     // Boss intro letterbox: bars slide in, the boss gets named, the
@@ -5696,6 +6747,17 @@ static void updateAndDraw(void)
                      (int)(barH * 0.5f - size * 0.5f), size,
                      Color{ 235, 235, 245, 255 });
         }
+    }
+
+    // Cutscene letterbox: bars slide with the scripted state (drawn over
+    // the world, under the dialogue/credits).
+    if (letterboxT > 0.001f)
+    {
+        float scale = virtualScale();
+        float barH = 26.0f * letterboxT * scale;
+        DrawRectangle(0, 0, GetScreenWidth(), (int)barH, BLACK);
+        DrawRectangle(0, GetScreenHeight() - (int)barH, GetScreenWidth(),
+                      (int)barH + 1, BLACK);
     }
 
     dialogue.draw();
@@ -5750,44 +6812,6 @@ int main(int argc, char** argv)
 
     // Ground objects block movement through the room's solidity check.
     room.setSolidExtras(objectSolidExtra, 0);
-
-    sndGrass = LoadSound("assets/audio/grass destroyed.wav");
-    sndEnemyDie = LoadSound("assets/audio/enemy dies.wav");
-    sndHeart = LoadSound("assets/audio/heart.wav");
-    sndRupee = LoadSound("assets/audio/rupee.wav");
-    sndLowHp = LoadSound("assets/audio/low hp.wav");
-    sndShot = LoadSound("assets/audio/fireball.wav");
-    sndShotWall = LoadSound("assets/audio/arrow hit wall.wav");
-    sndBoomerangHit = LoadSound("assets/audio/small enemy hit.wav");
-    sndTink = LoadSound("assets/audio/tink.wav");
-    sndSwordBeam = LoadSound("assets/audio/sword beam.wav");
-    sndThrow = LoadSound("assets/audio/throw.wav");
-    sndBreak = LoadSound("assets/audio/break.wav");
-    sndItemWater = LoadSound("assets/audio/item in water.wav");
-    sndMoveObject = LoadSound("assets/audio/move object.wav");
-    sndHammerPound = LoadSound("assets/audio/quake 1.wav");
-    sndDig = LoadSound("assets/audio/dig.wav");
-    sndThunder = LoadSound("assets/audio/thunder.wav");
-    sndHookshot = LoadSound("assets/audio/hookshot.wav");
-    sndButton = LoadSound("assets/audio/button.wav");
-    sndDoorOpen = LoadSound("assets/audio/door open.wav");
-    sndDoorClose = LoadSound("assets/audio/door close.wav");
-    sndBombExplode = LoadSound("assets/audio/bomb explode.wav");
-    sndBombWall = LoadSound("assets/audio/bombable wall.wav");
-    sndItemGet = LoadSound("assets/audio/item get 1.wav");
-    sndError = LoadSound("assets/audio/error.wav");
-    sndUiCursor = LoadSound("assets/audio/cursor.wav");
-    sndUiButton = LoadSound("assets/audio/button.wav");
-    sndChestOpen = LoadSound("assets/audio/chest open.wav");
-    sndFanfare = LoadSound("assets/audio/item get 2.wav");
-    sndUseKey = LoadSound("assets/audio/use key.wav");
-    sndFairy = LoadSound("assets/audio/fairy.wav");
-    sndBossDies = LoadSound("assets/audio/boss dies.wav");
-    sndBossIntro = LoadSound("assets/audio/boss hit.wav");
-    sndSecret = LoadSound("assets/audio/secret.wav");
-    sndWarp = LoadSound("assets/audio/warp.wav");
-    sndCrystal = LoadSound("assets/audio/crystal.wav");
-    sndFire = LoadSound("assets/audio/fire.wav");
 
     lightGradient = LoadTexture("assets/effects/light.png");
     SetTextureFilter(lightGradient, TEXTURE_FILTER_POINT);
@@ -5850,6 +6874,47 @@ int main(int argc, char** argv)
     // Title screen: the chosen slot starts (or continues) the game.
     gameState = STATE_TITLE;
 
+    // Test-from-here (editor hook): --room <name|stem> [--tile x,y] jumps
+    // straight into that room — a fresh demo start (full hearts, the demo
+    // inventory) with saving suppressed, skipping the title.
+    {
+        const char* testRoom = 0;
+        int testTileX = -1;
+        int testTileY = -1;
+        for (int i = 1; i < argc; i++)
+        {
+            if (strcmp(argv[i], "--room") == 0 && i + 1 < argc)
+            {
+                testRoom = argv[++i];
+            }
+            else if (strcmp(argv[i], "--tile") == 0 && i + 1 < argc)
+            {
+                int tx = -1;
+                int ty = -1;
+                if (sscanf(argv[++i], "%d,%d", &tx, &ty) == 2)
+                {
+                    testTileX = tx;
+                    testTileY = ty;
+                }
+            }
+        }
+        if (testRoom && testRoom[0])
+        {
+            int roomIndex_ = roomIndex(testRoom);
+            if (roomIndex_ >= 0)
+            {
+                testMode = true;
+                resetGameState();
+                loadRoom(roomIndex_, -1, testTileX, testTileY);
+                gameState = STATE_PLAYING;
+            }
+            else
+            {
+                fprintf(stderr, "test-from-here: unknown room '%s'\n", testRoom);
+            }
+        }
+    }
+
     camera.rotation = 0.0f;
 
 #if defined(PLATFORM_WEB)
@@ -5859,6 +6924,7 @@ int main(int argc, char** argv)
 
     startMusic(NULL);
     startAmbient(NULL);
+    startDangerMusic(NULL);
     delete[] encounterFired;
     encounterFired = 0;
     hero.unload();
@@ -5882,37 +6948,6 @@ int main(int argc, char** argv)
     {
         if (objectSheets[i].id != 0) UnloadTexture(objectSheets[i]);
     }
-    UnloadSound(sndGrass);
-    UnloadSound(sndEnemyDie);
-    UnloadSound(sndHeart);
-    UnloadSound(sndRupee);
-    UnloadSound(sndLowHp);
-    UnloadSound(sndShot);
-    UnloadSound(sndShotWall);
-    UnloadSound(sndBoomerangHit);
-    UnloadSound(sndTink);
-    UnloadSound(sndSwordBeam);
-    UnloadSound(sndThrow);
-    UnloadSound(sndBreak);
-    UnloadSound(sndItemWater);
-    UnloadSound(sndMoveObject);
-    UnloadSound(sndButton);
-    UnloadSound(sndDoorOpen);
-    UnloadSound(sndDoorClose);
-    UnloadSound(sndBombExplode);
-    UnloadSound(sndBombWall);
-    UnloadSound(sndItemGet);
-    UnloadSound(sndError);
-    UnloadSound(sndUiCursor);
-    UnloadSound(sndUiButton);
-    UnloadSound(sndChestOpen);
-    UnloadSound(sndFanfare);
-    UnloadSound(sndUseKey);
-    UnloadSound(sndBossDies);
-    UnloadSound(sndSecret);
-    UnloadSound(sndWarp);
-    UnloadSound(sndCrystal);
-    UnloadSound(sndFire);
     shutdownNamedSfx();
     UnloadTexture(lightGradient);
     if (lightRT.texture.id != 0) UnloadRenderTexture(lightRT);

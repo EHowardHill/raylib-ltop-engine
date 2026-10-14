@@ -80,8 +80,9 @@ function App() {
     if (!scan.project) return <ProjectPicker onPicked={refresh} />;
 
     const tabs = [
-        ['rooms', 'Rooms'], ['dialogue', 'Dialogue'], ['characters', 'Characters'],
-        ['files', 'Music & Files'], ['build', 'Build']
+        ['rooms', 'Rooms'], ['enemies', 'Enemies'], ['items', 'Items'],
+        ['tiles', 'Tiles'], ['dialogue', 'Dialogue'], ['characters', 'Characters'],
+        ['flags', 'Flags'], ['files', 'Music & Files'], ['build', 'Build']
     ];
 
     return (
@@ -96,13 +97,17 @@ function App() {
                         <ChangeProject onPicked={refresh} />
                     </div>
                 </nav>
-                <main>
+                    <main>
                     {tab === 'rooms' && <RoomsTab scan={scan} refresh={refresh} />}
+                    {tab === 'enemies' && <EnemiesTab scan={scan} refresh={refresh} />}
+                    {tab === 'items' && <ItemsTab scan={scan} refresh={refresh} />}
+                    {tab === 'tiles' && <TilesTab scan={scan} refresh={refresh} />}
                     {tab === 'dialogue' && <DialogueTab scan={scan} refresh={refresh} />}
+                    {tab === 'flags' && <FlagsTab />}
                     {tab === 'characters' && <CharactersTab scan={scan} refresh={refresh} />}
                     {tab === 'files' && <FilesTab scan={scan} refresh={refresh} />}
-                    {tab === 'build' && <BuildTab scan={scan} />}
-                </main>
+                    {tab === 'build' && <BuildTab scan={scan} refresh={refresh} />}
+                    </main>
             </div>
         </ConfirmProvider>
     );
@@ -110,10 +115,31 @@ function App() {
 
 function ChangeProject({ onPicked }) {
     const { pick, error } = useProject();
+    const [newName, setNewName] = useState('');
+    const [newError, setNewError] = useState('');
+
+    const createGame = async () => {
+        if (!newName.trim()) return;
+        const result = await api('/api/new_game', { name: newName.trim() });
+        if (result.error) return setNewError(result.error);
+        setNewName('');
+        setNewError('');
+        onPicked();
+    };
+
     return (
         <div>
             <button className="btn" style={{ marginTop: 6 }} onClick={() => pick(onPicked)}>Change…</button>
             {error && <p className="fail">{error}</p>}
+            <div style={{ marginTop: 14 }}>
+                <div className="dim">New game (a folder beside this one):</div>
+                <div className="row" style={{ marginTop: 4 }}>
+                    <input placeholder="name" value={newName} style={{ width: 96 }}
+                        onChange={e => setNewName(e.target.value)} />
+                    <button className="btn" onClick={createGame}>Create</button>
+                </div>
+                {newError && <p className="fail">{newError}</p>}
+            </div>
         </div>
     );
 }
@@ -129,7 +155,10 @@ const MARKER_TOOLS = [
     ['select', 'Select', 'V'],
     ['spawn', 'Spawn', 'S'],
     ['instant', 'Place Instant', 'N'],
-    ['interactive', 'Place Interactive', 'M']
+    ['interactive', 'Place Interactive', 'M'],
+    ['object', 'Place Object', 'O'],
+    ['enemy', 'Place Enemy', 'K'],
+    ['npc', 'Place NPC', 'P']
 ];
 const TOOL_HINTS = {
     paint: 'Left-drag paints the active layer. Right-drag erases.',
@@ -137,12 +166,22 @@ const TOOL_HINTS = {
     fill: 'Click to flood-fill a region of the active layer. Right-click fills with empty.',
     rect: 'Drag a rectangle to fill it on the active layer. Right-drag fills with empty.',
     pick: 'Click a tile to grab it into the palette.',
-    select: 'Click or drag the spawn / encounter markers to move them. Del removes the selected encounter.',
+    select: 'Click or drag the spawn / encounter / entity markers to move them. Del removes the selection.',
     spawn: 'Click a tile to place the hero spawn.',
     instant: 'Click a tile to add an instant encounter.',
-    interactive: 'Click a tile to add an interactive (action-button) encounter.'
+    interactive: 'Click a tile to add an interactive (action-button) encounter.',
+    object: 'Click a tile to place the chosen object type (chest, block, warp...).',
+    enemy: 'Click a tile to place the chosen enemy.',
+    npc: 'Click a tile to place the chosen character as an NPC.'
 };
 const ENCOUNTER_COLORS = { instant: '#f97316', interactive: '#3b82f6' };
+const ENTITY_COLORS = { object: '#a855f7', enemy: '#ef4444', npc: '#22d3ee' };
+const ENTITY_KINDS = ['object', 'enemy', 'npc'];
+const ENTITY_LABELS = { object: 'Objects', enemy: 'Enemies', npc: 'NPCs' };
+// Chest grant vocabulary (mirrors the generator's GRANT_KINDS; the editor
+// can't run the bake, so the stable engine list lives here).
+const GRANT_KINDS = ['item', 'rupees', 'arrows', 'bombs', 'magic', 'heart_container',
+    'flag', 'key', 'big_key', 'bottle', 'potion_red', 'potion_green', 'potion_blue'];
 
 function RoomEditor({ room, scan, onSaved }) {
     const tileset = scan.tileset || { image: '', columns: 1, tileCount: 0, tileWidth: 32, tileHeight: 32 };
@@ -152,6 +191,20 @@ function RoomEditor({ room, scan, onSaved }) {
     const [size, setSize] = useState({ w: room.mapWidth, h: room.mapHeight });
     const [def, setDef] = useState(room.default || {});
     const [enc, setEnc] = useState({ instant: [], interactive: [], ...(room.encounters || {}) });
+    // Entities (objects, enemies, NPCs): placed, dragged, and edited on
+    // the map like the encounter markers; saved into the room's lists.
+    const [objects, setObjects] = useState((room.raw.objects || []).slice());
+    const [enemies, setEnemies] = useState((room.raw.enemies || []).slice());
+    const [npcs, setNpcs] = useState((room.raw.npcs || []).slice());
+    // World links: edge doors, map-graph exits, the mirror pair, and the
+    // pit-landing — the room's connections to everything else.
+    const [doors, setDoors] = useState({ ...(room.raw.doors || {}) });
+    const [exits, setExits] = useState({ ...(room.raw.exits || {}) });
+    const [mirror, setMirror] = useState(room.raw.mirror || '');
+    const [pit, setPit] = useState({ ...(room.raw.pit || {}) });
+    const [placeType, setPlaceType] = useState((scan.objectTypes && scan.objectTypes[0]) ? scan.objectTypes[0].name : 'pot');
+    const [placeEnemy, setPlaceEnemy] = useState((scan.enemies && scan.enemies[0]) ? scan.enemies[0].name : '');
+    const [placeCharacter, setPlaceCharacter] = useState(scan.characters[0] ? stem(scan.characters[0].file) : '');
     const [layers, setLayers] = useState({
         decor: room.decor.slice(),
         colliders: room.colliders.slice(),
@@ -203,13 +256,12 @@ function RoomEditor({ room, scan, onSaved }) {
             const tag = (e.target && e.target.tagName) || '';
             if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
             const key = e.key.toLowerCase();
-            const keys = { b: 'paint', e: 'erase', g: 'fill', r: 'rect', i: 'pick', v: 'select', s: 'spawn', n: 'instant', m: 'interactive' };
+            const keys = { b: 'paint', e: 'erase', g: 'fill', r: 'rect', i: 'pick', v: 'select', s: 'spawn', n: 'instant', m: 'interactive', o: 'object', k: 'enemy', p: 'npc' };
             if (keys[key]) { setTool(keys[key]); return; }
             if (key === 'escape') { setSelected(null); setRectStart(null); return; }
             if ((key === 'delete' || key === 'backspace') && selected && selected !== 'spawn') {
-                setEnc(prev => ({ ...prev, [selected.kind]: prev[selected.kind].filter((_, j) => j !== selected.index) }));
+                removeEntity(selected);
                 setSelected(null);
-                setDirty(true);
             }
         };
         window.addEventListener('keydown', onKey);
@@ -305,7 +357,29 @@ function RoomEditor({ room, scan, onSaved }) {
                 ctx.fillText(kind === 'instant' ? '!' : 'A', cx, cy + 1);
             });
         }
-    }, [img, layers, vis, def, enc, hover, tool, rectStart, selected, showGrid, zoom, W, H]);
+
+        // Entity markers (objects, enemies, NPCs): colored squares with
+        // two-letter type initials.
+        const entityList = kind => kind === 'object' ? objects : kind === 'enemy' ? enemies : npcs;
+        for (const kind of ENTITY_KINDS) {
+            entityList(kind).forEach((entry, i) => {
+                if (!entry.location) return;
+                const x = entry.location[0] * ts, y = entry.location[1] * ts;
+                ctx.fillStyle = ENTITY_COLORS[kind];
+                ctx.fillRect(x + 3, y + 3, ts - 6, ts - 6);
+                const isSelected = selected && selected !== 'spawn' && selected.kind === kind && selected.index === i;
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = isSelected ? '#fff' : 'rgba(0,0,0,0.5)';
+                ctx.strokeRect(x + 3, y + 3, ts - 6, ts - 6);
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 12px sans-serif';
+                const label = kind === 'object'
+                    ? (entry.type || '??').slice(0, 2)
+                    : kind === 'enemy' ? (entry.name || '?').slice(0, 2) : (entry.character || '?').slice(0, 2);
+                ctx.fillText(label.toUpperCase(), x + ts / 2, y + ts / 2 + 1);
+            });
+        }
+    }, [img, layers, vis, def, enc, objects, enemies, npcs, hover, tool, rectStart, selected, showGrid, zoom, W, H]);
 
     // ---- map interaction -------------------------------------------------
 
@@ -358,10 +432,30 @@ function RoomEditor({ room, scan, onSaved }) {
         setDirty(true);
     };
 
+    const entityList = kind => kind === 'object' ? objects : kind === 'enemy' ? enemies : npcs;
+    const setEntityList = (kind, value) =>
+        kind === 'object' ? setObjects(value) : kind === 'enemy' ? setEnemies(value) : setNpcs(value);
+
+    const removeEntity = marker => {
+        // Functional updates: the keyboard shortcut's effect may hold an
+        // older render's lists, so deletes never race fresh placements.
+        if (marker.kind === 'object') setObjects(prev => prev.filter((_, j) => j !== marker.index));
+        else if (marker.kind === 'enemy') setEnemies(prev => prev.filter((_, j) => j !== marker.index));
+        else setNpcs(prev => prev.filter((_, j) => j !== marker.index));
+        setDirty(true);
+    };
+
     const markerAt = tile => {
         if (!tile) return null;
         for (const kind of ['instant', 'interactive']) {
             const list = enc[kind] || [];
+            for (let i = list.length - 1; i >= 0; i--) {
+                const loc = list[i].location;
+                if (loc && loc[0] === tile[0] && loc[1] === tile[1]) return { kind, index: i };
+            }
+        }
+        for (const kind of ENTITY_KINDS) {
+            const list = entityList(kind);
             for (let i = list.length - 1; i >= 0; i--) {
                 const loc = list[i].location;
                 if (loc && loc[0] === tile[0] && loc[1] === tile[1]) return { kind, index: i };
@@ -375,7 +469,7 @@ function RoomEditor({ room, scan, onSaved }) {
         if (marker === 'spawn') {
             setDef(prev => (!prev.spawn || prev.spawn[0] !== tile[0] || prev.spawn[1] !== tile[1])
                 ? { ...prev, spawn: tile.slice() } : prev);
-        } else {
+        } else if (marker.kind === 'instant' || marker.kind === 'interactive') {
             setEnc(prev => {
                 const list = prev[marker.kind] || [];
                 const entry = list[marker.index];
@@ -384,6 +478,9 @@ function RoomEditor({ room, scan, onSaved }) {
                 copy[marker.index] = { ...entry, location: tile.slice() };
                 return { ...prev, [marker.kind]: copy };
             });
+        } else {
+            setEntityList(marker.kind, entityList(marker.kind).map((entry, j) =>
+                j === marker.index ? { ...entry, location: tile.slice() } : entry));
         }
         setDirty(true);
     };
@@ -424,6 +521,21 @@ function RoomEditor({ room, scan, onSaved }) {
             setEnc(prev => ({ ...prev, [tool]: (prev[tool] || []).concat(entry) }));
             setSelected({ kind: tool, index: (enc[tool] || []).length });
             setDirty(true);
+        } else if (tool === 'object') {
+            const entry = { type: placeType, location: tile.slice() };
+            setObjects(prev => prev.concat(entry));
+            setSelected({ kind: 'object', index: objects.length });
+            setDirty(true);
+        } else if (tool === 'enemy') {
+            const entry = { name: placeEnemy, location: tile.slice() };
+            setEnemies(prev => prev.concat(entry));
+            setSelected({ kind: 'enemy', index: enemies.length });
+            setDirty(true);
+        } else if (tool === 'npc') {
+            const entry = { character: placeCharacter, location: tile.slice() };
+            setNpcs(prev => prev.concat(entry));
+            setSelected({ kind: 'npc', index: npcs.length });
+            setDirty(true);
         } else if (tool === 'select') {
             const marker = markerAt(tile);
             setSelected(marker);
@@ -462,6 +574,10 @@ function RoomEditor({ room, scan, onSaved }) {
         setEnc(prev => ({ ...prev, [kind]: prev[kind].map((x, j) => j === i ? { ...x, [key]: value } : x) }));
         setDirty(true);
     };
+    const patchEntity = (kind, i, key, value) => {
+        setEntityList(kind, entityList(kind).map((x, j) => j === i ? { ...x, [key]: value } : x));
+        setDirty(true);
+    };
 
     const resize = () => {
         const w = Math.max(1, Math.min(500, parseInt(newW, 10) || W));
@@ -485,23 +601,49 @@ function RoomEditor({ room, scan, onSaved }) {
             instant: (prev.instant || []).map(e => ({ ...e, location: clampLoc(e.location || [0, 0]) })),
             interactive: (prev.interactive || []).map(e => ({ ...e, location: clampLoc(e.location || [0, 0]) }))
         }));
+        for (const kind of ENTITY_KINDS) {
+            setEntityList(kind, entityList(kind).map(e => ({ ...e, location: clampLoc(e.location || [0, 0]) })));
+        }
         setSize({ w, h });
         setDirty(true);
     };
 
+    const playFromHere = async () => {
+        setStatus('Building + launching…');
+        const result = await api('/api/play', {
+            room: stem(room.file),
+            tile: def.spawn ? def.spawn.join(',') : undefined
+        });
+        if (result && result.error) setStatus(result.error);
+        else if (result && result.ok) setStatus('Launched (saving off in test session)');
+        else setStatus((result && result.error) || 'Launch failed — see Build output');
+    };
+
     const save = async () => {
+        // Doors/exits/mirror/pit with empty values drop their keys so the
+        // baked config sees "no link" rather than a blank one.
+        const cleanExits = Object.fromEntries(Object.entries(exits).filter(([, v]) => v));
+        const cleanDoors = Object.fromEntries(Object.entries(doors).filter(([, v]) => v && v.kind));
+        const cleanPit = pit.room ? { room: pit.room, ...(pit.tile ? { tile: pit.tile } : {}) } : undefined;
         await api('/api/save', {
             path: 'resources/rooms/' + room.file,
             content: JSON.stringify({
-                // Preserve keys the editor doesn't edit (enemies, objects...).
+                // Preserve keys the editor doesn't edit (buried, ...).
                 ...(room.raw || {}),
                 width: W, height: H,
                 default: def,
                 encounters: enc,
+                objects: objects,
+                enemies: enemies,
+                npcs: npcs,
+                doors: Object.keys(cleanDoors).length ? cleanDoors : undefined,
+                exits: Object.keys(cleanExits).length ? cleanExits : undefined,
+                mirror: mirror || undefined,
+                pit: cleanPit,
                 decor: layers.decor,
                 colliders: layers.colliders,
                 upper: layers.upper
-            }, null, 4)
+            }, (key, value) => value === undefined ? undefined : value, 4)
         });
         setDirty(false);
         setStatus('Saved');
@@ -541,6 +683,30 @@ function RoomEditor({ room, scan, onSaved }) {
                                 title={TOOL_HINTS[key] + ' (' + hotkey + ')'}
                                 onClick={() => setTool(key)}>{label}</button>)}
                     </div>
+                    {(tool === 'object' || tool === 'enemy' || tool === 'npc') && (
+                        <div className="toolbar">
+                            <span className="dim">placing:</span>
+                            {tool === 'object' && (
+                                <select value={placeType} onChange={e => setPlaceType(e.target.value)}
+                                    title="Object type (composed from resources/objects/types.json)">
+                                    {(scan.objectTypes || []).map(t =>
+                                        <option key={t.name} value={t.name}>{t.name}</option>)}
+                                </select>
+                            )}
+                            {tool === 'enemy' && (
+                                <select value={placeEnemy} onChange={e => setPlaceEnemy(e.target.value)}>
+                                    {(scan.enemies || []).map(en =>
+                                        <option key={en.name} value={en.name}>{en.name}</option>)}
+                                </select>
+                            )}
+                            {tool === 'npc' && (
+                                <select value={placeCharacter} onChange={e => setPlaceCharacter(e.target.value)}>
+                                    {scan.characters.map(c =>
+                                        <option key={c.file} value={stem(c.file)}>{stem(c.file)}</option>)}
+                                </select>
+                            )}
+                        </div>
+                    )}
                     <div className="toolbar">
                         {['decor', 'colliders', 'upper'].map(l =>
                             <span key={l} className="layerToggle">
@@ -640,6 +806,110 @@ function RoomEditor({ room, scan, onSaved }) {
                         </div>
                     ))}
 
+                    <h2>Entities</h2>
+                    {ENTITY_KINDS.map(kind => {
+                        const list = entityList(kind);
+                        return (
+                            <div key={kind} style={{ marginBottom: 10 }}>
+                                <h2>{ENTITY_LABELS[kind]}</h2>
+                                {list.length === 0 && <p className="dim">(none — use the "Place {ENTITY_LABELS[kind].replace(/s$/, '')}" tool on the map)</p>}
+                                {list.map((entry, i) => {
+                                    const isSelected = selected && selected !== 'spawn' && selected.kind === kind && selected.index === i;
+                                    const label = kind === 'object' ? (entry.type || '?')
+                                        : kind === 'enemy' ? (entry.name || '?') : (entry.character || '?');
+                                    return (
+                                        <div className={'row encRow' + (isSelected ? ' selected' : '')} key={i}
+                                            onClick={() => setSelected({ kind, index: i })}>
+                                            <span className="encDot" style={{ background: ENTITY_COLORS[kind] }} />
+                                            <span style={{ flex: 1 }}>{label}</span>
+                                            <span className="dim">{entry.location ? entry.location[0] + ',' + entry.location[1] : '?'}</span>
+                                            <button className="delete" onClick={e => {
+                                                e.stopPropagation();
+                                                removeEntity({ kind, index: i });
+                                                if (isSelected) setSelected(null);
+                                            }}>×</button>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        );
+                    })}
+                    {selected && selected !== 'spawn' && ENTITY_KINDS.includes(selected.kind) && (
+                        <EntityFields
+                            kind={selected.kind}
+                            entry={entityList(selected.kind)[selected.index]}
+                            scan={scan}
+                            patch={(key, value) => patchEntity(selected.kind, selected.index, key, value)} />
+                    )}
+
+                    <h2>Doors & Exits</h2>
+                    {['north', 'south', 'east', 'west'].map(edge => (
+                        <div className="row" key={edge} style={{ marginBottom: 4 }}>
+                            <span className="dim" style={{ width: 44 }}>{edge}</span>
+                            <select value={(doors[edge] || {}).kind || ''} title="Door kind on this edge"
+                                onChange={e => {
+                                    const kind = e.target.value;
+                                    setDoors(prev => {
+                                        const copy = { ...prev };
+                                        if (kind) copy[edge] = { ...(copy[edge] || {}), kind };
+                                        else delete copy[edge];
+                                        return copy;
+                                    });
+                                    setDirty(true);
+                                }}>
+                                <option value="">no door</option>
+                                {['open', 'closed', 'locked', 'big', 'bombable', 'shutter'].map(k =>
+                                    <option key={k} value={k}>{k}</option>)}
+                            </select>
+                            <select value={exits[edge] || ''} title="The room this edge leads to (the map graph)"
+                                onChange={e => {
+                                    const target = e.target.value;
+                                    setExits(prev => {
+                                        const copy = { ...prev };
+                                        if (target) copy[edge] = target;
+                                        else delete copy[edge];
+                                        return copy;
+                                    });
+                                    setDirty(true);
+                                }}>
+                                <option value="">walled</option>
+                                {scan.rooms.filter(r => r.file !== room.file).map(r =>
+                                    <option key={r.file} value={r.file}>{stem(r.file)}</option>)}
+                            </select>
+                        </div>
+                    ))}
+                    <p className="dim">Exits draw on the world graph; a shutter stays shut until the room is cleared, a locked one takes a small key.</p>
+
+                    <h2>World Links</h2>
+                    <div className="field"><label>Mirror pair <span className="dim">(the dark world)</span></label>
+                        <select value={mirror || ''} onChange={e => { setMirror(e.target.value); setDirty(true); }}>
+                            <option value="">(none)</option>
+                            {scan.rooms.filter(r => r.file !== room.file).map(r =>
+                                <option key={r.file} value={r.file}>{stem(r.file)}</option>)}
+                        </select>
+                    </div>
+                    <div className="field"><label>Pit landing <span className="dim">(falling into a pit tile warps here)</span></label>
+                        <select value={pit.room || ''}
+                            onChange={e => { setPit(prev => ({ ...prev, room: e.target.value })); setDirty(true); }}>
+                            <option value="">(respawn at the safe tile)</option>
+                            {scan.rooms.filter(r => r.file !== room.file).map(r =>
+                                <option key={r.file} value={r.file}>{stem(r.file)}</option>)}
+                        </select>
+                    </div>
+                    {pit.room && (
+                        <div className="row">
+                            <div className="field"><label>Landing tile X</label>
+                                <input type="number" value={(pit.tile || [])[0] || 0}
+                                    onChange={e => { setPit(prev => ({ ...prev, tile: [+e.target.value, (prev.tile || [])[1] || 0] })); setDirty(true); }} />
+                            </div>
+                            <div className="field"><label>Y</label>
+                                <input type="number" value={(pit.tile || [])[1] || 0}
+                                    onChange={e => { setPit(prev => ({ ...prev, tile: [(prev.tile || [])[0] || 0, +e.target.value] })); setDirty(true); }} />
+                            </div>
+                        </div>
+                    )}
+                    <p className="dim">Warp pads and stairs carry their targets on the map (place + edit them there); all links preview on the world graph.</p>
+
                     <h2>Resize Room</h2>
                     <div className="row">
                         <input type="number" value={newW} onChange={e => setNewW(+e.target.value)} />
@@ -651,6 +921,9 @@ function RoomEditor({ room, scan, onSaved }) {
 
                     <div className="row" style={{ marginTop: 16 }}>
                         <button className="btn primary" onClick={save}>Save Room</button>
+                        <button className="btn" onClick={playFromHere}
+                            title="Build, then launch the game straight into this room at the spawn tile (a throwaway test session — nothing saves)">
+                            Play from here</button>
                         <span className="dim">{status}</span>
                     </div>
 
@@ -663,6 +936,306 @@ function RoomEditor({ room, scan, onSaved }) {
                     </p>
                 </div>
             </div>
+        </div>
+    );
+}
+
+// Entity property form: type-specific fields for the selected object,
+// enemy, or NPC (the type's interactions decide what shows — the editor
+// reads the same composition data the engine interprets).
+function EntityFields({ kind, entry, scan, patch }) {
+    if (!entry) return null;
+
+    const numberField = (label, value, onSet, props) => (
+        <div className="field"><label>{label}</label>
+            <input type="number" value={value == null ? 0 : value}
+                onChange={e => onSet(e.target.value === '' ? undefined : +e.target.value)} {...(props || {})} />
+        </div>
+    );
+
+    if (kind === 'enemy') {
+        return (
+            <div className="entityFields">
+                <div className="field"><label>Enemy</label>
+                    <select value={entry.name || ''} onChange={e => patch('name', e.target.value)}>
+                        {(scan.enemies || []).map(en => <option key={en.name} value={en.name}>{en.name}</option>)}
+                    </select>
+                </div>
+            </div>
+        );
+    }
+
+    if (kind === 'npc') {
+        return (
+            <div className="entityFields">
+                <div className="field"><label>Character</label>
+                    <select value={entry.character || ''} onChange={e => patch('character', e.target.value)}>
+                        {scan.characters.map(c => <option key={c.file} value={stem(c.file)}>{stem(c.file)}</option>)}
+                    </select>
+                </div>
+                <div className="field"><label>Dialogue</label>
+                    <select value={entry.dialogue || ''} onChange={e => patch('dialogue', e.target.value || undefined)}>
+                        <option value="">(silent)</option>
+                        {scan.dialogues.map(d => <option key={d.file} value={d.file}>{d.file}</option>)}
+                    </select>
+                </div>
+                <div className="field"><label>Behavior</label>
+                    <label><input type="checkbox" checked={!!entry.wander}
+                        onChange={e => patch('wander', e.target.checked || undefined)} /> wander</label>
+                </div>
+                <div className="field"><label>Present if flag</label>
+                    <input placeholder="(always)" value={entry.if || ''}
+                        onChange={e => patch('if', e.target.value || undefined)} />
+                </div>
+                <div className="field"><label>Present unless flag</label>
+                    <input placeholder="(never hidden)" value={entry.unless || ''}
+                        onChange={e => patch('unless', e.target.value || undefined)} />
+                </div>
+            </div>
+        );
+    }
+
+    // Object: the type's interaction composition drives the form.
+    const type = entry.type || 'pot';
+    const typeDef = (scan.objectTypes || []).find(t => t.name === type);
+    const interactions = (typeDef && typeDef.interactions) || [];
+    const has = name => interactions.includes(name);
+    const grant = entry.grant || {};
+    const warp = entry.warp || {};
+
+    return (
+        <div className="entityFields">
+            <div className="field"><label>Type</label>
+                <select value={type} onChange={e => patch('type', e.target.value)}>
+                    {(scan.objectTypes || []).map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
+                </select>
+            </div>
+
+            {has('chest') && (
+                <div>
+                    <div className="field"><label>Chest kind</label>
+                        <select value={entry.kind || 'normal'} onChange={e => patch('kind', e.target.value)}>
+                            <option value="normal">normal</option>
+                            <option value="locked">locked (small key)</option>
+                            <option value="big">big (big key)</option>
+                        </select>
+                    </div>
+                    <div className="field"><label>Grant</label>
+                        <select value={grant.kind || 'rupees'}
+                            onChange={e => patch('grant', { kind: e.target.value })}>
+                            {GRANT_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+                        </select>
+                    </div>
+                    {grant.kind === 'item' && (
+                        <div className="field"><label>Item</label>
+                            <select value={grant.item || ''}
+                                onChange={e => patch('grant', { ...grant, item: e.target.value })}>
+                                <option value="">(pick)</option>
+                                {(scan.items || []).map(it => <option key={it.name} value={it.name}>{it.name}</option>)}
+                            </select>
+                        </div>
+                    )}
+                    {grant.kind === 'flag' && (
+                        <div className="field"><label>Flag name</label>
+                            <input placeholder="world flag" value={grant.flag || ''}
+                                onChange={e => patch('grant', { ...grant, flag: e.target.value })} />
+                        </div>
+                    )}
+                    {grant.kind !== 'item' && grant.kind !== 'flag' && (
+                        numberField('Amount', grant.amount, v => patch('grant', { ...grant, amount: v }))
+                    )}
+                </div>
+            )}
+
+            {(has('warp') || has('stair')) && (
+                <div>
+                    <div className="field"><label>{has('stair') ? 'Stair' : 'Warp'} target</label>
+                        <select value={warp.room || ''}
+                            onChange={e => patch('warp', { room: e.target.value, tile: warp.tile || [0, 0] })}>
+                            <option value="">(pick room)</option>
+                            {scan.rooms.map(r => <option key={r.file} value={r.file}>{stem(r.file)}</option>)}
+                        </select>
+                    </div>
+                    {numberField('Target tile X', (warp.tile || [])[0],
+                        v => patch('warp', { ...(warp.room ? { room: warp.room } : {}), tile: [v, (warp.tile || [])[1] || 0] }))}
+                    {numberField('Target tile Y', (warp.tile || [])[1],
+                        v => patch('warp', { ...(warp.room ? { room: warp.room } : {}), tile: [(warp.tile || [])[0] || 0, v] }))}
+                </div>
+            )}
+
+            {has('switch') && (
+                <div>
+                    <div className="field"><label>Mode</label>
+                        <select value={entry.mode || 'hold'} onChange={e => patch('mode', e.target.value)}>
+                            <option value="hold">hold (weight)</option>
+                            <option value="latch">latch (forever)</option>
+                            <option value="timed">timed (~3s)</option>
+                        </select>
+                    </div>
+                    {numberField('Link group', entry.link, v => patch('link', v))}
+                </div>
+            )}
+
+            {(has('torch') || has('lever')) && (
+                numberField('Link group', entry.link, v => patch('link', v))
+            )}
+
+            {has('barrier') && (
+                <div>
+                    <div className="field"><label>Color</label>
+                        <select value={entry.color || 'linked'} onChange={e => patch('color', e.target.value)}>
+                            <option value="linked">linked (follows its group)</option>
+                            <option value="blue">blue (crystal)</option>
+                            <option value="red">red (crystal)</option>
+                        </select>
+                    </div>
+                    {entry.color !== 'blue' && entry.color !== 'red' && numberField('Link group', entry.link, v => patch('link', v))}
+                </div>
+            )}
+
+            {has('readable') && (
+                <div className="field"><label>Dialogue</label>
+                    <select value={entry.dialogue || ''} onChange={e => patch('dialogue', e.target.value)}>
+                        <option value="">(pick)</option>
+                        {scan.dialogues.map(d => <option key={d.file} value={d.file}>{d.file}</option>)}
+                    </select>
+                </div>
+            )}
+
+            {has('hides') && (
+                <div className="field"><label>Hides enemy</label>
+                    <select value={entry.hides || ''} onChange={e => patch('hides', e.target.value || undefined)}>
+                        <option value="">(nothing)</option>
+                        {(scan.enemies || []).map(en => <option key={en.name} value={en.name}>{en.name}</option>)}
+                    </select>
+                </div>
+            )}
+
+            {has('platform') && (
+                <div className="field"><label>Rail path</label>
+                    <input placeholder="x,y x,y …" title="Tile waypoints, glided in a loop"
+                        value={(entry.path || []).map(p => (p || []).join(',')).join(' ')}
+                        onChange={e => {
+                            const text = e.target.value.trim();
+                            patch('path', text
+                                ? text.split(/\s+/).map(pair => pair.split(',').map(Number))
+                                : undefined);
+                        }} />
+                </div>
+            )}
+        </div>
+    );
+}
+
+// World graph preview: rooms as boxes laid out like the in-game map (BFS
+// over exits from the first room; rooms off the graph shelf bottom-right),
+// with exits, mirror pairs, pit-landings, and warp/stair links drawn.
+function WorldGraph({ rooms, current, onSelect }) {
+    const pitchX = 150, pitchY = 110, boxW = 116, boxH = 58;
+
+    const resolve = name => {
+        if (name == null) return -1;
+        const text = String(name);
+        return rooms.findIndex(r => r.file === text || stem(r.file) === stem(text));
+    };
+
+    const { xs, ys } = useMemo(() => {
+        const xs = rooms.map(() => Infinity);
+        const ys = rooms.map(() => Infinity);
+        if (rooms.length) { xs[0] = 0; ys[0] = 0; }
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (let i = 0; i < rooms.length; i++) {
+                if (xs[i] === Infinity) continue;
+                const exits = (rooms[i].raw && rooms[i].raw.exits) || {};
+                const edges = [['north', 0, -1], ['south', 0, 1], ['east', 1, 0], ['west', -1, 0]];
+                for (const [dir, ox, oy] of edges) {
+                    const target = resolve(exits[dir]);
+                    if (target < 0 || xs[target] !== Infinity) continue;
+                    xs[target] = xs[i] + ox;
+                    ys[target] = ys[i] + oy;
+                    changed = true;
+                }
+            }
+        }
+        let maxX = 0, maxY = 0;
+        for (let i = 0; i < rooms.length; i++) {
+            if (xs[i] === Infinity) continue;
+            maxX = Math.max(maxX, xs[i]);
+            maxY = Math.max(maxY, ys[i]);
+        }
+        let shelf = 0;
+        for (let i = 0; i < rooms.length; i++) {
+            if (xs[i] !== Infinity) continue;
+            xs[i] = maxX + 1 + shelf;
+            ys[i] = maxY + 1;
+            shelf++;
+        }
+        return { xs, ys };
+    }, [rooms]);
+
+    let width = 0, height = 0;
+    for (let i = 0; i < rooms.length; i++) {
+        width = Math.max(width, (xs[i] + 1) * pitchX + boxW);
+        height = Math.max(height, (ys[i] + 1) * pitchY + boxH);
+    }
+
+    const center = i => [xs[i] * pitchX + boxW / 2, ys[i] * pitchY + boxH / 2];
+    const link = (a, b) => {
+        if (a < 0 || b < 0) return null;
+        const [x0, y0] = center(a), [x1, y1] = center(b);
+        return <line key={'l' + a + '-' + b} x1={x0} y1={y0} x2={x1} y2={y1} strokeWidth={2} />;
+    };
+
+    const links = [];
+    rooms.forEach((r, i) => {
+        const raw = r.raw || {};
+        const exits = raw.exits || {};
+        // Exit edges (gray) — drawn once per pair via the lower index.
+        for (const dir of ['north', 'south', 'east', 'west']) {
+            const target = resolve(exits[dir]);
+            if (target >= 0 && target > i) links.push(
+                <line key={'e' + i + dir} x1={center(i)[0]} y1={center(i)[1]}
+                    x2={center(target)[0]} y2={center(target)[1]} stroke="#64748b" strokeWidth={2} />);
+        }
+        // Mirror pairs (dashed purple) — once per pair.
+        const mirror = resolve(raw.mirror);
+        if (mirror >= 0 && mirror > i) links.push(
+            <line key={'m' + i} x1={center(i)[0]} y1={center(i)[1]} x2={center(mirror)[0]} y2={center(mirror)[1]}
+                stroke="#a855f7" strokeWidth={2} strokeDasharray="6 4" />);
+        // Pit landings (dotted amber).
+        const pit = resolve((raw.pit || {}).room);
+        if (pit >= 0) links.push(
+            <line key={'p' + i} x1={center(i)[0]} y1={center(i)[1]} x2={center(pit)[0]} y2={center(pit)[1]}
+                stroke="#f59e0b" strokeWidth={2} strokeDasharray="2 5" />);
+        // Warp pads + stairs (dashed teal).
+        (raw.objects || []).forEach((o, j) => {
+            if (o.type !== 'warp' && o.type !== 'stair') return;
+            const target = resolve((o.warp || {}).room);
+            if (target < 0) return;
+            links.push(
+                <line key={'w' + i + '-' + j} x1={center(i)[0]} y1={center(i)[1]} x2={center(target)[0]} y2={center(target)[1]}
+                    stroke={o.type === 'stair' ? '#14b8a6' : '#0ea5e9'} strokeWidth={2} strokeDasharray="4 4" />);
+        });
+    });
+
+    return (
+        <div className="scrollWrap" style={{ flex: 1, minHeight: 0 }}>
+            <svg width={width} height={height} style={{ display: 'block' }}>
+                {links}
+                {rooms.map((r, i) => (
+                    <g key={r.file} onClick={() => onSelect(i)} style={{ cursor: 'pointer' }}>
+                        <rect x={xs[i] * pitchX} y={ys[i] * pitchY} width={boxW} height={boxH} rx={6}
+                            fill={i === current ? '#1d4ed8' : '#334155'}
+                            stroke={i === current ? '#fff' : '#64748b'} strokeWidth={2} />
+                        <text x={xs[i] * pitchX + boxW / 2} y={ys[i] * pitchY + 22} textAnchor="middle"
+                            fill="#fff" fontSize={13} fontWeight="bold">{stem(r.file)}</text>
+                        <text x={xs[i] * pitchX + boxW / 2} y={ys[i] * pitchY + 42} textAnchor="middle"
+                            fill="#cbd5e1" fontSize={11}>{r.mapWidth}×{r.mapHeight}</text>
+                    </g>
+                ))}
+            </svg>
         </div>
     );
 }
@@ -720,6 +1293,7 @@ function RoomsTab({ scan, refresh }) {
     const [w, setW] = useState(30);
     const [h, setH] = useState(20);
     const [error, setError] = useState('');
+    const [showGraph, setShowGraph] = useState(false);
     const room = scan.rooms[sel];
 
     const create = async () => {
@@ -739,6 +1313,10 @@ function RoomsTab({ scan, refresh }) {
         <div className="layout">
             <div className="sidebar">
                 <h2>Rooms</h2>
+                <button className={'btn' + (showGraph ? ' primary' : '')} style={{ width: '100%', marginBottom: 8 }}
+                    onClick={() => setShowGraph(!showGraph)}>
+                    {showGraph ? 'Back to the editor' : 'World graph'}
+                </button>
                 {scan.rooms.map((r, i) => (
                     <div className="row" key={r.file}>
                         <button className={'item' + (i === sel ? ' active' : '')} style={{ flex: 1 }}
@@ -756,8 +1334,680 @@ function RoomsTab({ scan, refresh }) {
                 {error && <p className="fail">{error}</p>}
             </div>
             {room
-                ? <RoomEditor key={room.file + ':' + scan.rooms.length} room={room} scan={scan} onSaved={refresh} />
+                ? (showGraph
+                    ? <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                        <h1>World Graph</h1>
+                        <p className="dim">Exits solid gray · mirror pairs dashed purple · pit-landings dotted amber · warp pads dashed sky · stairs dashed teal. Click a room to edit it. Off-graph rooms shelf bottom-right, like the in-game map.</p>
+                        <WorldGraph rooms={scan.rooms} current={sel}
+                            onSelect={i => { setSel(i); setShowGraph(false); }} />
+                    </div>
+                    : <RoomEditor key={room.file + ':' + scan.rooms.length} room={room} scan={scan} onSaved={refresh} />)
                 : <p className="dim">No rooms. Create one on the left.</p>}
+        </div>
+    );
+}
+
+// ---- data vocabulary lists (mirrored from the generator's tables; the
+// editor can't run the bake, so the stable engine vocabularies live here) --
+const USE_KINDS = ['none', 'boomerang', 'arrow', 'bomb', 'bolt', 'hammer', 'shovel',
+    'hookshot', 'medallion', 'byrna', 'cape', 'somaria', 'powder', 'flute', 'net',
+    'bottle', 'mirror'];
+const ELEMENT_KINDS = ['', 'fire', 'ice'];
+const BEHAVIOR_PRESETS = ['', 'soldier', 'octorok', 'boss'];
+const PICKUP_KINDS = ['heart', 'rupee', 'rupee5', 'arrow', 'bomb', 'magic', 'fairy', 'key'];
+const DIRECTIONS_4 = ['down', 'right', 'left', 'up'];
+
+// Game-code custom behaviors (resources/code/): scaffolding, the
+// manifest-driven list, and compile-error surfacing (a fast syntax-only
+// check with the engine's include paths; full builds surface the same
+// output on the Build tab).
+function BehaviorSection({ scan, refresh }) {
+    const [name, setName] = useState('');
+    const [error, setError] = useState('');
+    const [check, setCheck] = useState(null);   // {ok, output}
+
+    const create = async () => {
+        if (!name.trim()) return;
+        const result = await api('/api/create', { type: 'behavior', name: name.trim() });
+        if (result.error) return setError(result.error);
+        setName(''); setError('');
+        const verified = await api('/api/check_code', { file: name.trim() + '.cpp' });
+        setCheck(verified && verified.ok !== undefined ? verified : null);
+        refresh();
+    };
+
+    const checkAll = async () => {
+        setCheck(null);
+        const result = await api('/api/check_code', {});
+        setCheck(result);
+    };
+
+    return (
+        <div style={{ borderTop: '1px solid #334155', marginTop: 14, paddingTop: 10 }}>
+            <h2>Game-code behaviors</h2>
+            <p className="dim">resources/code/*.cpp — compiled into the binary; enemies reference them as "custom:&lt;name&gt;".</p>
+            {(scan.behaviors || []).map(b => (
+                <div className="row" key={b}>
+                    <code style={{ flex: 1 }}>custom:{b}</code>
+                    <button className="tool" title="Syntax-check this unit"
+                        onClick={async () => setCheck(await api('/api/check_code', { file: b + '.cpp' }))}>check</button>
+                </div>
+            ))}
+            <div className="row" style={{ marginTop: 6 }}>
+                <input placeholder="name" value={name} style={{ width: 96 }} onChange={e => setName(e.target.value)} />
+                <button className="btn" onClick={create}>Scaffold</button>
+                <button className="btn" onClick={checkAll}>Compile check all</button>
+            </div>
+            {error && <p className="fail">{error}</p>}
+            {check && (
+                <div style={{ marginTop: 8 }}>
+                    {check.ok
+                        ? <p className="dim" style={{ color: '#22c55e' }}>✓ Compiles clean.</p>
+                        : <p className="fail">✗ Compile errors:</p>}
+                    {check.output && check.output.trim() && check.output !== '(web build compiled clean)' && (
+                        <pre className="build" style={{ maxHeight: 200 }}>{check.output.slice(-4000)}</pre>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function EnemiesTab({ scan, refresh }) {
+    const confirm = useConfirm();
+    const [sel, setSel] = useState(0);
+    const [name, setName] = useState('');
+    const [error, setError] = useState('');
+    const enemy = scan.enemies[sel];
+
+    const create = async () => {
+        if (!name.trim()) return;
+        const result = await api('/api/create', { type: 'enemy', name: name.trim() });
+        if (result.error) return setError(result.error);
+        setName(''); setError(''); refresh();
+    };
+
+    const remove = async e => {
+        if (!await confirm('Delete ' + e.file + '?')) return;
+        await api('/api/delete', { path: 'resources/enemies/' + e.file });
+        setSel(0); refresh();
+    };
+
+    return (
+        <div className="layout">
+            <div className="sidebar">
+                <h2>Enemies</h2>
+                {scan.enemies.map((e, i) => (
+                    <div className="row" key={e.file}>
+                        <button className={'item' + (i === sel ? ' active' : '')} style={{ flex: 1 }}
+                            onClick={() => setSel(i)}>{e.name}</button>
+                        <button className="delete" onClick={() => remove(e)}>×</button>
+                    </div>
+                ))}
+                <h2>New</h2>
+                <div className="row">
+                    <input placeholder="name" value={name} style={{ width: 92 }} onChange={e => setName(e.target.value)} />
+                    <button className="btn" onClick={create}>Create</button>
+                </div>
+                {error && <p className="fail">{error}</p>}
+                <BehaviorSection scan={scan} refresh={refresh} />
+            </div>
+            {enemy
+                ? <EnemyEditor key={enemy.file} enemy={enemy} scan={scan} onSaved={refresh} />
+                : <p className="dim">No enemies. Create one, then upload a same-named .png in Music & Files.</p>}
+        </div>
+    );
+}
+
+function EnemyEditor({ enemy, scan, onSaved }) {
+    const [data, setData] = useState(enemy.data);
+    const [status, setStatus] = useState('');
+    const [dirty, setDirty] = useState(false);
+
+    const stats = data.stats || {};
+    const components = stats.components || {};
+    const drops = stats.drops || {};
+
+    const patch = (key, value) => { setData(prev => ({ ...prev, [key]: value })); setDirty(true); };
+    const patchStats = (key, value) => {
+        setData(prev => ({ ...prev, stats: { ...(prev.stats || {}), [key]: value } }));
+        setDirty(true);
+    };
+    const patchComponent = (key, value) => {
+        setData(prev => ({
+            ...prev,
+            stats: {
+                ...(prev.stats || {}),
+                components: { ...(prev.stats || {}).components || {}, [key]: value }
+            }
+        }));
+        setDirty(true);
+    };
+    const patchDrop = (kind, weight) => {
+        setData(prev => ({
+            ...prev,
+            stats: {
+                ...(prev.stats || {}),
+                drops: { ...((prev.stats || {}).drops || {}), [kind]: weight }
+            }
+        }));
+        setDirty(true);
+    };
+    const removeDrop = kind => {
+        const copy = { ...drops };
+        delete copy[kind];
+        patchStats('drops', copy);
+    };
+    const addDrop = () => patchDrop('heart', 10);
+
+    // Stand/move animation frame lists, per direction ("0,4" notation).
+    const animValue = (block, dir) => ((data[block] || {})[dir] || []).join(',');
+    const patchAnim = (block, dir, text) => {
+        const frames = text.split(',').map(s => parseInt(s.trim(), 10))
+            .filter(n => !isNaN(n));
+        patch(block, { ...(data[block] || {}), [dir]: frames });
+    };
+
+    const save = async () => {
+        await api('/api/save', {
+            path: 'resources/enemies/' + enemy.file,
+            content: JSON.stringify(data, null, 4)
+        });
+        setDirty(false);
+        setStatus('Saved');
+        onSaved();
+    };
+
+    const numberField = (label, value, onSet) => (
+        <div className="field"><label>{label}</label>
+            <input type="number" value={value == null ? 0 : value}
+                onChange={e => onSet(e.target.value === '' ? undefined : +e.target.value)} />
+        </div>
+    );
+
+    return (
+        <div className="panel" style={{ maxWidth: 560 }}>
+            <h1>{enemy.name} {dirty && <span className="fail">(unsaved)</span>}</h1>
+
+            <h2>Sheet & Stats</h2>
+            <div className="row">
+                {numberField('Sheet columns', data.width, v => patch('width', v))}
+                <div className="field"><label>Color (rgb)</label>
+                    <span>
+                        <input type="number" style={{ width: 52 }} value={(data.color || [200, 60, 60])[0]}
+                            onChange={e => patch('color', [+e.target.value, (data.color || [])[1] || 0, (data.color || [])[2] || 0])} />
+                        <input type="number" style={{ width: 52 }} value={(data.color || [])[1] || 0}
+                            onChange={e => patch('color', [(data.color || [])[0] || 0, +e.target.value, (data.color || [])[2] || 0])} />
+                        <input type="number" style={{ width: 52 }} value={(data.color || [])[2] || 0}
+                            onChange={e => patch('color', [(data.color || [])[0] || 0, (data.color || [])[1] || 0, +e.target.value])} />
+                    </span>
+                </div>
+            </div>
+            <div className="row">
+                {numberField('HP', stats.hp, v => patchStats('hp', v))}
+                {numberField('Speed', stats.speed, v => patchStats('speed', v))}
+                {numberField('Damage (half-hearts)', stats.damage, v => patchStats('damage', v))}
+            </div>
+            <div className="field"><label>Behavior</label>
+                <select value={stats.behavior || ''}
+                    onChange={e => patchStats('behavior', e.target.value)}>
+                    {BEHAVIOR_PRESETS.map(b =>
+                        <option key={b} value={b}>{b === '' ? '(plain wanderer)' : b}</option>)}
+                    {(scan.behaviors || []).map(b =>
+                        <option key={'c' + b} value={'custom:' + b}>custom:{b}</option>)}
+                </select>
+            </div>
+            <div className="row">
+                {numberField('Sight (charge radius)', stats.sight, v => patchStats('sight', v))}
+                {numberField('Shoot period', stats.shoot_period, v => patchStats('shoot_period', v))}
+            </div>
+
+            <h2>Components</h2>
+            <div className="row">
+                <label title="Arena boss: seals the room, health bar, banked defeat">
+                    <input type="checkbox" checked={!!components.boss} onChange={e => patchComponent('boss', e.target.checked || undefined)} /> boss</label>
+                <label title="Mid-fight: seals + health bar, room-local defeat">
+                    <input type="checkbox" checked={!!components.mini_boss} onChange={e => patchComponent('mini_boss', e.target.checked || undefined)} /> mini_boss</label>
+                <label title="Only projectile hits land (reflectable magic)">
+                    <input type="checkbox" checked={!!components.strike_immune} onChange={e => patchComponent('strike_immune', e.target.checked || undefined)} /> strike_immune</label>
+                <label title="The bug net bottles it">
+                    <input type="checkbox" checked={!!components.catchable} onChange={e => patchComponent('catchable', e.target.checked || undefined)} /> catchable</label>
+            </div>
+            <div className="row">
+                {numberField('Mover walk time (s)', (components.mover || {}).walk_time,
+                    v => patchComponent('mover', v == null ? undefined : { ...(components.mover || {}), walk_time: v }))}
+                <label title="Occasional random course change while walking">
+                    <input type="checkbox" checked={!!(components.mover || {}).turn_chance}
+                        onChange={e => patchComponent('mover', e.target.checked
+                            ? { ...(components.mover || {}), turn_chance: true }
+                            : (components.mover || {}).walk_time != null ? { walk_time: components.mover.walk_time } : undefined)} /> turn_chance</label>
+            </div>
+
+            <h2>Animations <span className="dim">(frame numbers, comma-separated)</span></h2>
+            {['stand', 'move'].map(block => (
+                <div key={block} style={{ marginBottom: 8 }}>
+                    <div className="dim">{block}</div>
+                    {DIRECTIONS_4.map(dir => (
+                        <div className="field" key={dir}>
+                            <label>{dir}</label>
+                            <input value={animValue(block, dir)}
+                                onChange={e => patchAnim(block, dir, e.target.value)} />
+                        </div>
+                    ))}
+                </div>
+            ))}
+
+            <h2>Drops <span className="dim">(kind → weight)</span></h2>
+            {Object.keys(drops).length === 0 && <p className="dim">(engine default roll)</p>}
+            {Object.entries(drops).map(([kind, weight]) => (
+                <div className="row" key={kind}>
+                    <select value={kind} onChange={e => {
+                        const copy = { ...drops };
+                        delete copy[kind];
+                        copy[e.target.value] = weight;
+                        patchStats('drops', copy);
+                    }}>
+                        {PICKUP_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+                    </select>
+                    <input type="number" style={{ width: 70 }} value={weight}
+                        onChange={e => patchDrop(kind, +e.target.value)} />
+                    <button className="delete" onClick={() => removeDrop(kind)}>×</button>
+                </div>
+            ))}
+            <button className="btn" onClick={addDrop}>+ Add drop</button>
+
+            <div className="row" style={{ marginTop: 16 }}>
+                <button className="btn primary" onClick={save}>Save Enemy</button>
+                <span className="dim">{status}</span>
+            </div>
+        </div>
+    );
+}
+
+function ItemsTab({ scan, refresh }) {
+    const confirm = useConfirm();
+    const [sel, setSel] = useState(0);
+    const [name, setName] = useState('');
+    const [error, setError] = useState('');
+    const item = scan.items[sel];
+
+    const create = async () => {
+        if (!name.trim()) return;
+        const result = await api('/api/create', { type: 'item', name: name.trim() });
+        if (result.error) return setError(result.error);
+        setName(''); setError(''); refresh();
+    };
+
+    const remove = async it => {
+        if (!await confirm('Delete ' + it.name + '?')) return;
+        await api('/api/delete', { path: 'resources/items/' + it.name + '.json' });
+        setSel(0); refresh();
+    };
+
+    return (
+        <div className="layout">
+            <div className="sidebar">
+                <h2>Items</h2>
+                {scan.items.map((it, i) => (
+                    <div className="row" key={it.name}>
+                        <button className={'item' + (i === sel ? ' active' : '')} style={{ flex: 1 }}
+                            onClick={() => setSel(i)}>{it.name}</button>
+                        <button className="delete" onClick={() => remove(it)}>×</button>
+                    </div>
+                ))}
+                <h2>New</h2>
+                <div className="row">
+                    <input placeholder="name" value={name} style={{ width: 92 }} onChange={e => setName(e.target.value)} />
+                    <button className="btn" onClick={create}>Create</button>
+                </div>
+                {error && <p className="fail">{error}</p>}
+            </div>
+            {item
+                ? <ItemEditor key={item.name} item={item} scan={scan} onSaved={refresh} />
+                : <p className="dim">No items. Create one on the left.</p>}
+        </div>
+    );
+}
+
+function ItemEditor({ item, scan, onSaved }) {
+    const [data, setData] = useState(item.data);
+    const [status, setStatus] = useState('');
+    const [dirty, setDirty] = useState(false);
+
+    const use = data.use || {};
+    const passive = data.passive || {};
+    const upgrade = data.upgrade || {};
+    const cost = use.cost || {};
+    const ammoCost = cost.ammo === 'arrow' || cost.ammo === 'bomb';
+
+    const patch = (key, value) => { setData(prev => ({ ...prev, [key]: value })); setDirty(true); };
+    const patchUse = (key, value) => { setData(prev => ({ ...prev, use: { ...(prev.use || {}), [key]: value } })); setDirty(true); };
+    const patchPassive = (key, value) => { setData(prev => ({ ...prev, passive: { ...(prev.passive || {}), [key]: value } })); setDirty(true); };
+    const patchUpgrade = (key, value) => { setData(prev => ({ ...prev, upgrade: { ...(prev.upgrade || {}), [key]: value } })); setDirty(true); };
+    const patchCost = (key, value) => { setData(prev => ({ ...prev, use: { ...(prev.use || {}), cost: { ...(prev.use || {}).cost || {}, [key]: value } } })); setDirty(true); };
+
+    const save = async () => {
+        await api('/api/save', {
+            path: 'resources/items/' + item.name + '.json',
+            content: JSON.stringify(data, null, 4)
+        });
+        setDirty(false);
+        setStatus('Saved');
+        onSaved();
+    };
+
+    const numberField = (label, value, onSet) => (
+        <div className="field"><label>{label}</label>
+            <input type="number" value={value == null ? 0 : value}
+                onChange={e => onSet(e.target.value === '' ? undefined : +e.target.value)} />
+        </div>
+    );
+
+    return (
+        <div className="panel" style={{ maxWidth: 560 }}>
+            <h1>{item.name} {dirty && <span className="fail">(unsaved)</span>}</h1>
+
+            <div className="field"><label>Label (subscreen)</label>
+                <input value={data.label || ''} onChange={e => patch('label', e.target.value)} />
+            </div>
+
+            <h2>Use-Action</h2>
+            <div className="field"><label>Kind</label>
+                <select value={use.kind || 'none'} onChange={e => patchUse('kind', e.target.value)}>
+                    {USE_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+                </select>
+            </div>
+            <div className="field"><label>Sfx</label>
+                <select value={use.sfx || ''} onChange={e => patchUse('sfx', e.target.value || undefined)}>
+                    <option value="">(none)</option>
+                    {scan.audio.map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+            </div>
+            {(use.kind === 'bolt' || use.kind === 'medallion') && (
+                <div className="field"><label>Element</label>
+                    <select value={use.element || ''} onChange={e => patchUse('element', e.target.value || undefined)}>
+                        {ELEMENT_KINDS.filter(k => k !== '').map(k => <option key={k} value={k}>{k}</option>)}
+                    </select>
+                </div>
+            )}
+            {use.kind !== 'none' && (
+                <div>
+                    <h2>Cost</h2>
+                    <div className="row">
+                        {numberField('Magic (half-units)', cost.magic, v => patchCost('magic', v))}
+                        <label title="Ammo cost instead of magic">
+                            <input type="checkbox" checked={ammoCost}
+                                onChange={e => patchCost('ammo', e.target.checked ? 'arrow' : undefined)} /> ammo</label>
+                    </div>
+                    {ammoCost && (
+                        <div className="row">
+                            <div className="field"><label>Ammo</label>
+                                <select value={cost.ammo || 'arrow'} onChange={e => patchCost('ammo', e.target.value)}>
+                                    <option value="arrow">arrow</option>
+                                    <option value="bomb">bomb</option>
+                                </select>
+                            </div>
+                            {numberField('Amount', cost.amount, v => patchCost('amount', v))}
+                            <label title="Spend a rupee when the quiver is dry">
+                                <input type="checkbox" checked={!!cost.rupee_fallback}
+                                    onChange={e => patchCost('rupee_fallback', e.target.checked || undefined)} /> rupee fallback</label>
+                        </div>
+                    )}
+                </div>
+            )}
+            {use.kind === 'somaria' && (
+                <div className="field"><label>Spawned block type</label>
+                    <select value={data.spawn || ''} onChange={e => patch('spawn', e.target.value || undefined)}>
+                        <option value="">(none)</option>
+                        {(scan.objectTypes || []).map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
+                    </select>
+                </div>
+            )}
+
+            <h2>Passives</h2>
+            <div className="row">
+                {numberField('Light radius (lantern)', passive.light, v => patchPassive('light', v))}
+                <label title="Deep water becomes swimmable"><input type="checkbox" checked={!!passive.swim}
+                    onChange={e => patchPassive('swim', e.target.checked || undefined)} /> swim</label>
+                <label title="Hoists heavy objects"><input type="checkbox" checked={!!passive.lift}
+                    onChange={e => patchPassive('lift', e.target.checked || undefined)} /> lift</label>
+                <label title="Map marks chests/bosses"><input type="checkbox" checked={!!passive.compass}
+                    onChange={e => patchPassive('compass', e.target.checked || undefined)} /> compass</label>
+            </div>
+
+            <h2>Upgrade <span className="dim">(flag-gated stats)</span></h2>
+            <div className="field"><label>Flag</label>
+                <input placeholder="world flag" value={upgrade.flag || ''}
+                    onChange={e => patchUpgrade('flag', e.target.value || undefined)} />
+            </div>
+            <div className="row">
+                {numberField('Speed', upgrade.speed, v => patchUpgrade('speed', v))}
+                {numberField('Damage', upgrade.damage, v => patchUpgrade('damage', v))}
+            </div>
+
+            <div className="row" style={{ marginTop: 16 }}>
+                <button className="btn primary" onClick={save}>Save Item</button>
+                <span className="dim">{status}</span>
+            </div>
+        </div>
+    );
+}
+
+function TilesTab({ scan, refresh }) {
+    const tileset = scan.tileset || { image: '', columns: 1, tileCount: 0, tileWidth: 32, tileHeight: 32 };
+    const cols = tileset.columns || 1;
+    const ts = tileset.tileWidth || 32;
+    const rows = Math.max(1, Math.ceil((tileset.tileCount || 1) / cols));
+    const rawTiles = (scan.tileMeta && scan.tileMeta.tiles) || {};
+
+    const [sel, setSel] = useState(1);   // 1-based tile id
+    const [meta, setMeta] = useState(rawTiles);
+    const [status, setStatus] = useState('');
+    const [dirty, setDirty] = useState(false);
+    const [img, setImg] = useState(null);
+    const canvasRef = useRef(null);
+
+    useEffect(() => {
+        if (!tileset.image) return;
+        let alive = true;
+        resourceUrl(tileset.image).then(src => {
+            if (!alive) return;
+            const image = new Image();
+            image.onload = () => setImg(image);
+            image.src = src;
+        }).catch(() => {});
+        return () => { alive = false; };
+    }, [tileset.image]);
+
+    const entry = meta[String(sel)] || {};
+
+    const patch = (key, value) => {
+        setMeta(prev => ({ ...prev, [String(sel)]: { ...(prev[String(sel)] || {}), [key]: value } }));
+        setDirty(true);
+    };
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || !img) return;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        // Tiles carrying metadata get an amber outline.
+        for (const key of Object.keys(meta)) {
+            const frame = parseInt(key, 10) - 1;
+            if (isNaN(frame) || frame < 0 || frame >= tileset.tileCount) continue;
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 2;
+            ctx.strokeRect((frame % cols) * ts + 1, Math.floor(frame / cols) * ts + 1, ts - 2, ts - 2);
+        }
+        // The selection gets a white outline.
+        if (sel > 0 && sel <= tileset.tileCount) {
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(((sel - 1) % cols) * ts + 1, Math.floor((sel - 1) / cols) * ts + 1, ts - 2, ts - 2);
+        }
+    }, [img, meta, sel]);
+
+    const tileFromEvent = e => {
+        const canvas = canvasRef.current, rect = canvas.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left) / (rect.width / cols));
+        const y = Math.floor((e.clientY - rect.top) / (rect.height / rows));
+        return (x >= 0 && y >= 0 && x < cols && y < rows) ? y * cols + x + 1 : null;
+    };
+
+    const save = async () => {
+        await api('/api/save', {
+            path: 'resources/tiles/tiles.json',
+            content: JSON.stringify({ ...(scan.tileMeta || {}), tiles: meta }, null, 4)
+        });
+        setDirty(false);
+        setStatus('Saved');
+        refresh();
+    };
+
+    const numberField = (label, value, onSet, title) => (
+        <div className="field" title={title}><label>{label}</label>
+            <input type="number" value={value == null ? 0 : value}
+                onChange={e => onSet(e.target.value === '' ? undefined : +e.target.value)} />
+        </div>
+    );
+    const checkField = (label, key, title) => (
+        <label title={title || key}><input type="checkbox" checked={!!entry[key]}
+            onChange={e => patch(key, e.target.checked || undefined)} /> {label}</label>
+    );
+    const selectField = (label, key, options, title) => (
+        <div className="field" title={title}><label>{label}</label>
+            <select value={entry[key] || ''} onChange={e => patch(key, e.target.value || undefined)}>
+                {options.map(o => <option key={o} value={o}>{o === '' ? '(none)' : o}</option>)}
+            </select>
+        </div>
+    );
+
+    return (
+        <div className="layout">
+            <div className="sidebar">
+                <h2>Tile Properties</h2>
+                <p className="dim">Click a tile to edit its behavior. Amber outlines carry metadata.</p>
+                <p className="dim">Solidity is the colliders layer (paint it in Rooms), and walk sfx is per-room — the tile vocabulary covers behavior flags only.</p>
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+                <h1>Tile {sel - 1} <span className="dim">(id {sel})</span> {dirty && <span className="fail">(unsaved)</span>}</h1>
+                <div className="scrollWrap">
+                    <canvas ref={canvasRef} width={cols * ts} height={rows * ts}
+                        style={{ width: cols * ts * 2, imageRendering: 'pixelated', cursor: 'pointer', display: 'block', background: '#3a3a44' }}
+                        onClick={e => { const tile = tileFromEvent(e); if (tile) setSel(tile); }} />
+                </div>
+
+                <div className="panel" style={{ maxWidth: 560, marginTop: 12 }}>
+                    <h2>Behavior</h2>
+                    <div className="row">
+                        {checkField('pit (hole)', 'pit', 'The hero falls in; with a room pit-landing, drops through')}
+                        {checkField('ice', 'ice', 'Momentum sliding')}
+                        {checkField('heal', 'heal', 'Fairy-fountain water: refills hearts + magic')}
+                        {checkField('dig', 'dig', 'Soft soil: the shovel turns it over')}
+                    </div>
+                    <div className="row">
+                        {selectField('Water', 'water', ['', 'deep', 'shallow'],
+                            'deep = splash/bounce (swimmable with flippers); shallow = wading')}
+                        {selectField('Ledge', 'ledge', ['', 'down', 'right', 'left', 'up'],
+                            'One-way vault-over lip facing that direction')}
+                    </div>
+                    <div className="row">
+                        {checkField('cuttable', 'cuttable', 'Sword swings cut it (grass)')}
+                        {numberField('Cut result', entry.cut_result, v => patch('cut_result', v), 'Tile left after cutting')}
+                        {checkField('bombable', 'bombable', 'Bombs blast it open')}
+                        {numberField('Bomb result', entry.bomb_result, v => patch('bomb_result', v),
+                            'Tile left after blasting (255 = open hole)')}
+                    </div>
+                    <h2>Current / Conveyor</h2>
+                    <div className="row">
+                        {numberField('Push dx (px/s)', (entry.push || [])[0],
+                            v => patch('push', [v || 0, (entry.push || [])[1] || 0]),
+                            'Drift while standing on it (e.g. 48 = belt speed)')}
+                        {numberField('Push dy (px/s)', (entry.push || [])[1],
+                            v => patch('push', [(entry.push || [])[0] || 0, v || 0]))}
+                    </div>
+                    <h2>Hazard</h2>
+                    <div className="row">
+                        {numberField('Damage (half-hearts)', entry.damage, v => patch('damage', v),
+                            'Hurts on contact with knockback')}
+                    </div>
+                    <div className="row" style={{ marginTop: 16 }}>
+                        <button className="btn primary" onClick={save}>Save Tiles</button>
+                        <span className="dim">{status}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// World flags: the baked registry (names + where they came from), read
+// through the generator's tooling mode — the bake is the single authority
+// on flag ids, so this list is the reference view. Flags are referenced
+// by NAME everywhere in game data (dialogue, rooms, items), so renaming
+// one means renaming it in the source files — the pointers here say where.
+function FlagsTab() {
+    const [flags, setFlags] = useState(null);
+    const [error, setError] = useState('');
+    const [filter, setFilter] = useState('');
+
+    const load = useCallback(() => {
+        api('/api/list_flags').then(result => {
+            if (result.error) setError(result.error);
+            else { setError(''); setFlags(result); }
+        });
+    }, []);
+    useEffect(load, [load]);
+
+    if (error) {
+        return (
+            <div>
+                <h1>World Flags</h1>
+                <p className="fail">{error}</p>
+                <button className="btn" onClick={load}>Retry</button>
+            </div>
+        );
+    }
+
+    const shown = (flags || []).filter(f =>
+        !filter || f.name.toLowerCase().includes(filter.toLowerCase()));
+
+    return (
+        <div>
+            <h1>World Flags <span className="dim">{flags ? flags.length + ' registered' : 'loading…'}</span></h1>
+            <p className="dim">
+                The baked registry, in id order. Flags are referenced by name in dialogue files (if/unless/set/clear),
+                item upgrades, NPC presence conditions, and encounter conditions — engine-registered ones
+                (boss defeats, the crystal switch, shrine flags) are set by the engine at runtime.
+                Renaming a flag means renaming it everywhere it's referenced; ids are first-use order,
+                so <b>adding</b> new flags is safe while <b>reordering or deleting</b> existing ones invalidates saves.
+            </p>
+            <div className="row" style={{ margin: '10px 0' }}>
+                <input placeholder="filter…" value={filter} style={{ width: 180 }}
+                    onChange={e => setFilter(e.target.value)} />
+                <button className="btn" onClick={load}>Refresh</button>
+            </div>
+            {flags && (
+                <table className="flagTable" style={{ borderCollapse: 'collapse', minWidth: 480 }}>
+                    <thead>
+                        <tr>
+                            <th style={{ textAlign: 'left' }}>id</th>
+                            <th style={{ textAlign: 'left' }}>name</th>
+                            <th style={{ textAlign: 'left' }}>first registered by</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {shown.map((f, i) => (
+                            <tr key={f.name + i}>
+                                <td className="dim">{i}</td>
+                                <td><code>{f.name}</code></td>
+                                <td className="dim">{f.source || '(engine-registered)'}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            )}
         </div>
     );
 }
@@ -801,55 +2051,434 @@ function DialogueTab({ scan, refresh }) {
                 {error && <p className="fail">{error}</p>}
             </div>
             {dialogue
-                ? <DialogueEditor key={dialogue.file} dialogue={dialogue} onSaved={refresh} />
+                ? <DialogueEditor key={dialogue.file} dialogue={dialogue} scan={scan} onSaved={refresh} />
                 : <p className="dim">No dialogues.</p>}
         </div>
     );
 }
 
-function DialogueEditor({ dialogue, onSaved }) {
-    const rawLines = dialogue.data.lines || [];
-    const [lines, setLines] = useState(rawLines.map(l => (l && l.text != null) ? l.text : String(l ?? '')));
+// Dialogue scripting: a line's editable fields, structured (no raw JSON).
+// Plain strings normalize to { text }; the editor writes back only the
+// keys that are set, so unedited conventions survive.
+const normalizeLine = l =>
+    (l && typeof l === 'object') ? { ...l } : { text: String(l != null ? l : '') };
+const flagList = (entry, key) => (Array.isArray(entry[key]) ? entry[key].join(', ') : (entry[key] || ''));
+const parseFlagList = text => text.split(',').map(s => s.trim()).filter(Boolean);
+const NUM = v => (v === '' || v == null ? undefined : +v);
+
+function DialogueEditor({ dialogue, scan, onSaved }) {
+    const rawLines = (dialogue.data.lines || []).map(normalizeLine);
+    const [lines, setLines] = useState(rawLines);
+    const [meta, setMeta] = useState({
+        credits: !!(dialogue.data.credits),
+        next: dialogue.data.next || ''
+    });
+    const [open, setOpen] = useState(null);          // expanded line index
+    const [view, setView] = useState('lines');       // lines | tree
     const [status, setStatus] = useState('');
+    const [dirty, setDirty] = useState(false);
+
+    const labels = lines.map((l, i) => l.label ? [l.label, i] : null).filter(Boolean);
+    const patchLine = (i, mut) => {
+        setLines(prev => prev.map((l, j) => j === i ? mut(l) : l));
+        setDirty(true);
+    };
+    const setLine = (i, key, value) => patchLine(i, l => ({ ...l, [key]: value }));
+    const dropKey = (i, key) => patchLine(i, l => {
+        const copy = { ...l };
+        delete copy[key];
+        return copy;
+    });
+
+    const insertLine = (template, at) => {
+        const index = at != null ? at + 1 : lines.length;
+        setLines(prev => {
+            const copy = prev.slice();
+            copy.splice(index, 0, template);
+            return copy;
+        });
+        setOpen(index);
+        setDirty(true);
+    };
+    const removeLine = i => {
+        setLines(prev => prev.filter((_, j) => j !== i));
+        setDirty(true);
+    };
+    const moveLine = (i, dir) => {
+        const j = i + dir;
+        if (j < 0 || j >= lines.length) return;
+        setLines(prev => {
+            const copy = prev.slice();
+            const tmp = copy[i]; copy[i] = copy[j]; copy[j] = tmp;
+            return copy;
+        });
+        setDirty(true);
+    };
 
     const save = async () => {
-        // Keep script fields (label/if/unless/set/clear/sfx/music/goto/warp/
-        // choice) on lines the editor doesn't edit; only text is replaced.
-        const merged = lines.map((text, i) => ({
-            ...(typeof rawLines[i] === 'object' && rawLines[i] ? rawLines[i] : {}),
-            text: text != null ? text : ''
-        }));
+        // Write back only set keys — but "" is a real value for some fields
+        // (music "" stops the bgm), so only undefined/empty-array drops.
+        const clean = lines.map(l => {
+            const copy = {};
+            for (const [k, v] of Object.entries(l)) {
+                if (v === undefined) continue;
+                if (Array.isArray(v) && !v.length) continue;
+                copy[k] = v;
+            }
+            return copy;
+        });
         await api('/api/save', {
             path: 'resources/dialogue/' + dialogue.file,
             content: JSON.stringify({
                 ...(dialogue.data || {}),
-                lines: merged
+                credits: meta.credits || undefined,
+                next: meta.next || undefined,
+                lines: clean
             }, null, 4)
         });
+        setDirty(false);
         setStatus('Saved');
         onSaved();
     };
 
+    // ---- line summary (collapsed view): shared summaryBits below -------
+
     return (
-        <div style={{ flex: 1 }}>
-            <h1>{dialogue.file}</h1>
-            <h2>Lines</h2>
-            {lines.map((text, i) => (
-                <div className="row" key={i}>
-                    <span className="dim">{i + 1}.</span>
-                    <input style={{ flex: 1, minWidth: 300 }} value={text}
-                        onChange={e => setLines(prev => prev.map((t, j) => j === i ? e.target.value : t))} />
-                    <button className="delete" onClick={() => setLines(prev => prev.filter((_, j) => j !== i))}>×</button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+            <h1>{dialogue.file} {dirty && <span className="fail">(unsaved)</span>}</h1>
+            <div className="row" style={{ marginBottom: 8 }}>
+                <button className={'btn' + (view === 'lines' ? ' primary' : '')} onClick={() => setView('lines')}>Lines</button>
+                <button className={'btn' + (view === 'tree' ? ' primary' : '')} onClick={() => setView('tree')}>Branch tree</button>
+                <span className="toolbarSep" />
+                <label title="Endgame roll: centered auto-advancing lines over black">
+                    <input type="checkbox" checked={meta.credits}
+                        onChange={e => { setMeta(m => ({ ...m, credits: e.target.checked })); setDirty(true); }} /> credits</label>
+                <div className="field" title="Chain into this dialogue when this one runs out">
+                    <label>next</label>
+                    <select value={meta.next} onChange={e => { setMeta(m => ({ ...m, next: e.target.value })); setDirty(true); }}>
+                        <option value="">(none)</option>
+                        {scan.dialogues.filter(d => d.file !== dialogue.file).map(d =>
+                            <option key={d.file} value={d.file}>{d.file}</option>)}
+                    </select>
                 </div>
-            ))}
-            <div className="row" style={{ marginTop: 8 }}>
-                <button className="btn" onClick={() => setLines(prev => prev.concat(''))}>+ Line</button>
+                <span className="toolbarSep" />
                 <button className="btn primary" onClick={save}>Save</button>
                 <span className="dim">{status}</span>
             </div>
+
+            {view === 'tree' ? <DialogueTree lines={lines} labels={labels} /> : (
+                <div>
+                    <div className="row" style={{ marginBottom: 10 }}>
+                        <span className="dim">insert:</span>
+                        <button className="btn" onClick={() => insertLine({ text: '' })}>+ Text</button>
+                        <button className="btn" onClick={() => insertLine({ text: '', label: '' })}>+ Branch (label + goto)</button>
+                        <button className="btn" onClick={() => insertLine({ text: '', choice: [{ text: 'yes' }, { text: 'no' }] })}>+ Choice</button>
+                        <button className="btn" title="A silent beat: auto-advances after N seconds, no box"
+                            onClick={() => insertLine({ text: '', wait: 2 })}>+ Beat</button>
+                        <button className="btn" title="A cutscene cue: bars, camera pan, actor blocking"
+                            onClick={() => insertLine({ text: '', letterbox: true, camera: { pan: [0, 0], time: 1 }, wait: 2 })}>+ Cutscene</button>
+                    </div>
+
+                    {lines.map((line, i) => (
+                        <div key={i} className="encRow" style={{
+                            display: 'block', marginBottom: 6, padding: '6px 8px',
+                            border: open === i ? '2px solid #3b82f6' : '1px solid #3341553d',
+                            borderRadius: 6
+                        }}>
+                            <div className="row">
+                                <span className="dim" style={{ width: 22 }}>{i + 1}.</span>
+                                <span style={{ flex: 1, color: line.text ? '#e2e8f0' : '#64748b', fontStyle: line.text ? 'normal' : 'italic' }}>
+                                    {line.text ? line.text.slice(0, 60) + (line.text.length > 60 ? '…' : '') : '(no text)'}
+                                </span>
+                                {summaryBits(line).slice(0, 3).map((s, k) =>
+                                    <span key={k} className="chip dim" style={{ fontSize: 10 }}>{s}</span>)}
+                                <button className="tool" onClick={() => setOpen(open === i ? null : i)}>{open === i ? '▾' : '▸'}</button>
+                                <button className="tool" title="Move up" onClick={() => moveLine(i, -1)}>↑</button>
+                                <button className="tool" title="Move down" onClick={() => moveLine(i, 1)}>↓</button>
+                                <button className="delete" onClick={() => removeLine(i)}>×</button>
+                            </div>
+
+                            {open === i && (
+                                <div style={{ borderTop: '1px solid #3341553d', marginTop: 6, paddingTop: 8 }}>
+                                    <div className="field"><label>Text</label>
+                                        <input style={{ width: '100%' }} value={line.text || ''}
+                                            onChange={e => setLine(i, 'text', e.target.value)} />
+                                    </div>
+                                    <div className="row">
+                                        <div className="field"><label>Label <span className="dim">(goto target)</span></label>
+                                            <input value={line.label || ''} onChange={e => setLine(i, 'label', e.target.value || undefined)} />
+                                        </div>
+                                        <div className="field"><label>Go to label</label>
+                                            <select value={line.goto || ''} onChange={e => setLine(i, 'goto', e.target.value || undefined)}>
+                                                <option value="">(advance)</option>
+                                                {labels.filter(([lab]) => lab !== line.label).map(([lab]) =>
+                                                    <option key={lab} value={lab}>{lab}</option>)}
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div className="row">
+                                        <div className="field" title="Shown only while this flag holds"><label>if flag</label>
+                                            <input value={line.if || ''} onChange={e => setLine(i, 'if', e.target.value || undefined)} />
+                                        </div>
+                                        <div className="field" title="Shown unless this flag holds"><label>unless flag</label>
+                                            <input value={line.unless || ''} onChange={e => setLine(i, 'unless', e.target.value || undefined)} />
+                                        </div>
+                                        <div className="field" title="Flags set when the line shows (comma-separated)"><label>set flags</label>
+                                            <input value={flagList(line, 'set')} onChange={e => setLine(i, 'set', e.target.value ? parseFlagList(e.target.value) : undefined)} />
+                                        </div>
+                                        <div className="field" title="Flags cleared when the line shows"><label>clear flags</label>
+                                            <input value={flagList(line, 'clear')} onChange={e => setLine(i, 'clear', e.target.value ? parseFlagList(e.target.value) : undefined)} />
+                                        </div>
+                                    </div>
+                                    <div className="row">
+                                        <div className="field"><label>Sfx</label>
+                                            <select value={line.sfx || ''} onChange={e => setLine(i, 'sfx', e.target.value || undefined)}>
+                                                <option value="">(none)</option>
+                                                {scan.audio.map(a => <option key={a} value={a}>{a}</option>)}
+                                            </select>
+                                        </div>
+                                        <div className="field"><label>Music</label>
+                                            <select value={line.music == null ? '__keep' : (line.music === '' ? '__stop' : line.music)}
+                                                onChange={e => {
+                                                    const v = e.target.value;
+                                                    if (v === '__keep') dropKey(i, 'music');
+                                                    else setLine(i, 'music', v === '__stop' ? '' : v);
+                                                }}>
+                                                <option value="__keep">(keep playing)</option>
+                                                <option value="__stop">(stop the bgm)</option>
+                                                {scan.music.map(m => <option key={m} value={m}>{m}</option>)}
+                                            </select>
+                                        </div>
+                                        <div className="field"><label>Give item</label>
+                                            <select value={line.give || ''} onChange={e => setLine(i, 'give', e.target.value || undefined)}>
+                                                <option value="">(none)</option>
+                                                {scan.items.map(it => <option key={it.name} value={it.name}>{it.name}</option>)}
+                                            </select>
+                                        </div>
+                                        <div className="field" title="Auto-advance after N seconds; 0 = button-advance">
+                                            <label>Wait (s)</label>
+                                            <input type="number" value={line.wait != null ? line.wait : ''}
+                                                onChange={e => e.target.value === '' ? dropKey(i, 'wait') : setLine(i, 'wait', +e.target.value)} />
+                                        </div>
+                                    </div>
+                                    <div className="row">
+                                        <div className="field"><label>Warp to room</label>
+                                            <select value={(line.warp || {}).room || ''}
+                                                onChange={e => {
+                                                    const room = e.target.value;
+                                                    if (!room) { dropKey(i, 'warp'); return; }
+                                                    setLine(i, 'warp', { room, tile: (line.warp || {}).tile || [0, 0] });
+                                                }}>
+                                                <option value="">(no warp)</option>
+                                                {scan.rooms.map(r => <option key={r.file} value={r.file}>{stem(r.file)}</option>)}
+                                            </select>
+                                        </div>
+                                        {(line.warp || {}).room && <>
+                                            <div className="field"><label>tile x,y</label>
+                                                <input type="number" style={{ width: 56 }} value={(line.warp.tile || [])[0] || 0}
+                                                    onChange={e => setLine(i, 'warp', { ...line.warp, tile: [+e.target.value, (line.warp.tile || [])[1] || 0] })} />
+                                                <input type="number" style={{ width: 56 }} value={(line.warp.tile || [])[1] || 0}
+                                                    onChange={e => setLine(i, 'warp', { ...line.warp, tile: [(line.warp.tile || [])[0] || 0, +e.target.value] })} />
+                                            </div>
+                                        </>}
+                                    </div>
+
+                                    <div className="row">
+                                        <div className="field" title="Cinematic bars"><label>Letterbox</label>
+                                            <select value={line.letterbox == null ? '' : (line.letterbox ? 'on' : 'off')}
+                                                onChange={e => {
+                                                    if (e.target.value === '') dropKey(i, 'letterbox');
+                                                    else setLine(i, 'letterbox', e.target.value === 'on');
+                                                }}>
+                                                <option value="">(leave)</option>
+                                                <option value="on">on</option>
+                                                <option value="off">off</option>
+                                            </select>
+                                        </div>
+                                        <div className="field" title="Scripted camera"><label>Camera</label>
+                                            <select value={line.camera ? (line.camera.pan ? 'pan' : 'hero') : ''}
+                                                onChange={e => {
+                                                    if (e.target.value === '') dropKey(i, 'camera');
+                                                    else if (e.target.value === 'hero') setLine(i, 'camera', 'hero');
+                                                    else setLine(i, 'camera', { pan: (line.camera || {}).pan || [0, 0], time: (line.camera || {}).time || 1 });
+                                                }}>
+                                                <option value="">(follow hero)</option>
+                                                <option value="pan">pan to tile…</option>
+                                                <option value="hero">return to hero</option>
+                                            </select>
+                                        </div>
+                                        {(line.camera || {}).pan && <>
+                                            <div className="field"><label>pan x,y</label>
+                                                <input type="number" style={{ width: 56 }} value={(line.camera.pan || [])[0] || 0}
+                                                    onChange={e => setLine(i, 'camera', { ...line.camera, pan: [+e.target.value, (line.camera.pan || [])[1] || 0] })} />
+                                                <input type="number" style={{ width: 56 }} value={(line.camera.pan || [])[1] || 0}
+                                                    onChange={e => setLine(i, 'camera', { ...line.camera, pan: [(line.camera.pan || [])[0] || 0, +e.target.value] })} />
+                                            </div>
+                                            <div className="field"><label>time</label>
+                                                <input type="number" style={{ width: 56 }} value={(line.camera.time != null ? line.camera.time : 1)}
+                                                    onChange={e => setLine(i, 'camera', { ...line.camera, time: +e.target.value })} />
+                                            </div>
+                                        </>}
+                                    </div>
+                                    <div className="row">
+                                        <div className="field" title="Actor blocking: glide the hero or an npc to a tile">
+                                            <label>Move</label>
+                                            <select value={line.move ? String(line.move.actor) : ''}
+                                                onChange={e => {
+                                                    const v = e.target.value;
+                                                    if (v === '') { dropKey(i, 'move'); return; }
+                                                    setLine(i, 'move', { actor: v === 'hero' ? 'hero' : +v, tile: (line.move || {}).tile || [0, 0], time: (line.move || {}).time || 1 });
+                                                }}>
+                                                <option value="">(no blocking)</option>
+                                                <option value="hero">the hero</option>
+                                                {Array.from({ length: 8 }, (_, n) =>
+                                                    <option key={n} value={String(n)}>npc #{n}</option>)}
+                                            </select>
+                                        </div>
+                                        {line.move && <>
+                                            <div className="field"><label>to x,y</label>
+                                                <input type="number" style={{ width: 56 }} value={(line.move.tile || [])[0] || 0}
+                                                    onChange={e => setLine(i, 'move', { ...line.move, tile: [+e.target.value, (line.move.tile || [])[1] || 0] })} />
+                                                <input type="number" style={{ width: 56 }} value={(line.move.tile || [])[1] || 0}
+                                                    onChange={e => setLine(i, 'move', { ...line.move, tile: [(line.move.tile || [])[0] || 0, +e.target.value] })} />
+                                            </div>
+                                            <div className="field"><label>time</label>
+                                                <input type="number" style={{ width: 56 }} value={(line.move.time != null ? line.move.time : 1)}
+                                                    onChange={e => setLine(i, 'move', { ...line.move, time: +e.target.value })} />
+                                            </div>
+                                        </>}
+                                    </div>
+
+                                    <h2 style={{ marginTop: 8 }}>Choices <span className="dim">(action opens the list; the pick decides where the script goes)</span></h2>
+                                    {(line.choice || []).map((ch, ci) => (
+                                        <div className="row" key={ci} style={{ marginBottom: 4 }}>
+                                            <input placeholder="text" style={{ width: 120 }} value={ch.text || ''}
+                                                onChange={e => setLine(i, 'choice', line.choice.map((c, j) => j === ci ? { ...c, text: e.target.value } : c))} />
+                                            <div className="field" title="Jump to this label on pick"><label>goto</label>
+                                                <select value={ch.goto || ''} onChange={e => setLine(i, 'choice', line.choice.map((c, j) =>
+                                                    j === ci ? { ...c, goto: e.target.value || undefined } : c))}>
+                                                    <option value="">(advance)</option>
+                                                    {labels.map(([lab]) => <option key={lab} value={lab}>{lab}</option>)}
+                                                </select>
+                                            </div>
+                                            <div className="field" title="Shop pick: deducts rupees"><label>cost</label>
+                                                <input type="number" style={{ width: 56 }} value={ch.cost || ''}
+                                                    onChange={e => setLine(i, 'choice', line.choice.map((c, j) =>
+                                                        j === ci ? { ...c, cost: NUM(e.target.value) } : c))} />
+                                            </div>
+                                            <div className="field" title="Grant this item on pick"><label>give</label>
+                                                <select value={ch.give || ''} onChange={e => setLine(i, 'choice', line.choice.map((c, j) =>
+                                                    j === ci ? { ...c, give: e.target.value || undefined } : c))}>
+                                                    <option value="">(none)</option>
+                                                    {scan.items.map(it => <option key={it.name} value={it.name}>{it.name}</option>)}
+                                                </select>
+                                            </div>
+                                            <button className="delete" onClick={() => setLine(i, 'choice', line.choice.filter((_, j) => j !== ci))}>×</button>
+                                        </div>
+                                    ))}
+                                    <div className="row">
+                                        <button className="btn" onClick={() => setLine(i, 'choice', [...(line.choice || []), { text: '' }])}>+ Choice</button>
+                                        {line.choice && line.choice.length > 0 &&
+                                            <button className="btn" onClick={() => dropKey(i, 'choice')}>Remove choices</button>}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
         </div>
     );
 }
+
+// Branch/choice tree: a read-only control-flow map of the script. Nodes
+// stack vertically in line order; edges show the flow — default advance
+// (gray), goto jumps (blue), choice splits (orange, one per option).
+function DialogueTree({ lines, labels }) {
+    const NODE_H = 54, NODE_W = 300, GAP = 10, X = 130;
+    const height = lines.length * (NODE_H + GAP) + 20;
+    const labelIndex = Object.fromEntries(labels);
+    const nodeY = i => 10 + i * (NODE_H + GAP);
+
+    const edges = [];
+    lines.forEach((line, i) => {
+        const y = nodeY(i);
+        if (line.choice && line.choice.length) {
+            (line.choice).forEach((ch, ci) => {
+                const target = ch.goto != null ? labelIndex[ch.goto] : i + 1;
+                edges.push([i, target == null ? null : target, '#f97316',
+                    (ch.text || 'option ' + (ci + 1)).slice(0, 18)]);
+            });
+        } else if (line.goto != null) {
+            const target = labelIndex[line.goto];
+            edges.push([i, target == null ? null : target, '#3b82f6', 'goto ' + line.goto]);
+        } else if (i + 1 < lines.length) {
+            edges.push([i, i + 1, '#475569', null]);
+        }
+    });
+
+    return (
+        <div className="scrollWrap" style={{ flex: 1 }}>
+            <svg width={NODE_W + 260} height={height} style={{ display: 'block' }}>
+                <defs>
+                    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" />
+                    </marker>
+                </defs>
+                {edges.map(([from, to, color, label], k) => {
+                    if (to == null) return null;
+                    const y0 = nodeY(from) + NODE_H / 2;
+                    const y1 = nodeY(to) + NODE_H / 2;
+                    const bend = to <= from ? -40 : 0;   // loops bend back
+                    const d = `M ${X} ${y0} C ${X - 90 + bend} ${y0}, ${X - 90 + bend} ${y1}, ${X} ${y1}`;
+                    return (
+                        <g key={k}>
+                            <path d={d} fill="none" stroke={color} strokeWidth={2} markerEnd="url(#arrow)" opacity={to <= from ? 0.9 : 0.55} />
+                            {label && to <= from && (
+                                <text x={X - 100 + bend} y={(y0 + y1) / 2} fill="#94a3b8" fontSize={10} textAnchor="end">{label}</text>
+                            )}
+                        </g>
+                    );
+                })}
+                {lines.map((line, i) => {
+                    const y = nodeY(i);
+                    const bits = summaryBits(line);
+                    return (
+                        <g key={i}>
+                            <rect x={X} y={y} width={NODE_W} height={NODE_H} rx={6}
+                                fill={line.choice ? '#7c2d12' : '#1e293b'} stroke="#475569" strokeWidth={1.5} />
+                            <text x={X + 10} y={y + 20} fill="#e2e8f0" fontSize={12} fontWeight="bold">
+                                {i + 1}. {line.label ? <tspan fill="#3b82f6">[{line.label}] </tspan> : null}
+                                {(line.text || '(no text)').slice(0, 34)}
+                            </text>
+                            <text x={X + 10} y={y + 38} fill="#94a3b8" fontSize={10}>
+                                {bits.slice(0, 5).join(' · ')}
+                            </text>
+                        </g>
+                    );
+                })}
+            </svg>
+        </div>
+    );
+}
+const summaryBits = line => {
+    const bits = [];
+    if (line.choice) bits.push(line.choice.length + ' choices');
+    if (line.goto) bits.push('goto ' + line.goto);
+    if (line.if) bits.push('if ' + line.if);
+    if (line.unless) bits.push('unless ' + line.unless);
+    if (line.wait != null) bits.push('beat ' + line.wait + 's');
+    if (line.camera) bits.push('camera');
+    if (line.letterbox != null) bits.push('bars');
+    if (line.move) bits.push('blocking');
+    if (line.warp) bits.push('warp');
+    if (line.music != null) bits.push('music');
+    if (line.sfx) bits.push('sfx');
+    if (line.give) bits.push('give');
+    if (line.set) bits.push('set ' + line.set.join(','));
+    if (line.clear) bits.push('clear ' + line.clear.join(','));
+    return bits;
+};
 
 function CharactersTab({ scan, refresh }) {
     const confirm = useConfirm();
@@ -1253,12 +2882,45 @@ function FilesTab({ scan, refresh }) {
     );
 }
 
-function BuildTab({ scan }) {
+function GameIdentity({ scan, onSaved }) {
+    const [data, setData] = useState(scan.game || { title: '', slug: '' });
+    const [status, setStatus] = useState('');
+    const [dirty, setDirty] = useState(false);
+
+    const save = async () => {
+        await api('/api/save', {
+            path: 'resources/game.json',
+            content: JSON.stringify(data, null, 4)
+        });
+        setDirty(false);
+        setStatus('Saved');
+        onSaved();
+    };
+
+    return (
+        <div className="panel" style={{ maxWidth: 480 }}>
+            <h2>Game Identity {dirty && <span className="fail">(unsaved)</span>}</h2>
+            <div className="field"><label>Title</label>
+                <input value={data.title || ''} onChange={e => { setData(prev => ({ ...prev, title: e.target.value })); setDirty(true); }} />
+            </div>
+            <div className="field"><label>Slug <span className="dim">(save identity — changing it orphans existing saves)</span></label>
+                <input value={data.slug || ''} onChange={e => { setData(prev => ({ ...prev, slug: e.target.value })); setDirty(true); }} />
+            </div>
+            <div className="row">
+                <button className="btn" onClick={save}>Save</button>
+                <span className="dim">{status}</span>
+            </div>
+        </div>
+    );
+}
+
+function BuildTab({ scan, refresh }) {
     const [state, setState] = useState({ running: false, output: '', ok: null });
     const isMac = scan.platform === 'darwin';
+    const script = isMac ? './build-mac.sh' : './build-web.sh';
 
     const run = async () => {
-        setState({ running: true, output: 'Running ./build-mac.sh ...', ok: null });
+        setState({ running: true, output: 'Running ' + script + ' ...', ok: null });
         const result = await api('/api/build');
         setState({ running: false, output: (result.output || '') + (result.error ? '\n' + result.error : ''), ok: result.ok });
     };
@@ -1267,12 +2929,15 @@ function BuildTab({ scan }) {
         <div>
             <h1>Build</h1>
             <p className="dim">Runs the generator and compiles the game. Platform: {scan.platform}.</p>
-            <button className="btn primary" onClick={run} disabled={state.running || !isMac}>
-                {state.running ? 'Building…' : 'Run ./build-mac.sh'}
+            <button className="btn primary" onClick={run} disabled={state.running}>
+                {state.running ? 'Building…' : 'Run ' + script}
             </button>
-            {!isMac && <p className="fail">build-mac.sh only runs on Mac.</p>}
+            {!isMac && <p className="dim">Non-Mac hosts build the web package (needs emcc on PATH; its errors show below).</p>}
             {state.ok === false && <p className="fail">Build failed.</p>}
             {state.output && <pre className="build">{state.output}</pre>}
+            <div style={{ marginTop: 20 }}>
+                <GameIdentity scan={scan} onSaved={refresh} />
+            </div>
         </div>
     );
 }

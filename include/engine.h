@@ -75,6 +75,21 @@ struct DialogueLine
     int giveItem;           // item id granted when shown, -1 = none
     int choiceCount;
     const DialogueChoice* choices;
+    // Cutscene vocabulary: beat holds, scripted camera, letterbox, actor
+    // blocking. The engine interprets; scripts compose them like any
+    // other shown-effect (they queue on the line and drain in the game).
+    float waitSeconds;      // 0 = button-advance; >0 = auto-advance once
+                             // the reveal completes (a silent beat when
+                             // the line carries no text)
+    int camAction;          // 0 = none, 1 = pan to tile, 2 = back to hero
+    int camTileX;
+    int camTileY;
+    float camSeconds;       // pan duration
+    int letterbox;          // -1 = leave as-is, 0 = bars off, 1 = bars on
+    int moveActor;          // -1 = none, -2 = the hero, else room npc index
+    int moveTileX;
+    int moveTileY;
+    float moveSeconds;      // blocking glide duration
 };
 
 struct Dialogue
@@ -82,6 +97,11 @@ struct Dialogue
     const char* name;
     int lineCount;
     const DialogueLine* lines;
+    bool credits;        // endgame roll: centered lines over black that
+                         // auto-advance (a wait on a line overrides the
+                         // default beat)
+    int nextDialogue;    // chain into this dialogue when it runs out,
+                          // -1 = none (a warp line still wins over it)
 };
 
 struct Encounter
@@ -91,6 +111,8 @@ struct Encounter
     int dialogue;
     int id;
     bool repeat;
+    int ifFlag;      // story-flag conditions: fires only while they hold
+    int unlessFlag;  // (a condition that fails never consumes the shot)
 };
 
 // Enemy component vocabulary. The engine interprets these parameters
@@ -135,6 +157,8 @@ struct EnemyConfig
     bool miniBoss;          // mid-fight: seals the room + health bar, room-local death
     bool strikeImmune;      // direct hero strikes (sword/spin/dash/hammer)
                             // bounce off — only projectile hits land
+    bool catchable;         // net-catchable critter (bees): the bug net
+                            // bottles it instead of agitating it
     const char* customBehavior; // gamecode "custom:<name>" behavior, 0 = none
     const DropEntry* drops; // per-enemy drop table, 0 = engine default
     int dropCount;
@@ -183,6 +207,10 @@ constexpr unsigned OBJINT_HOOKABLE = 0x800000; // hookshot latch: the chain grab
                                               // and reels the hero in
 constexpr unsigned OBJINT_POWDER = 0x1000000; // magic powder awakens it (aux2 = the
                                               // world flag the sprinkle sets)
+constexpr unsigned OBJINT_STAIR = 0x2000000;  // staircase: step-on warp down/up a
+                                              // room layer, with the stair cue
+                                              // (aux payloads like warp: room,
+                                              // tile x, tile y)
 
 struct ObjectConfig
 {
@@ -222,6 +250,7 @@ constexpr int GRANTEFFECT_ADD_HEARTS = 5;   // heart container: max +1 heart
 constexpr int GRANTEFFECT_ADD_SMALL_KEY = 6;
 constexpr int GRANTEFFECT_ADD_BIG_KEY = 7;
 constexpr int GRANTEFFECT_SET_FLAG = 8;     // story flag set (param = flag index)
+constexpr int GRANTEFFECT_GIVE_BOTTLE = 9;  // bottle slot (param = starting contents)
 
 // Grant rule: the engine applies `effect` (with param = item index or
 // amount), shows the item-get rise with `pickupFrame` (pickups sheet
@@ -292,6 +321,8 @@ struct RoomConfig
     const char* music;
     const char* walkSfx;
     const char* ambient;   // streamed, looping room ambience (birds, rain)
+    const char* dangerMusic; // alternate track crossfaded in while an
+                             // arena fight (boss/mini-boss) lives
     const Encounter* instant;
     int instantCount;
     const Encounter* interactive;
@@ -329,6 +360,18 @@ struct RoomConfig
     int exitSouth;   // walking down off the bottom
     int exitEast;    // walking right off the right
     int exitWest;    // walking left off the left
+    // Dungeon treatment: defeated spawns stay dead across re-entries
+    // (session-lifetime), while overworld rooms respawn on every visit.
+    bool dungeon;
+    // Pit-landing: falling into a pit tile warps here (room index + tile)
+    // instead of the safe-tile respawn, -1 = the usual respawn.
+    int pitRoom;
+    int pitTileX;
+    int pitTileY;
+    // Parallel-world pair (the mirror): using the mirror warps between
+    // paired rooms at the hero's tile. Declared on either side; the
+    // generator bakes the reciprocal. -1 = no pair.
+    int mirrorRoom;
 };
 
 struct TilesetConfig
@@ -524,6 +567,10 @@ constexpr int ITEM_USE_CAPE = 10;      // toggle cloak: invisible + intangible w
 constexpr int ITEM_USE_SOMARIA = 11;   // toggle block: spawns/removes the linked block type
 constexpr int ITEM_USE_POWDER = 12;    // sprinkle: stuns, lights torches, awakens shrines
 constexpr int ITEM_USE_FLUTE = 13;     // bird-summon fast travel to visited rooms
+constexpr int ITEM_USE_NET = 14;       // bug net: catches fairies/bees, agitates enemies
+constexpr int ITEM_USE_BOTTLE = 15;    // bottle: fill at water, use the carried contents
+constexpr int ITEM_USE_MIRROR = 16;    // reflection: warp to this room's
+                                       // parallel-world pair (dark world)
 
 // Projectile elements (rods, future medallions).
 constexpr int ELEMENT_NONE = 0;
@@ -566,7 +613,7 @@ struct ItemConfig
 // Process-lifetime until the save system lands.
 struct Inventory
 {
-    static const int MAX_ITEMS = 20;
+    static const int MAX_ITEMS = 24;
 
     int equippedItem;    // game-defined item id or -1 (empty hands)
     bool owned[MAX_ITEMS];
@@ -582,15 +629,67 @@ struct Inventory
     int smallKeys;   // per-dungeon keys pending the dungeon system
     int bigKeys;
 
+    // Bottles (LttP): up to four slots, one thing each. The bottle item
+    // uses the first filled slot (or fills the first empty one at water).
+    static const int BOTTLE_MAX = 4;
+    static const int BOTTLE_EMPTY = 0;
+    static const int BOTTLE_WATER = 1;        // fairy-fountain water: 1 heart
+    static const int BOTTLE_POTION_RED = 2;   // hearts refill
+    static const int BOTTLE_POTION_GREEN = 3; // magic refill
+    static const int BOTTLE_POTION_BLUE = 4;  // hearts + magic refill
+    static const int BOTTLE_FAIRY = 5;        // releases: full refill, on the wing
+    static const int BOTTLE_BEE = 6;         // releases: the bee simply leaves
+    int bottles;                             // owned bottle slots (0..BOTTLE_MAX)
+    int bottleContents[BOTTLE_MAX];
+
     Inventory()
         : equippedItem(-1), rupees(0), rupeeMax(99),
           arrows(0), arrowsMax(10), bombs(0), bombsMax(10),
-          magic(0), magicMax(16), smallKeys(0), bigKeys(0)
+          magic(0), magicMax(16), smallKeys(0), bigKeys(0), bottles(0)
     {
         for (int i = 0; i < MAX_ITEMS; i++) owned[i] = false;
+        for (int i = 0; i < BOTTLE_MAX; i++) bottleContents[i] = BOTTLE_EMPTY;
     }
 
     void give(int item) { if (item >= 0 && item < MAX_ITEMS) owned[item] = true; }
+    // Grants a bottle slot (with starting contents); first empty slot
+    // wins, a full set ignores it. True when the bottle landed.
+    bool giveBottle(int contents)
+    {
+        if (bottles >= BOTTLE_MAX) return false;
+        bottles++;
+        for (int i = 0; i < BOTTLE_MAX; i++)
+        {
+            if (bottleContents[i] == BOTTLE_EMPTY)
+            {
+                bottleContents[i] = contents;
+                break;
+            }
+        }
+        return true;
+    }
+    // First slot carrying something (contents out through the ref), -1 if
+    // every bottle is empty.
+    int firstFilledBottle(int& contents) const
+    {
+        for (int i = 0; i < BOTTLE_MAX; i++)
+        {
+            if (bottleContents[i] != BOTTLE_EMPTY)
+            {
+                contents = bottleContents[i];
+                return i;
+            }
+        }
+        contents = BOTTLE_EMPTY;
+        return -1;
+    }
+    // First empty slot (-1 when all full) — filling water/catches.
+    int firstEmptyBottle() const
+    {
+        for (int i = 0; i < BOTTLE_MAX; i++)
+            if (bottleContents[i] == BOTTLE_EMPTY) return i;
+        return -1;
+    }
     void addRupees(int amount)
     {
         rupees += amount;

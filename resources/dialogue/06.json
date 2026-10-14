@@ -1,0 +1,32 @@
+{
+    "lines": [
+        {
+            "letterbox": true,
+            "music": "",
+            "sfx": "ganon's tower opens.wav",
+            "camera": { "pan": [12, 6], "time": 2.0 },
+            "wait": 2.4
+        },
+        {
+            "camera": { "pan": [8, 8], "time": 1.6 },
+            "wait": 1.8
+        },
+        {
+            "move": { "actor": "hero", "tile": [8, 8], "time": 1.4 },
+            "wait": 1.8
+        },
+        {
+            "text": "The wizard has fallen...",
+            "wait": 2.6
+        },
+        {
+            "text": "Light returns to the valley.",
+            "wait": 2.4
+        },
+        {
+            "text": "But every ending is a beginning.",
+            "wait": 2.6
+        }
+    ],
+    "next": "07.json"
+}

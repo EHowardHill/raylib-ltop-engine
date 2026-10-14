@@ -14,7 +14,11 @@ import sys
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RES = os.path.join(ROOT, "resources")
+# The game folder: the repo's own resources/ by default, or any other
+# game folder via LTOP_GAME (the editor sets it when the open project is
+# a new game folder rather than the engine repo — a new resources folder
+# is a new game).
+RES = os.environ.get("LTOP_GAME") or os.path.join(ROOT, "resources")
 ASSETS = os.path.join(ROOT, "assets")
 INCLUDE_AUTO = os.path.join(ROOT, "include_auto")
 SRC_AUTO = os.path.join(ROOT, "src_auto")
@@ -28,7 +32,7 @@ def res(*parts):
 
 
 def warn(message):
-    print("warning: %s" % message)
+    print("warning: %s" % message, file=sys.stderr)
 
 
 def cstr(text):
@@ -72,12 +76,14 @@ class FlagRegistry:
 
     def __init__(self):
         self.names = []
+        self.sources = {}  # name -> first file that introduced it (tooling)
 
-    def index(self, name):
+    def index(self, name, source=""):
         name = str(name)
         if name in self.names:
             return self.names.index(name)
         self.names.append(name)
+        self.sources[name] = str(source)
         return len(self.names) - 1
 
 
@@ -89,8 +95,14 @@ def load_dialogues(flags):
        "set": [<flags>], "clear": [<flags>], "sfx": "<file>",
        "music": "<file>"|"", "goto": "<label>",
        "warp": {"room": "<room>", "tile": [x, y]},
+       "wait": <seconds>                       # cutscene beat: auto-advance
+       "camera": {"pan": [tileX, tileY], "time": <s>} | "hero"
+       "letterbox": true|false                  # cinematic bars
+       "move": {"actor": "hero"|<npc index>, "tile": [x, y], "time": <s>}
        "choice": [{"text": ..., "set": [...], "clear": [...], "sfx": ...,
-                   "give": <item>, "cost": <rupees>, "goto": ...}, ...]}"""
+                   "give": <item>, "cost": <rupees>, "goto": ...}, ...]}
+    Dialogue-level keys: "credits": true (endgame roll: centered lines over
+    black, auto-advancing), "next": "<dialogue>" (chain when it runs out)."""
     dialogues = []
     directory = res("dialogue")
     if not os.path.isdir(directory):
@@ -104,7 +116,7 @@ def load_dialogues(flags):
         def flag(value, what):
             if value is None or value == "":
                 return -1
-            return flags.index(value)
+            return flags.index(value, "dialogue/%s" % filename)
 
         def item(value, what):
             if value is None or value == "":
@@ -120,7 +132,7 @@ def load_dialogues(flags):
                 return []
             if isinstance(values, (str, int, float)):
                 values = [values]
-            return [flags.index(v) for v in values]
+            return [flags.index(v, "dialogue/%s" % filename) for v in values]
 
         lines = []
         for entry in data.get("lines") or []:
@@ -132,6 +144,50 @@ def load_dialogues(flags):
             if isinstance(entry.get("warp"), dict):
                 warp_room = str(entry["warp"].get("room") or "")
                 tile = entry["warp"].get("tile") or [0, 0]
+
+            # Cutscene vocabulary: beat hold, camera pan/return, bars,
+            # actor blocking (hero or a room npc index).
+            try:
+                wait_seconds = max(0.0, float(entry.get("wait") or 0))
+            except (TypeError, ValueError):
+                warn("dialogue '%s' has a bad wait %r" % (filename, entry.get("wait")))
+                wait_seconds = 0.0
+            cam_action = 0
+            cam_tile = [0, 0]
+            cam_seconds = 0.0
+            camera = entry.get("camera")
+            if camera == "hero" or camera == "follow":
+                cam_action = 2
+            elif isinstance(camera, dict):
+                cam_action = 1
+                cam_tile = camera.get("pan") or [0, 0]
+                try:
+                    cam_seconds = max(0.0, float(camera.get("time") or 1.0))
+                except (TypeError, ValueError):
+                    cam_seconds = 1.0
+            letterbox = -1
+            if entry.get("letterbox") is not None:
+                letterbox = 1 if entry.get("letterbox") else 0
+            move_actor = -1
+            move_tile = [0, 0]
+            move_seconds = 0.0
+            move = entry.get("move")
+            if isinstance(move, dict):
+                actor = move.get("actor")
+                if actor == "hero":
+                    move_actor = -2
+                else:
+                    try:
+                        move_actor = int(actor)
+                    except (TypeError, ValueError):
+                        warn("dialogue '%s' move has a bad actor %r"
+                             % (filename, actor))
+                        move_actor = -1
+                move_tile = move.get("tile") or [0, 0]
+                try:
+                    move_seconds = max(0.0, float(move.get("time") or 1.0))
+                except (TypeError, ValueError):
+                    move_seconds = 1.0
 
             choices = []
             for opt in entry.get("choice") or []:
@@ -168,6 +224,16 @@ def load_dialogues(flags):
                 "goto": entry.get("goto"),
                 "warpRoom": warp_room,
                 "warpTile": tile,
+                "wait": wait_seconds,
+                "camAction": cam_action,
+                "camTileX": int(cam_tile[0]),
+                "camTileY": int(cam_tile[1]),
+                "camSeconds": cam_seconds,
+                "letterbox": letterbox,
+                "moveActor": move_actor,
+                "moveTileX": int(move_tile[0]),
+                "moveTileY": int(move_tile[1]),
+                "moveSeconds": move_seconds,
                 "choices": choices,
             })
 
@@ -196,7 +262,10 @@ def load_dialogues(flags):
                     choice["gotoLine"] = -1
             line.pop("label")
 
-        dialogues.append({"name": filename, "lines": lines})
+        dialogues.append({"name": filename, "lines": lines,
+                          "credits": bool(data.get("credits", False)),
+                          # Resolved to an index once every dialogue loads.
+                          "next": str(data.get("next") or "")})
     return dialogues
 
 
@@ -289,7 +358,7 @@ def load_game():
 ITEM_USE_KINDS = {"none": 0, "boomerang": 1, "arrow": 2, "bomb": 3, "bolt": 4,
                   "hammer": 5, "shovel": 6, "hookshot": 7, "medallion": 8,
                   "byrna": 9, "cape": 10, "somaria": 11, "powder": 12,
-                  "flute": 13}
+                  "flute": 13, "net": 14, "bottle": 15, "mirror": 16}
 ELEMENTS = {"none": 0, "fire": 1, "ice": 2}
 
 # Room weather vocabulary (engine WEATHER_* constants).
@@ -406,8 +475,8 @@ def load_items():
             "upgradeDamage": upgrade_damage,
             "spawnObjectName": spawn_object_name,
         })
-    if len(items) > 20:
-        warn("%d items exceed the inventory slots (20); the extras are"
+    if len(items) > 24:
+        warn("%d items exceed the inventory slots (24); the extras are"
              " unreachable" % len(items))
     return items
 
@@ -446,6 +515,7 @@ OBJINT_NAMES = {
     "platform": 0x400000,  # moving platform ("path" = tile waypoints, looped)
     "hookable": 0x800000,  # hookshot latch: the chain grabs it and reels the hero in
     "powder": 0x1000000,   # magic powder awakens it (aux2 = story flag to set)
+    "stair": 0x2000000,    # staircase ("warp" aux payloads; step-on layer warp)
 }
 
 # Baseline type set, used when the game ships no types.json (a fresh game
@@ -460,6 +530,7 @@ DEFAULT_OBJECT_TYPES = [
     {"name": "chest", "interactions": ["solid", "chest", "two_frame"]},
     {"name": "torch", "interactions": ["solid", "torch"]},
     {"name": "warp", "interactions": ["floor", "warp"]},
+    {"name": "stair", "interactions": ["floor", "stair"]},
     {"name": "crystal", "interactions": ["solid", "crystal"]},
     {"name": "rock", "interactions": ["solid", "hammer_smash"]},
     {"name": "big_rock", "interactions": ["solid", "liftable", "heavy"]},
@@ -481,8 +552,19 @@ def load_object_types():
     global OBJECT_TYPES
     path = res("objects", "types.json")
     if not os.path.exists(path):
-        return [{"image": t["name"] + ".png", "interactions": list(t["interactions"])}
-                for t in DEFAULT_OBJECT_TYPES]
+        types = []
+        for t in DEFAULT_OBJECT_TYPES:
+            mask = 0
+            for interaction in t["interactions"]:
+                mask |= OBJINT_NAMES.get(interaction, 0)
+            types.append({
+                "name": t["name"],
+                "image": t["name"] + ".png",
+                "interactions": list(t["interactions"]),
+                "interactionsMask": mask,
+            })
+        OBJECT_TYPES = types
+        return types
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     types = []
@@ -562,6 +644,16 @@ GRANT_KIND_DEFS = [
      "text": "You got a small key!"},
     {"name": "big_key", "effect": 7, "pickup": -1,
      "text": "You got the big key! It opens the biggest chest."},
+    # Bottles: a slot each (aux3 = starting contents, engine vocabulary).
+    # The decanter frame doubles as the bottle rise visual.
+    {"name": "bottle", "effect": 9, "pickup": 6,
+     "text": "You got a bottle! Fill it with water or catch something!"},
+    {"name": "potion_red", "effect": 9, "pickup": 6,
+     "text": "You got a bottle of red potion! It refills your hearts!"},
+    {"name": "potion_green", "effect": 9, "pickup": 6,
+     "text": "You got a bottle of green potion! It refills your magic!"},
+    {"name": "potion_blue", "effect": 9, "pickup": 6,
+     "text": "You got a bottle of blue potion! Hearts and magic, both restored!"},
 ]
 GRANT_KINDS = {entry["name"]: i for i, entry in enumerate(GRANT_KIND_DEFS)}
 
@@ -620,7 +712,7 @@ def enemy_components(name, stats, manifest):
         "charge_sight": 0.0, "charge_scale": 0.0, "charge_stun": False,
         "shoot_period": 0, "walk_segment": 0.0, "turn_in_place": False,
         "phases": [], "boss": False, "mini_boss": False,
-        "strike_immune": False, "custom": None,
+        "strike_immune": False, "catchable": False, "custom": None,
     }
     behavior = str(stats.get("behavior") or "")
     sight = int(stats.get("sight") or 0)
@@ -676,6 +768,9 @@ def enemy_components(name, stats, manifest):
         # Reflectable-magic bosses: direct hero strikes bounce off;
         # only projectile hits (deflected volleys) land.
         comps["strike_immune"] = bool(explicit["strike_immune"])
+    if "catchable" in explicit:
+        # Net-catchable critter (bees): the bug net bottles it.
+        comps["catchable"] = bool(explicit["catchable"])
     phases = explicit.get("phases")
     if isinstance(phases, list) and phases:
         table = []
@@ -694,6 +789,13 @@ def enemy_components(name, stats, manifest):
     # "boss": true stat shortcut (kept for compatibility).
     if stats.get("boss"):
         comps["boss"] = True
+    # "mini_boss": true stat shortcut (mid-fight: seals + health bar, but
+    # its defeat stays room/session-local instead of banking).
+    if stats.get("mini_boss"):
+        comps["mini_boss"] = True
+    # "catchable": true stat shortcut (same deal).
+    if stats.get("catchable"):
+        comps["catchable"] = True
 
     if comps["custom"] and comps["custom"] not in manifest:
         warn("enemy '%s' references custom behavior '%s' that is not in"
@@ -782,6 +884,7 @@ def load_enemies(manifest):
             "boss": comps["boss"],
             "miniBoss": comps["mini_boss"],
             "strikeImmune": comps["strike_immune"],
+            "catchable": comps["catchable"],
             "custom": comps["custom"],
             "drops": drops,
             "color": [int(max(0, min(255, c))) for c in color],
@@ -1003,8 +1106,12 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
                     if index < 0:
                         warn("room '%s' references unknown dialogue '%s'" % (stem, dialogue_name))
                 repeat = bool(entry.get("repeat", False))
+                # Story-flag conditions (e.g. a post-boss endgame trigger),
+                # stored raw and resolved with the flag registry below.
                 encounters.append({"x": int(location[0]), "y": int(location[1]),
-                                   "dialogue": index, "repeat": repeat})
+                                   "dialogue": index, "repeat": repeat,
+                                   "ifFlag": entry.get("if"),
+                                   "unlessFlag": entry.get("unless")})
             return encounters
 
         enemies = []
@@ -1108,9 +1215,10 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
                     if aux1 < 0:
                         warn("room '%s' object hides unknown enemy '%s'"
                              % (stem, hides_name))
-            if mask & OBJINT_NAMES["warp"]:
+            if (mask & OBJINT_NAMES["warp"]) or (mask & OBJINT_NAMES["stair"]):
                 # "warp": {"room": ..., "tile": [x, y]} — the room resolves
                 # to a ROOMS[] index once every room is loaded (aux1).
+                # Stair objects carry the same payload shape.
                 warp_spec = entry.get("warp") or {}
                 warp_room_raw = str(warp_spec.get("room") or "")
                 tile = warp_spec.get("tile") or [0, 0]
@@ -1149,6 +1257,14 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
                             warn("room '%s' chest grants a flag without a"
                                  " registry" % stem)
                             aux3 = -1
+                    if grant_kind == "bottle":
+                        aux3 = 0  # empty
+                    if grant_kind == "potion_red":
+                        aux3 = 2
+                    if grant_kind == "potion_green":
+                        aux3 = 3
+                    if grant_kind == "potion_blue":
+                        aux3 = 4
             objects.append({"x": int(location[0]), "y": int(location[1]),
                             "type": index, "aux1": aux1, "aux2": aux2, "aux3": aux3,
                             "path": obj_path,
@@ -1265,6 +1381,8 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
             "spawnY": int(spawn[1]) if has_spawn else 0,
             "music": default.get("music") or None,
             "walkSfx": default.get("walk_sfx") or None,
+            # Danger layer: crossfaded in while an arena fight lives.
+            "dangerMusic": default.get("danger_music") or None,
             "ambient": default.get("ambient") or None,
             "instant": encounter_list("instant"),
             "interactive": encounter_list("interactive"),
@@ -1278,7 +1396,8 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
                             for o in objects) if objects else False,
             # Boss defeat banks a story flag ("boss_defeated_<stem>") so
             # dialogue can branch on the victory — same flag registry.
-            "bossFlag": (flags.index("boss_defeated_%s" % stem)
+            "bossFlag": (flags.index("boss_defeated_%s" % stem,
+                                      "rooms/%s.json (boss)" % stem)
                          if (room_has_boss and flags is not None) else -1),
             "npcSpawns": npc_spawns,
             "dark": bool(data.get("dark", False)),
@@ -1286,6 +1405,17 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
             "tintR": tint_r,
             "tintG": tint_g,
             "tintB": tint_b,
+            # Dungeon treatment: defeated spawns stay dead across
+            # re-entries (session-lifetime); overworld rooms respawn.
+            "dungeon": bool(data.get("dungeon", False)),
+            # Pit-landing: falling into a pit tile warps here instead of
+            # the safe-tile respawn. Raw room name until rooms resolve.
+            "pitRoomRaw": (data.get("pit") or {}).get("room"),
+            "pitTileX": int(((data.get("pit") or {}).get("tile") or [0, 0])[0]),
+            "pitTileY": int(((data.get("pit") or {}).get("tile") or [0, 0])[1]),
+            # Parallel-world pair (the mirror): declared on either side
+            # ("mirror": "07.json"); the reciprocal bakes automatically.
+            "mirrorRoomRaw": data.get("mirror"),
             "doorN": doors.get("north", -1),
             "doorS": doors.get("south", -1),
             "doorE": doors.get("east", -1),
@@ -1340,6 +1470,42 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
         room["exitS"] = resolve_exit(room["name"], raw.get("south"))
         room["exitE"] = resolve_exit(room["name"], raw.get("east"))
         room["exitW"] = resolve_exit(room["name"], raw.get("west"))
+
+    # Pit-landing targets resolve like exits (raw name -> ROOMS[] index).
+    for room in rooms:
+        room["pitRoom"] = resolve_exit(room["name"], room.pop("pitRoomRaw"))
+
+    # Mirror pairs (the parallel world): each side lands on its partner.
+    # A declaration on one side bakes the reciprocal on the other; two
+    # rooms declaring different partners for the same room warn (the
+    # first pairing wins).
+    mirror_targets = {}
+    for room in rooms:
+        raw = room.pop("mirrorRoomRaw")
+        room["mirrorRoom"] = resolve_exit(room["name"], raw) if raw else -1
+        if room["mirrorRoom"] >= 0:
+            mirror_targets.setdefault(room["mirrorRoom"], []).append(room["name"])
+    for i, room in enumerate(rooms):
+        if room["mirrorRoom"] >= 0:
+            continue
+        decls = mirror_targets.get(i)
+        if not decls:
+            continue
+        if len(decls) > 1:
+            warn("rooms %s all mirror into '%s' — the first pairing wins"
+                 % (", ".join(decls), room["name"]))
+        room["mirrorRoom"] = room_index[decls[0]]
+
+    # Symmetry check: a declared pair whose target points elsewhere is a
+    # data smell (the mirror would not round-trip).
+    for i, room in enumerate(rooms):
+        target = room["mirrorRoom"]
+        if target < 0:
+            continue
+        if rooms[target]["mirrorRoom"] != i:
+            warn("room '%s' mirrors into '%s', which pairs elsewhere — "
+                 "mirror travel will not round-trip"
+                 % (room["name"], rooms[target]["name"]))
 
     # Resolve warp-pad targets ("warp": {"room": ...}) to ROOMS[] indices.
     for room in rooms:
@@ -1398,7 +1564,8 @@ def emit_dialogues(c, dialogues):
                 c.append("")
 
             line_refs.append(
-                "    { %s, %d, %d, %d, %s, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %s },"
+                "    { %s, %d, %d, %d, %s, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %s, "
+                "%s, %d, %d, %d, %s, %d, %d, %d, %d, %s },"
                 % (cstr(line["text"]), line["gotoLine"], line["if"], line["unless"],
                    (lbase + "_SET") if line["set"] else "0", len(line["set"]),
                    (lbase + "_CLEAR") if line["clear"] else "0", len(line["clear"]),
@@ -1409,7 +1576,13 @@ def emit_dialogues(c, dialogues):
                    line["warpTile"][1] if line["warpTile"] else 0,
                    line["ifItem"], line["unlessItem"], line["give"],
                    len(line["choices"]),
-                   (lbase + "_CHOICES") if line["choices"] else "0"))
+                   (lbase + "_CHOICES") if line["choices"] else "0",
+                   cfloat(line["wait"]),
+                   line["camAction"], line["camTileX"], line["camTileY"],
+                   cfloat(line["camSeconds"]),
+                   line["letterbox"], line["moveActor"],
+                   line["moveTileX"], line["moveTileY"],
+                   cfloat(line["moveSeconds"])))
 
         if line_refs:
             c.append("static const DialogueLine %s_LINES[] = {" % base)
@@ -1417,13 +1590,17 @@ def emit_dialogues(c, dialogues):
                 c.append(ref)
             c.append("};")
         else:
-            c.append("static const DialogueLine %s_LINES[] = { { 0, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, -1, -1, 0, 0 } };" % base)
+            c.append("static const DialogueLine %s_LINES[] = { { 0, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, -1, -1, 0, 0, "
+                     "0.0f, 0, 0, 0, 0.0f, -1, -1, 0, 0, 0.0f } };" % base)
         c.append("")
 
     c.append("const Dialogue DIALOGUES[] = {")
     for dialogue in dialogues:
-        c.append("    { %s, %d, DIALOGUE_%s_LINES },"
-                 % (cstr(dialogue["name"]), len(dialogue["lines"]), sym(dialogue["name"])))
+        c.append("    { %s, %d, DIALOGUE_%s_LINES, %s, %d },"
+                 % (cstr(dialogue["name"]), len(dialogue["lines"]),
+                    sym(dialogue["name"]),
+                    "true" if dialogue["credits"] else "false",
+                    dialogue["nextIndex"]))
     c.append("};")
     c.append("const int DIALOGUE_COUNT = %d;" % len(dialogues))
     c.append("")
@@ -1507,7 +1684,7 @@ def emit_enemies(c, enemies):
             "%d, %s, %s, "
             "%s, %d, "
             "%s, %s, "
-            "%s, %s, %s, %d"
+            "%s, %s, %s, %s, %d"
             % (enemy["hp"], enemy["speed"], enemy["damage"],
                cfloat(enemy["chargeSight"]), cfloat(enemy["chargeScale"]),
                "true" if enemy["chargeStun"] else "false",
@@ -1518,6 +1695,7 @@ def emit_enemies(c, enemies):
                "true" if enemy["boss"] else "false",
                "true" if enemy["miniBoss"] else "false",
                "true" if enemy["strikeImmune"] else "false",
+               "true" if enemy["catchable"] else "false",
                cstr(enemy["custom"]) if enemy["custom"] else "0",
                (base + "_DROPS") if enemy["drops"] else "0",
                len(enemy["drops"]))
@@ -1647,9 +1825,10 @@ def emit_rooms(c, rooms):
             if room[key]:
                 name = "%s_%s" % (base, key.upper())
                 c.append("static const Encounter %s[%d] = {" % (name, len(room[key])))
-                entries = ", ".join("{ %d, %d, %d, %d, %s }"
+                entries = ", ".join("{ %d, %d, %d, %d, %s, %d, %d }"
                                     % (e["x"], e["y"], e["dialogue"], e["id"],
-                                       "true" if e["repeat"] else "false")
+                                       "true" if e["repeat"] else "false",
+                                       e["ifFlagIdx"], e["unlessFlagIdx"])
                                     for e in room[key])
                 c.append("    %s," % entries)
                 c.append("};")
@@ -1762,6 +1941,7 @@ def emit_rooms(c, rooms):
             cstr(room["music"]) if room["music"] else "0",
             cstr(room["walkSfx"]) if room["walkSfx"] else "0",
             cstr(room["ambient"]) if room["ambient"] else "0",
+            cstr(room["dangerMusic"]) if room["dangerMusic"] else "0",
             instant_ref, str(len(room["instant"])),
             interactive_ref, str(len(room["interactive"])),
             enemy_ref, str(len(room["enemySpawns"])),
@@ -1781,6 +1961,9 @@ def emit_rooms(c, rooms):
             decor_ref, colliders_ref, upper_ref,
             str(room["exitN"]), str(room["exitS"]),
             str(room["exitE"]), str(room["exitW"]),
+            "true" if room["dungeon"] else "false",
+            str(room["pitRoom"]), str(room["pitTileX"]), str(room["pitTileY"]),
+            str(room["mirrorRoom"]),
         ]
         c.append("    { " + ", ".join(fields) + " },")
     c.append("};")
@@ -2526,7 +2709,7 @@ def create_object_bitmap(path, kind):
 def create_pickups_bitmap(path):
     """Placeholder pickup sheet, 16x16 frames in a row:
     0 heart, 1 rupee (1), 2 rupee (5), 3 rock (enemy projectile),
-    4 arrow, 5 bomb, 6 magic, 7 heart container."""
+    4 arrow, 5 bomb, 6 magic, 7 heart container, 8 fairy, 9 small key."""
     if os.path.exists(path):
         return False
 
@@ -2667,8 +2850,67 @@ def create_pickups_bitmap(path):
             image.append(row)
         return image
 
+    def fairy_frame():
+        # Hovering fairy: spread wings, glowing pink body, trailing sparkles.
+        image = []
+        for y in range(16):
+            row = bytearray()
+            for x in range(16):
+                dx = x + 0.5 - 8.0
+                dy = y + 0.5 - 8.0
+                pixel = (0, 0, 0, 0)
+                # Wings: swept shapes up and out from the body, tapering.
+                if -3.0 <= dy <= 0.5 and 1.0 <= abs(dx) <= 5.5:
+                    span = (5.5 - abs(dx)) * 0.9
+                    if span > 0.0 and abs(dy + 1.25) < span:
+                        pixel = (235, 245, 255, 255)
+                # Body: a bright orb with a white-hot core.
+                d = math.hypot(dx, dy - 1.0)
+                if d < 2.8:
+                    pixel = (255, 130, 190, 255)
+                    if d < 1.5:
+                        pixel = (255, 235, 245, 255)
+                # Trailing sparkle dots.
+                if (x == 2 and y == 11) or (x == 13 and y == 4):
+                    pixel = (255, 200, 230, 255)
+                row.extend(pixel)
+            image.append(row)
+        return image
+
+    def key_frame():
+        # Gold small key: ringed bow, horizontal shaft, one tooth.
+        gold = (216, 168, 60, 255)
+        shade = (140, 100, 30, 255)
+        image = []
+        for y in range(16):
+            row = bytearray()
+            for x in range(16):
+                dx = x + 0.5 - 5.5
+                dy = y + 0.5 - 7.0
+                pixel = (0, 0, 0, 0)
+                # Bow: a gold ring around a shadowed hole.
+                d = math.hypot(dx, dy)
+                if d < 3.4:
+                    pixel = gold
+                    if d < 1.8:
+                        pixel = (26, 18, 10, 255)
+                # Shaft out to the right.
+                if 7 <= x <= 13 and 6 <= y <= 7:
+                    pixel = gold
+                    if x == 13:
+                        pixel = shade
+                # Tooth hanging at the shaft's end.
+                if 11 <= x <= 12 and 8 <= y <= 10:
+                    pixel = gold
+                    if y == 10:
+                        pixel = shade
+                row.extend(pixel)
+            image.append(row)
+        return image
+
     frames = [heart_frame(), rupee1, rupee5, rock_frame(),
-              arrow_frame(), bomb_frame(), magic_frame(), container_frame()]
+              arrow_frame(), bomb_frame(), magic_frame(), container_frame(),
+              fairy_frame(), key_frame()]
     sheet = []
     for y in range(16):
         row = bytearray()
@@ -2926,7 +3168,7 @@ def sync_runtime_assets():
     print("synced %d runtime files to assets/" % count)
 
 
-def generate():
+def generate(dump_flags=False):
     game = load_game()
     manifest = load_code_manifest()
 
@@ -2952,10 +3194,24 @@ def generate():
     dialogues = load_dialogues(flags)
     dialogue_index = {d["name"]: i for i, d in enumerate(dialogues)}
 
+    # Chain targets ("next") resolve once every dialogue is loaded; the
+    # endgame script chains into its credits roll this way.
+    for dialogue in dialogues:
+        name = dialogue.pop("next")
+        if not name:
+            dialogue["nextIndex"] = -1
+        elif name in dialogue_index:
+            dialogue["nextIndex"] = dialogue_index[name]
+        else:
+            warn("dialogue '%s' chains into unknown dialogue '%s'"
+                 % (dialogue["name"], name))
+            dialogue["nextIndex"] = -1
+
     # Item upgrade flags (silver arrows, magical boomerang) register into
     # the same world-flag registry the dialogues fill.
     for item in items:
-        item["upgradeFlagIdx"] = (flags.index(item.pop("upgradeFlagName"))
+        item["upgradeFlagIdx"] = (flags.index(item.pop("upgradeFlagName"),
+                                               "items/%s.json" % item["name"])
                                   if item["upgradeFlagName"] else -1)
 
     # Placeholder sheets for characters that don't ship art (NPCs), before
@@ -3014,6 +3270,22 @@ def generate():
     if total_encounters > 512:
         warn("%d encounters exceed the save cap (512)" % total_encounters)
 
+    # Audio budget (web memory: everything ships in the package, and
+    # decoded PCM lives in RAM once loaded). Long loops dominate — warn
+    # so content authors keep them short.
+    for subdir, cap_mb in (("audio", 0.5), ("music", 2.0)):
+        directory = res(subdir)
+        if not os.path.isdir(directory):
+            continue
+        for filename in sorted(os.listdir(directory)):
+            path = os.path.join(directory, filename)
+            if not os.path.isfile(path):
+                continue
+            size = os.path.getsize(path)
+            if size > cap_mb * 1024 * 1024:
+                warn("audio/%s is %.1f MB (> %.1f MB budget) — trim the "
+                     "loop for the web build" % (filename, size / (1024.0 * 1024.0), cap_mb))
+
     # NPC spawn conditions resolve against the same flag registry the
     # dialogues filled (story-state presence).
     for room in rooms:
@@ -3022,6 +3294,15 @@ def generate():
                              if npc["ifFlag"] else -1)
             npc["unlessFlag"] = (flags.index(npc.pop("unlessFlag"))
                                  if npc["unlessFlag"] else -1)
+
+        # Encounter conditions ("if"/"unless" story flags) resolve the same
+        # way; a condition that never holds leaves the one-shot intact.
+        for key in ("instant", "interactive"):
+            for encounter in room[key]:
+                encounter["ifFlagIdx"] = (flags.index(encounter.pop("ifFlag"))
+                                           if encounter["ifFlag"] else -1)
+                encounter["unlessFlagIdx"] = (flags.index(encounter.pop("unlessFlag"))
+                                               if encounter["unlessFlag"] else -1)
 
     # The crystal-switch state (blue/red barriers) is a saved world flag so
     # it persists like story state; bake its index as a named constant.
@@ -3099,6 +3380,10 @@ def generate():
     h.append("")
     h.append('#include "engine.h"')
     h.append("")
+    h.append("// The baked index helpers below use strcmp/snprintf.")
+    h.append("#include <stdio.h>")
+    h.append("#include <string.h>")
+    h.append("")
     h.append("// Game identity (resources/game.json). The slug is baked into save")
     h.append("// files so a save from one game is never loaded by another.")
     h.append("extern const char* const GAME_TITLE;")
@@ -3165,6 +3450,73 @@ def generate():
     h.append("extern const int WORLD_FLAG_CRYSTAL_RED;")
     h.append("")
 
+    # Baked asset indexing: name -> index lookups over every data family,
+    # emitted as inline helpers (bake, don't parse — the tables are the
+    # baked arrays themselves, so lookups need no runtime string building).
+    # Names match the baked file names (rooms: "01.json"; flags: flag
+    # names), so callers resolve data references by name without
+    # re-walking or guessing conventions.
+    h.append("// Baked asset indexing: name -> index lookups (dialogues/rooms/")
+    h.append("// enemies/objects/items by name, world flags by flag name).")
+    h.append("// Returns -1 when the name isn't in the game's data.")
+    h.append("inline int dialogueIndex(const char* name)")
+    h.append("{")
+    h.append("    for (int i = 0; i < DIALOGUE_COUNT; i++)")
+    h.append("        if (strcmp(DIALOGUES[i].name, name) == 0) return i;")
+    h.append("    return -1;")
+    h.append("}")
+    h.append("inline int roomIndex(const char* name)")
+    h.append("{")
+    h.append("    // Rooms accept both the file name (\"01.json\") and the stem (\"01\").")
+    h.append("    size_t len = name ? strlen(name) : 0;")
+    h.append("    bool stem = len >= 5 && strcmp(name + len - 5, \".json\") == 0;")
+    h.append("    for (int i = 0; i < ROOM_COUNT; i++)")
+    h.append("        if (strcmp(ROOMS[i].name, name) == 0) return i;")
+    h.append("    if (stem)")
+    h.append("    {")
+    h.append("        char withJson[128];")
+    h.append("        snprintf(withJson, sizeof(withJson), \"%s.json\", name);")
+    h.append("        for (int i = 0; i < ROOM_COUNT; i++)")
+    h.append("            if (strcmp(ROOMS[i].name, withJson) == 0) return i;")
+    h.append("    }")
+    h.append("    else")
+    h.append("    {")
+    h.append("        for (int i = 0; i < ROOM_COUNT; i++)")
+    h.append("        {")
+    h.append("            const char* rn = ROOMS[i].name;")
+    h.append("            size_t rl = strlen(rn);")
+    h.append("            if (rl >= 5 && strcmp(rn + rl - 5, \".json\") == 0")
+    h.append("                && strncmp(rn, name, rl - 5) == 0 && len == rl - 5)")
+    h.append("                return i;")
+    h.append("        }")
+    h.append("    }")
+    h.append("    return -1;")
+    h.append("}")
+    h.append("inline int enemyIndex(const char* name)")
+    h.append("{")
+    h.append("    for (int i = 0; i < ENEMY_COUNT; i++)")
+    h.append("        if (strcmp(ENEMIES[i].name, name) == 0) return i;")
+    h.append("    return -1;")
+    h.append("}")
+    h.append("inline int objectIndex(const char* name)")
+    h.append("{")
+    h.append("    for (int i = 0; i < OBJECT_COUNT; i++)")
+    h.append("        if (strcmp(OBJECTS[i].name, name) == 0) return i;")
+    h.append("    return -1;")
+    h.append("}")
+    h.append("inline int itemIndex(const char* name)")
+    h.append("{")
+    h.append("    for (int i = 0; i < ITEM_COUNT; i++)")
+    h.append("        if (strcmp(ITEMS[i].name, name) == 0) return i;")
+    h.append("    return -1;")
+    h.append("}")
+    h.append("inline int worldFlagIndex(const char* name)")
+    h.append("{")
+    h.append("    for (int i = 0; i < WORLD_FLAG_COUNT; i++)")
+    h.append("        if (strcmp(WORLD_FLAG_NAMES[i], name) == 0) return i;")
+    h.append("    return -1;")
+    h.append("}")
+
     c = []
     c.append("// Generated by scripts/generate_assets.py - do not edit by hand.")
     c.append('#include "assets.h"')
@@ -3195,18 +3547,47 @@ def generate():
         c.append("const TilesetConfig TILESET = { 0, 1, 1, 0, %d, %d };" % (TILE, TILE))
     c.append("")
 
+    # Tooling mode (--flags): print the world-flag registry as JSON and
+    # stop — no generated files, no asset sync. The editor's flags tab
+    # reads this (the bake is the single authority on flag ids).
+    if dump_flags:
+        import json as _json
+        print(_json.dumps([
+            {"name": name, "source": flags.sources.get(name, "")}
+            for name in flags.names
+        ], indent=4))
+        return 0
+
     os.makedirs(INCLUDE_AUTO, exist_ok=True)
     os.makedirs(SRC_AUTO, exist_ok=True)
+    header_text = "\n".join(h)
+    source_text = "\n".join(c)
     with open(os.path.join(INCLUDE_AUTO, "assets.h"), "w") as handle:
-        handle.write("\n".join(h))
+        handle.write(header_text)
     with open(os.path.join(SRC_AUTO, "assets.cpp"), "w") as handle:
-        handle.write("\n".join(c))
+        handle.write(source_text)
 
+    # Generated-code size management (web memory budget): the baked tables
+    # all become .data in the binary — the web build pays for every byte.
+    # Report each bake, and warn as it scales so content growth is a
+    # visible cost, not a silent creep. Source-size warnings lag the
+    # table-size ones (text compresses; the tables are what ship).
+    header_kb = len(header_text.encode()) / 1024.0
+    source_kb = len(source_text.encode()) / 1024.0
     print("generated: include_auto/assets.h")
     print("generated: src_auto/assets.cpp")
+    print("  baked source size: %.1f KB header + %.1f KB source" % (header_kb, source_kb))
+    if source_kb > 512.0:
+        warn("generated source is %.0f KB (> 512 KB) — the web build compiles all of it; "
+             "consider trimming content or splitting rooms" % source_kb)
+    for room in rooms:
+        tiles = room["mapWidth"] * room["mapHeight"]
+        room_kb = (tiles * 2 * 2) / 1024.0    # decor + collider ushorts
+        if room_kb > 128.0:
+            warn("room '%s' layers bake ~%.0f KB each (> 128 KB) — "
+                 "large rooms multiply the web budget" % (room["name"], room_kb))
     print("  %d dialogues, %d characters, %d enemies, %d items, %d object types, %d rooms, %d tile meta entries"
-          % (len(dialogues), len(characters), len(enemies), len(items),
-             len(object_types), len(rooms),
+          % (len(dialogues), len(characters), len(enemies), len(items), len(object_types), len(rooms),
              sum(1 for m in tile_meta if m["flags"] or m["damage"])))
     sync_runtime_assets()
 
@@ -3219,4 +3600,8 @@ def generate():
 
 
 if __name__ == "__main__":
+    # Tooling mode: dump the world-flag registry (names + sources) as
+    # JSON for the editor's flags tab — no bake, no writes.
+    if len(sys.argv) > 1 and sys.argv[1] == "--flags":
+        sys.exit(generate(dump_flags=True))
     sys.exit(generate())

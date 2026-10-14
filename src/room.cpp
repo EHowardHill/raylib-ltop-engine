@@ -4,7 +4,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-Room::Room() : cfg(0), walkSound(), hasWalkSound(false), solidExtra(0),
+Room::Room() : cfg(0), solidExtra(0),
     solidExtraCtx(0), decorState(0), colliderState(0)
 {
 }
@@ -13,13 +13,6 @@ void Room::load(const RoomConfig& config)
 {
     unload();
     cfg = &config;
-    if (config.walkSfx && config.walkSfx[0])
-    {
-        char path[512];
-        snprintf(path, sizeof(path), "assets/audio/%s", config.walkSfx);
-        walkSound = LoadSound(path);
-        hasWalkSound = true;
-    }
     int tiles = config.mapWidth * config.mapHeight;
     if (tiles > 0 && config.decor)
     {
@@ -35,11 +28,6 @@ void Room::load(const RoomConfig& config)
 
 void Room::unload()
 {
-    if (hasWalkSound)
-    {
-        UnloadSound(walkSound);
-        hasWalkSound = false;
-    }
     delete[] decorState;
     decorState = 0;
     delete[] colliderState;
@@ -47,9 +35,9 @@ void Room::unload()
     cfg = 0;
 }
 
-const Sound* Room::walkSfx() const
+const char* Room::walkSfx() const
 {
-    return hasWalkSound ? &walkSound : 0;
+    return (cfg && cfg->walkSfx && cfg->walkSfx[0]) ? cfg->walkSfx : 0;
 }
 
 bool Room::solidTilesBox(Rectangle box) const

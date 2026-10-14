@@ -20,6 +20,14 @@
                 ],
                 "dialogue": "01.json",
                 "repeat": false
+            },
+            {
+                "location": [
+                    5,
+                    7
+                ],
+                "dialogue": "08.json",
+                "if": "game_complete"
             }
         ],
         "interactive": [
@@ -1272,16 +1280,16 @@
                 5,
                 10
             ]
+        },
+        {
+            "name": "bee",
+            "location": [
+                10,
+                10
+            ]
         }
     ],
     "objects": [
-        {
-            "type": "pot",
-            "location": [
-                6,
-                4
-            ]
-        },
         {
             "type": "pot",
             "location": [
@@ -1375,23 +1383,6 @@
             "link": 1
         },
         {
-            "type": "switch",
-            "location": [
-                28,
-                3
-            ],
-            "mode": "hold",
-            "link": 2
-        },
-        {
-            "type": "barrier",
-            "location": [
-                28,
-                6
-            ],
-            "link": 2
-        },
-        {
             "type": "chest",
             "location": [
                 12,
@@ -1412,14 +1403,6 @@
             "grant": {
                 "kind": "heart_container"
             }
-        },
-        {
-            "type": "torch",
-            "location": [
-                10,
-                14
-            ],
-            "link": 3
         },
         {
             "type": "torch",
@@ -2054,6 +2037,7 @@
     "exits": {
         "east": "02.json"
     },
+    "mirror": "07.json",
     "pickups": [
         {
             "kind": "heart",
@@ -2067,6 +2051,13 @@
             "location": [
                 15,
                 17
+            ]
+        },
+        {
+            "kind": "fairy",
+            "location": [
+                28,
+                7
             ]
         }
     ],

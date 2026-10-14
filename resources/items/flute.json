@@ -1,0 +1,7 @@
+{
+    "label": "FLUTE",
+    "use": {
+        "kind": "flute",
+        "sfx": "flute 1.wav"
+    }
+}

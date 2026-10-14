@@ -1,0 +1,7 @@
+{
+    "label": "NET",
+    "use": {
+        "kind": "net",
+        "sfx": "bug net.wav"
+    }
+}

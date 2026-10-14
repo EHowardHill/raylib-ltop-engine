@@ -1,0 +1,7 @@
+{
+    "label": "MIRROR",
+    "use": {
+        "kind": "mirror",
+        "sfx": "mirror warp.wav"
+    }
+}

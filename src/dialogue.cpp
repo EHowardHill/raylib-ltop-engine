@@ -17,6 +17,9 @@ static const float BOX_MIN_WIDTH = 128.0f;
 static const float TEXT_PAD_X = 6.0f;
 static const float TEXT_PAD_Y = 5.0f;
 static const float CHARS_PER_SECOND = 30.0f;
+// Credits roll: the default beat a centered line holds before the roll
+// advances on its own (a line's "wait" overrides it).
+static const float CREDITS_BEAT = 1.6f;
 
 // Installed by the game at boot (see dialogue.h).
 bool (*gDialogueItemOwned)(int item) = 0;
@@ -45,7 +48,12 @@ DialogueBox::DialogueBox()
       choiceActive(false), choiceCursor(0),
       musicRequest(), musicPending(false),
       giveItem(-1), givePending(false),
-      warpRoom(-1), warpTileX(0), warpTileY(0), warpPending(false)
+      warpRoom(-1), warpTileX(0), warpTileY(0), warpPending(false),
+      camPending(false), camAction(0), camTileX(0), camTileY(0),
+      camSeconds(0.0f), letterboxPending(false), letterboxState(-1),
+      movePending(false), moveActor(-1), moveTileX(0), moveTileY(0),
+      moveSeconds(0.0f), nextDialogue(-1), nextPending(false),
+      waitTimer(0.0f)
 {
     for (int i = 0; i < MAX_ROWS; i++) rows[i].offset = 0;
 }
@@ -55,18 +63,17 @@ void DialogueBox::init()
     font = LoadFontEx("assets/fonts/dialogue.otf", DRAW_FONT_BASE, NULL, 0);
     border = LoadTexture("assets/ui/border.png");
     SetTextureFilter(border, TEXTURE_FILTER_POINT);
-    letterSfx = LoadSound("assets/audio/message.wav");
-    finishSfx = LoadSound("assets/audio/message_finish.wav");
-    errorSfx = LoadSound("assets/audio/error.wav");
+    // Letter cues name their files; they decode on first play through the
+    // shared lazy cache.
+    letterSfx = { "message.wav" };
+    finishSfx = { "message_finish.wav" };
+    errorSfx = { "error.wav" };
 }
 
 void DialogueBox::shutdown()
 {
     UnloadFont(font);
     UnloadTexture(border);
-    UnloadSound(letterSfx);
-    UnloadSound(finishSfx);
-    UnloadSound(errorSfx);
     shutdownNamedSfx();
     current = 0;
     musicPending = false;
@@ -110,6 +117,10 @@ void DialogueBox::open(const Dialogue& dialogue)
     musicPending = false;
     givePending = false;
     warpPending = false;
+    camPending = false;
+    letterboxPending = false;
+    movePending = false;
+    nextPending = false;
     startLine();
 }
 
@@ -118,6 +129,7 @@ void DialogueBox::startLine()
     reveal = 0.0f;
     rowCount = 0;
     totalChars = 0;
+    waitTimer = 0.0f;
     if (!current) return;
 
     // Skip lines whose conditions fail (skipped lines execute nothing).
@@ -137,7 +149,8 @@ void DialogueBox::startLine()
             continue;
         }
 
-        // Shown-effects: world flags, sfx cue, music switch, item grant.
+        // Shown-effects: world flags, sfx cue, music switch, item grant,
+        // and the cutscene cues (camera, bars, blocking).
         applyFlags(line.setFlags, line.setCount, line.clearFlags, line.clearCount);
         if (line.sfx) playNamedSfx(line.sfx);
         if (line.music)
@@ -150,6 +163,27 @@ void DialogueBox::startLine()
             giveItem = line.giveItem;
             givePending = true;
         }
+        if (line.camAction != 0)
+        {
+            camAction = line.camAction;
+            camTileX = line.camTileX;
+            camTileY = line.camTileY;
+            camSeconds = line.camSeconds;
+            camPending = true;
+        }
+        if (line.letterbox >= 0)
+        {
+            letterboxState = line.letterbox;
+            letterboxPending = true;
+        }
+        if (line.moveActor != -1)
+        {
+            moveActor = line.moveActor;
+            moveTileX = line.moveTileX;
+            moveTileY = line.moveTileY;
+            moveSeconds = line.moveSeconds;
+            movePending = true;
+        }
 
         choiceActive = false;
         choiceCursor = 0;
@@ -161,7 +195,14 @@ void DialogueBox::startLine()
         return;
     }
 
-    // Ran off the end: the dialogue closes.
+    // Ran off the end: the dialogue closes — or chains into the next
+    // script when one is linked (a warp line still wins over the chain,
+    // since it closes the box on its own path).
+    if (current->nextDialogue >= 0 && current->nextDialogue < DIALOGUE_COUNT)
+    {
+        nextDialogue = current->nextDialogue;
+        nextPending = true;
+    }
     current = 0;
 }
 
@@ -262,6 +303,15 @@ void DialogueBox::update()
         if (now > previous && text[now - 1] != ' ') PlaySound(letterSfx);
         if (reveal >= (float)totalChars) PlaySound(finishSfx);
     }
+    else if (line.waitSeconds > 0.0f || current->credits)
+    {
+        // Cutscene beats and credits rolls advance on their own once the
+        // line is fully revealed; the button can still hurry a beat along.
+        float beat = line.waitSeconds > 0.0f ? line.waitSeconds : CREDITS_BEAT;
+        waitTimer += frameDt();
+        if (waitTimer >= beat && !choiceActive) advanceLine(true);
+        return;
+    }
 
     if (choiceActive)
     {
@@ -355,6 +405,44 @@ bool DialogueBox::takeWarpRequest(int& room, int& tileX, int& tileY)
     return true;
 }
 
+bool DialogueBox::takeCameraRequest(int& action, int& tileX, int& tileY, float& seconds)
+{
+    if (!camPending) return false;
+    camPending = false;
+    action = camAction;
+    tileX = camTileX;
+    tileY = camTileY;
+    seconds = camSeconds;
+    return true;
+}
+
+bool DialogueBox::takeLetterboxRequest(int& state)
+{
+    if (!letterboxPending) return false;
+    letterboxPending = false;
+    state = letterboxState;
+    return true;
+}
+
+bool DialogueBox::takeMoveRequest(int& actor, int& tileX, int& tileY, float& seconds)
+{
+    if (!movePending) return false;
+    movePending = false;
+    actor = moveActor;
+    tileX = moveTileX;
+    tileY = moveTileY;
+    seconds = moveSeconds;
+    return true;
+}
+
+bool DialogueBox::takeNextRequest(int& dialogue)
+{
+    if (!nextPending) return false;
+    nextPending = false;
+    dialogue = nextDialogue;
+    return true;
+}
+
 void DialogueBox::drawChoices(Rectangle box) const
 {
     if (!current || !choiceActive) return;
@@ -396,6 +484,46 @@ void DialogueBox::draw() const
     if (!current) return;
 
     float sc = scale();
+    float textSize = fontSize();
+    float spacing = sc;
+
+    if (current->credits)
+    {
+        // Endgame roll: the world vanishes behind a black screen and the
+        // lines center themselves, one beat at a time.
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), BLACK);
+        float viewWidth = (float)GetScreenWidth() / sc;
+        int revealed = (int)reveal;
+        for (int j = 0; j < rowCount; j++)
+        {
+            int rowLen = (int)strlen(rows[j].text);
+            int count = revealed - rows[j].offset;
+            if (count <= 0) break;
+            if (count > rowLen) count = rowLen;
+
+            char tmp[256];
+            memcpy(tmp, rows[j].text, (size_t)count);
+            tmp[count] = '\0';
+
+            float width = MeasureTextEx(font, tmp, textSize, spacing).x;
+            float y = VIRTUAL_HEIGHT * 0.42f
+                      + (float)j * LINE_HEIGHT
+                      - (float)rowCount * LINE_HEIGHT * 0.5f;
+            Vector2 pos = { (viewWidth - width) * 0.5f, y * sc };
+            DrawTextEx(font, tmp, pos, textSize, spacing, RAYWHITE);
+        }
+        return;
+    }
+
+    // Silent cutscene beats (no text, a timed wait): the cues play over
+    // the world with no box in the way.
+    if (lineIndex >= 0 && lineIndex < current->lineCount)
+    {
+        const DialogueLine& line = current->lines[lineIndex];
+        const char* text = line.text ? line.text : "";
+        if (!text[0] && line.waitSeconds > 0.0f) return;
+    }
+
     float viewWidth = (float)GetScreenWidth() / sc;
     float boxWidth = boxWidthVirtual();
 
@@ -418,8 +546,6 @@ void DialogueBox::draw() const
     Vector2 origin = { 0.0f, 0.0f };
     DrawTextureNPatch(border, npatch, dest, origin, 0.0f, WHITE);
 
-    float textSize = fontSize();
-    float spacing = sc;
     float left = (box.x + (float)patch + TEXT_PAD_X) * sc;
     float top = (box.y + (float)patch + TEXT_PAD_Y) * sc;
 

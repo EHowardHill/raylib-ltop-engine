@@ -1,0 +1,26 @@
+{
+    "lines": [
+        {
+            "letterbox": true,
+            "camera": { "pan": [6, 7], "time": 1.2 },
+            "wait": 1.6
+        },
+        {
+            "move": { "actor": 0, "tile": [5, 6], "time": 1.4 },
+            "wait": 1.8
+        },
+        {
+            "text": "VILLAGER: The whole valley is talking about you!",
+            "wait": 2.8
+        },
+        {
+            "text": "Rest now. You've earned it.",
+            "wait": 2.2
+        },
+        {
+            "camera": "hero",
+            "letterbox": false,
+            "wait": 0.4
+        }
+    ]
+}

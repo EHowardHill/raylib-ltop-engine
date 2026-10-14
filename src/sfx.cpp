@@ -3,8 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 
-// Lazy sfx cache for scripted/data cues (name -> loaded Sound).
-static const int MAX_NAMED_SFX = 24;
+// Lazy sfx cache for data cues and LazySound wrappers (name -> loaded
+// Sound). One shared cache: footsteps, engine feedback banks, hero cues,
+// and dialogue letters all decode here on first use and stay for the
+// session. The cap covers a game's whole working set; overflow reuses
+// slot 0 (playing a wrong cue beats crashing).
+static const int MAX_NAMED_SFX = 64;
 struct NamedSfx
 {
     char name[96];
@@ -13,7 +17,7 @@ struct NamedSfx
 };
 static NamedSfx namedSfx[MAX_NAMED_SFX] = {};
 
-static Sound loadNamedSfx(const char* name)
+static Sound& loadNamedSfx(const char* name)
 {
     for (int i = 0; i < MAX_NAMED_SFX; i++)
     {
@@ -38,6 +42,13 @@ void playNamedSfx(const char* name)
 {
     if (!name || !name[0]) return;
     PlaySound(loadNamedSfx(name));
+}
+
+Sound& LazySound::get() const
+{
+    static Sound emptySound = {};
+    if (!name || !name[0]) return emptySound;
+    return loadNamedSfx(name);
 }
 
 void shutdownNamedSfx()

@@ -8,6 +8,8 @@ static const float ENEMY_ANIM_FPS = 6.0f;
 static const float HURT_DURATION = 0.22f;
 static const float KNOCK_SPEED = 160.0f;
 static const float STUN_DURATION = 0.6f;
+static const float AGITATE_DURATION = 3.0f;
+static const float AGITATE_SPEED_SCALE = 1.8f;
 static const float SOLDIER_CHARGE_SPEED = 2.2f;
 static const float BOX_X = 8.0f;
 static const float BOX_Y = 12.0f;
@@ -24,8 +26,18 @@ Enemy::Enemy()
     : cfg(0), sheet(), x(0.0f), y(0.0f), facing(DIR_DOWN), mode(ENEMY_IDLE),
       modeTime(0.0f), timer(0.0f), hp(0), hits(0), knockX(0.0f), knockY(0.0f),
       lastSwing(-1), shotPending_(false),
-      shotDirX(0.0f), shotDirY(0.0f), animTime(0.0f), customFn(0)
+      shotDirX(0.0f), shotDirY(0.0f), animTime(0.0f), agitateTimer(0.0f),
+      trailCount(0), trailSpacing(0.0f), trailDist(0.0f),
+      lastSampleX(0.0f), lastSampleY(0.0f),
+      weakX(0.0f), weakY(0.0f), weakW(0.0f), weakH(0.0f),
+      customFn(0)
 {
+    for (int i = 0; i < TRAIL_MAX; i++)
+    {
+        trailX[i] = 0.0f;
+        trailY[i] = 0.0f;
+    }
+    for (int i = 0; i < 4; i++) scratch_[i] = 0.0f;
 }
 
 void Enemy::spawn(const EnemyConfig& config, Texture2D spriteSheet, int tileX, int tileY)
@@ -43,6 +55,20 @@ void Enemy::spawn(const EnemyConfig& config, Texture2D spriteSheet, int tileX, i
     knockY = 0.0f;
     animTime = 0.0f;
     timer = 0.0f;
+    agitateTimer = 0.0f;
+    trailCount = 0;
+    trailSpacing = 0.0f;
+    trailDist = 0.0f;
+    lastSampleX = x;
+    lastSampleY = y;
+    for (int i = 0; i < TRAIL_MAX; i++)
+    {
+        trailX[i] = x;
+        trailY[i] = y;
+    }
+    weakW = 0.0f;
+    weakH = 0.0f;
+    for (int i = 0; i < 4; i++) scratch_[i] = 0.0f;
     // Layer-4 seam: game-code behaviors resolve by name at spawn (bake-time
     // linked registry; missing names degrade to the built-in components).
     customFn = config.customBehavior ? gamecodeFindEnemyBehavior(config.customBehavior) : 0;
@@ -131,6 +157,48 @@ void Enemy::stun(float seconds)
     timer = seconds > 0.0f ? seconds : STUN_DURATION;
 }
 
+void Enemy::agitate(float seconds)
+{
+    if (!alive()) return;
+    agitateTimer = seconds > 0.0f ? seconds : AGITATE_DURATION;
+    // A jostled enemy snaps out of a stun into its dither.
+    if (mode == ENEMY_STUN) setMode(ENEMY_PAUSE);
+}
+
+void Enemy::enableTrail(int count, float spacing)
+{
+    if (count > TRAIL_MAX) count = TRAIL_MAX;
+    if (count < 1) count = 1;
+    trailCount = count;
+    trailSpacing = spacing > 1.0f ? spacing : 1.0f;
+    // Seed the whole trail at the current spot so it grows out behind
+    // the enemy instead of streaming in from (0,0).
+    for (int i = 0; i < TRAIL_MAX; i++)
+    {
+        trailX[i] = x;
+        trailY[i] = y;
+    }
+    trailDist = 0.0f;
+    lastSampleX = x;
+    lastSampleY = y;
+}
+
+bool Enemy::tailPosition(float& outX, float& outY) const
+{
+    if (trailCount <= 0) return false;
+    outX = trailX[0];
+    outY = trailY[0];
+    return true;
+}
+
+void Enemy::setWeakPointAt(float worldX, float worldY, float w, float h)
+{
+    weakX = worldX;
+    weakY = worldY;
+    weakW = w;
+    weakH = h;
+}
+
 void Enemy::freeze(float seconds)
 {
     if (!alive()) return;
@@ -167,6 +235,24 @@ bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir,
     if (attackBox.x + attackBox.width < enemyBox.x) return false;
     if (attackBox.y > enemyBox.y + enemyBox.height) return false;
     if (attackBox.y + attackBox.height < enemyBox.y) return false;
+
+    // Weak point (a behavior-armed tail): strikes landing outside the
+    // sub-box bounce off harmlessly — one bounce per swing id, no
+    // damage, no hurt flinch.
+    if (weakW > 0.0f && weakH > 0.0f)
+    {
+        Rectangle weak = { weakX - weakW * 0.5f, weakY - weakH * 0.5f,
+                           weakW, weakH };
+        bool inWeak = !(attackBox.x > weak.x + weak.width
+                        || attackBox.x + attackBox.width < weak.x
+                        || attackBox.y > weak.y + weak.height
+                        || attackBox.y + attackBox.height < weak.y);
+        if (!inWeak)
+        {
+            lastSwing = swingId;
+            return false;
+        }
+    }
 
     // Single hit per swing.
     if (swingId == lastSwing) return false;
@@ -209,6 +295,29 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
 
     modeTime += dt;
     animTime += dt;
+    if (agitateTimer > 0.0f) agitateTimer -= dt;
+
+    // Segmented trail: distance-based sampling — the trail only moves
+    // as far as the body does, so segments trail naturally.
+    if (trailCount > 0)
+    {
+        float dx = x - lastSampleX;
+        float dy = y - lastSampleY;
+        trailDist += sqrtf(dx * dx + dy * dy);
+        lastSampleX = x;
+        lastSampleY = y;
+        while (trailDist >= trailSpacing)
+        {
+            trailDist -= trailSpacing;
+            for (int i = 0; i + 1 < trailCount; i++)
+            {
+                trailX[i] = trailX[i + 1];
+                trailY[i] = trailY[i + 1];
+            }
+            trailX[trailCount - 1] = x;
+            trailY[trailCount - 1] = y;
+        }
+    }
 
     // Layer-4 seam: a registered custom behavior owns the whole AI in the
     // AI states. The engine keeps handling hurt/stun/frozen recovery (and
@@ -293,6 +402,7 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
             dy /= len;
             faceVector(dx, dy);
             float speed = (float)cfg->speed * speedScale;
+            if (agitateTimer > 0.0f) speed *= AGITATE_SPEED_SCALE;
             if (!slide(room, dx * speed * dt, dy * speed * dt))
             {
                 if (cfg->chargeStunOnWall) stun(0.5f);
@@ -307,11 +417,15 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
     case ENEMY_WALK:
     {
         float speed = (float)cfg->speed;
+        if (agitateTimer > 0.0f) speed *= AGITATE_SPEED_SCALE;
         float dx = (facing == DIR_LEFT) ? -speed : (facing == DIR_RIGHT) ? speed : 0.0f;
         float dy = (facing == DIR_UP) ? -speed : (facing == DIR_DOWN) ? speed : 0.0f;
         bool moved = slide(room, dx * dt, dy * dt);
 
         if (timer > 0.0f) timer -= dt;
+
+        // Agitated (bug-net swish): dither about, changing course often.
+        if (agitateTimer > 0.0f && rng.range(24) == 0) pickDirection(rng);
 
         // Shooter cadence (component: shootPeriod > 0): the walk leg lasts
         // one cadence, then a pre-shot pause.
@@ -407,6 +521,18 @@ void Enemy::draw() const
 {
     if (!cfg || !alive()) return;
 
+    // Segmented trail (Moldorm-style worms): shrinking segments behind
+    // the body, oldest (the tail) smallest.
+    for (int i = 0; i < trailCount; i++)
+    {
+        float t = (trailCount > 1) ? (float)i / (float)(trailCount - 1) : 1.0f;
+        float radius = 2.5f + t * 5.0f;
+        DrawCircle((int)trailX[i], (int)trailY[i], radius,
+                   Color{ 96, 76, 52, 255 });
+        DrawCircle((int)trailX[i], (int)trailY[i] + 1.0f, radius,
+                   Color{ 60, 46, 30, 255 });
+    }
+
     const DirectionalFrames* frames = (mode == ENEMY_WALK || mode == ENEMY_CHARGE)
                                           ? &cfg->move[facing] : &cfg->stand[facing];
     if (frames->count <= 0) frames = &cfg->stand[facing];
@@ -448,6 +574,17 @@ void Enemy::draw() const
             DrawTextureRec(sheet, src, pos, Color{ 255, 96, 96, 255 });
             return;
         }
+    }
+    // Agitated (bug-net swish): a buzzy yellow flicker while it dithers.
+    if (agitateTimer > 0.0f && ((int)(animTime * 24.0f) % 2 == 0)
+        && frame >= 0 && (cfg->frameCount <= 0 || frame < cfg->frameCount))
+    {
+        Rectangle src = { (float)((frame % columns) * TILE_SIZE),
+                         (float)((frame / columns) * TILE_SIZE),
+                         (float)TILE_SIZE, (float)TILE_SIZE };
+        Vector2 pos = { x, y };
+        DrawTextureRec(sheet, src, pos, Color{ 255, 230, 120, 255 });
+        return;
     }
     drawFrame(frame);
 }

@@ -38,12 +38,12 @@ public:
     // but painted over the entities; call after they render.
     void drawUpper(Texture2D tileset, const Camera2D& camera) const;
 
-    const Sound* walkSfx() const;
+    // Footstep cue name (a file under assets/audio/, 0 = none): the hero
+    // plays it through the shared lazy cache — nothing decodes per room.
+    const char* walkSfx() const;
 
 private:
     const RoomConfig* cfg;
-    Sound walkSound;
-    bool hasWalkSound;
     SolidExtraFn solidExtra;
     void* solidExtraCtx;
     // Runtime-mutable copies of the baked layers (grass cutting, bomb
