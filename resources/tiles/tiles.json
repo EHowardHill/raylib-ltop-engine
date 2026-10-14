@@ -10,14 +10,25 @@
             "cuttable": true,
             "cut_result": 46
         },
+        "46": {
+            "dig": true
+        },
         "59": {
             "water": "deep",
-            "anim": [59, 73, 74]
+            "anim": [
+                59,
+                73,
+                74
+            ]
         },
         "60": {
             "water": "shallow",
             "heal": true,
-            "anim": [60, 75, 76]
+            "anim": [
+                60,
+                75,
+                76
+            ]
         },
         "61": {
             "ice": true
@@ -52,7 +63,11 @@
                 0,
                 32
             ],
-            "anim": [66, 77, 78]
+            "anim": [
+                66,
+                77,
+                78
+            ]
         },
         "67": {
             "ledge": "down"
@@ -69,9 +84,6 @@
         "72": {
             "bombable": true,
             "bomb_result": 0
-        },
-        "46": {
-            "dig": true
         }
     }
 }

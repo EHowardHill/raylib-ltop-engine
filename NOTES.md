@@ -141,7 +141,7 @@ Sound:
 
 Rooms are edited entirely in the web editor — no external map tool.
 - Rooms are stored in `resources/rooms` as a single .json file per room.
-- All base tiles are stored in `resources/tiles` as a single .png (a grid of 32x32 tiles; the tileset's columns and tile count are derived from the image dimensions at build time).
+- Base tiles live in `resources/tiles` as 32x32-grid .png **tilesets** — one or many. Each room references the sheet its layers paint from (multiple rooms share a sheet; that's the expected shape). All metadata (columns, tile count) derives from each image's dimensions at build time; the pool holds 16.
 
 Each room .json contains:
 - "width" and "height": the map size, in tiles.
@@ -151,9 +151,10 @@ Each room .json contains:
 - "dark" (optional, top level): true renders the room in darkness — a lightmap (ambient gloom + additive radial lights) multiplied over the world each frame. Light sources: the hero's lantern (wide radius; ~1 magic half drained per 4 seconds while in dark rooms, shrinking to an ember when dry) and lit torches (warm flickering pools). The HUD stays lit. The gradient sprite is the generator placeholder `resources/effects/light.png` (opaque radial falloff).
 - "weather" (optional, top level): `"rain"`, `"storm"`, or `"fog"` — a presentation layer over the world in screen space (under the HUD): rain streaks with a wind slant (storm = rain + fog-weighted air + lightning: `thunder.wav` + a white screen flash on a seeded-rng cadence). Pairs with the room ambient loop (e.g. rain weather + `rain.wav` ambience).
 - "tint" (optional, top level): `[r, g, b]` (0-255) — an ambient tint multiplied over the world each frame (255 each = neutral/none). `"night": true` is a preset blue-dim tint. Composes with dark rooms (tint applies over the lightmap).
-- Tile ids are 0-based frame indices into the tileset sheet, **plus 1**; 0 means empty.
+- "tileset" (optional, top level): the sheet this room's layers paint from — a tileset file name or stem from `resources/tiles/`. Missing means the DEFAULT tileset: `texture.png` when present, else the first by name — so existing single-sheet games keep their meaning when new sheets are added. Rooms share sheets freely; the reference resolves to a baked index at build time.
+- Tile ids are 0-based frame indices into the room's tileset sheet, **plus 1**; 0 means empty.
 
-Tile behavior metadata lives in `resources/tiles/tiles.json` (optional):
+Tile behavior metadata lives beside its sheet (optional): `<stem>.json` next to the .png, with the legacy `resources/tiles/tiles.json` serving the default tileset (single-sheet games keep their file; a `<stem>.json` always wins when present):
 - "tiles" maps tile ids (as string keys, same 1-based ids rooms use) to properties.
 - "pit": true — a hole; the hero falls in (shrink animation, half heart of damage) and respawns on the last safe tile stood on — unless the room carries a `"pit"` landing (see below), which drops the hero into the room layer below instead.
 - "damage": N — half-hearts lost on contact, with directional knockback and invincibility frames.
@@ -397,7 +398,7 @@ Per-feature smoke checklist (practiced on every round):
 - Generator determinism: two bakes must produce byte-identical `include_auto`/`src_auto`.
 - Save/load soak: `./main --soak` headlessly runs fresh game -> save -> reload -> re-save and requires every persisted byte to round-trip (the rng state is masked: loading a room spawns NPCs, which legitimately advances the world rng).
 
-The generator validates data at bake time (warnings): room layer tile ids in tileset range (out-of-range cleared), animation frames inside their sheets, unknown references (dialogue/enemy/item/object/room/flag names), exits linking to real rooms, orphan rooms unreachable from room 0, malformed optional fields, spawn counts against the engine's fixed budgets, and (once it exists) `custom:` behavior references against the code manifest. The engine asserts indices the generator guarantees (`loadRoom` room index, `tileMetaAt` tile ids).
+The generator validates data at bake time (warnings): room layer tile ids in that room's tileset range (out-of-range cleared), unknown room `"tileset"` references (fall back to the default), animation frames inside their sheets, unknown references (dialogue/enemy/item/object/room/flag names), exits linking to real rooms, orphan rooms unreachable from room 0, malformed optional fields, spawn counts against the engine's fixed budgets, more tilesets than the 16-slot pool, and (once it exists) `custom:` behavior references against the code manifest. The engine asserts indices the generator guarantees (`loadRoom` room index, `tileMetaAt` tile ids).
 
 ## Editor
 
@@ -416,7 +417,8 @@ Room painting covers the `decor`, `colliders`, and `upper` layers (each selectab
 **Definition editors** — the data families get the same list + form treatment:
 - *Enemies tab*: sheet columns + placeholder color, hp/speed/damage, a behavior select over the presets plus the game's registered `custom:` behaviors (read from `resources/code/manifest.json`), sight/shoot period, component checkboxes (boss, mini_boss, strike_immune, catchable) with the mover knobs, per-direction stand/move frame lists ("0,4" notation), and the kind→weight drop table. Creating an enemy stubs a minimal definition that bakes clean (the generator synthesizes placeholder art from the color).
 - *Items tab*: subscreen label, use-action kind over the full vocabulary, sfx, element (bolts/medallions), cost forms (magic half-units, or ammo kind + amount with the rupee fallback), the Somaria spawn pick (from the game's object types), passives (light radius, swim, lift, compass), and the flag-gated upgrade (flag/speed/damage).
-- *Tiles tab*: click a tile on the sheet (metadata-carrying tiles get amber outlines) and edit the tile behavior vocabulary — pit/ice/heal/dig flags, water depth, ledge direction, cuttable + cut result, bombable + bomb result, current push dx/dy, contact damage. Solidity is the colliders layer (painted in Rooms) and walk sfx is per-room; neither is tile metadata in this engine, so the form covers what `tiles.json` actually carries.
+- *Tiles tab*: the tileset manager + per-tile behavior editor. The sidebar lists every sheet in `resources/tiles/` — create scaffolds the starter png + empty metadata, delete guards rooms that reference it (explicitly, or implicitly through the default), and each sheet uploads/replaces its png in place (canonical `<name>.png`, like every other upload). The canvas is the selected tileset: click a tile (metadata-carrying tiles get amber outlines) and edit the tile behavior vocabulary — pit/ice/heal/dig flags, water depth, ledge direction, cuttable + cut result, bombable + bomb result, current push dx/dy, contact damage. Metadata saves to the file the generator reads for that sheet (`<stem>.json`; the legacy `tiles.json` for the default). Solidity is the colliders layer (painted in Rooms) and walk sfx is per-room; neither is tile metadata in this engine.
+- *Rooms tab, tileset*: each room's side panel picks the sheet its layers paint from ("(default)" keeps the room unfielded); the map and palette re-render from the chosen sheet live, and the choice saves as the room's `"tileset"` reference.
 
 **Game identity & new games**: the Build tab carries a Game Identity form (title + slug — the slug is the save identity; changing it orphans existing saves). **A new game folder is a new game**: the editor's "New game" creates a starter folder beside the engine repo — `game.json`, a starter tileset, a `hero` character (placeholder art synthesizes at bake), and a first walled room — and switches the project to it. The generator reads the `LTOP_GAME` env var (a path to any game folder's `resources/`), so builds always run at the engine root while baking whichever project is open; the flow is verified end to end (a template folder baked, built, and booted via test-from-here with zero errors). The saved project IS the game selector — a new resources folder is a new game.
 

@@ -11,6 +11,9 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(PLATFORM_DREAMCAST)
+    #include <unistd.h>     // chdir: boot into the romdisk (see main)
+#endif
 
 #if defined(PLATFORM_WEB)
     #include <emscripten/emscripten.h>
@@ -32,7 +35,16 @@ static bool dangerLoaded = false;
 static char dangerFile[512] = "";
 static float dangerMix = 0.0f;   // 0 = calm bgm, 1 = full danger
 
-static Texture2D tilesetTexture = {};
+// Tileset sheets (one texture per baked tileset; rooms carry their index).
+static Texture2D tilesetTextures[MAX_TILESETS] = {};
+
+// The current room's sheet (clamped to the baked table).
+static Texture2D& roomTilesetTexture()
+{
+    int index = room.config().tilesetIndex;
+    if (index < 0 || index >= TILESET_COUNT || index >= MAX_TILESETS) index = 0;
+    return tilesetTextures[index];
+}
 
 static int prevTileX = -1;
 static int prevTileY = -1;
@@ -1882,11 +1894,15 @@ static bool mirrorTileBlocked(const RoomConfig& cfg, int tileX, int tileY)
     if (cfg.colliders[tileY * w + tileX] != 0) return true;
     int ids[2] = { cfg.decor[tileY * w + tileX],
                    cfg.colliders[tileY * w + tileX] };
+    int tilesetIndex = cfg.tilesetIndex;
+    if (tilesetIndex < 0 || tilesetIndex >= TILESET_COUNT) tilesetIndex = 0;
+    int tileCount = TILESETS[tilesetIndex].tileCount;
+    const TileMeta* metaBase = TILE_META + TILE_META_OFFSETS[tilesetIndex];
     for (int i = 0; i < 2; i++)
     {
         int id = ids[i];
-        if (id <= 0 || id > TILE_META_COUNT) continue;
-        unsigned short flags = TILE_META[id - 1].flags;
+        if (id <= 0 || id > tileCount) continue;
+        unsigned short flags = metaBase[id - 1].flags;
         if (flags & TILE_FLAG_PIT) return true;
         // Deep water is fine with the flippers, a dunk without.
         if ((flags & TILE_FLAG_WATER_DEEP) && !swimItemOwned()) return true;
@@ -6782,7 +6798,7 @@ static void updateAndDraw(void)
     ClearBackground(BLACK);
 
     BeginMode2D(camera);
-    room.draw(tilesetTexture, camera);
+    room.draw(roomTilesetTexture(), camera);
     drawFloorObjects();
     drawGroundFx();
     drawEntitiesSorted();
@@ -6790,7 +6806,7 @@ static void updateAndDraw(void)
     drawObjectsOverhead();
     drawItemGet();
     // Decor-above layer (tree tops, archways): over everything that walks.
-    room.drawUpper(tilesetTexture, camera);
+    room.drawUpper(roomTilesetTexture(), camera);
     // Edge doors: archways and slabs at the wall midpoints.
     drawDoorways();
     EndMode2D();
@@ -6878,6 +6894,14 @@ static void updateAndDraw(void)
 
 int main(int argc, char** argv)
 {
+#if defined(PLATFORM_DREAMCAST)
+    // Assets ride the disc's data track, not the binary: the full sheet/
+    // audio set would never fit the console's 16MB RAM as a romdisk. The
+    // iso9660 fs serves the boot disc at /cd, and chdir sets the kernel
+    // cwd that fs_normalize_path joins relative loads against — so every
+    // "assets/..." open below reads straight off the disc.
+    chdir("/cd");
+#endif
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(896, 448, "LttP Engine");
 
@@ -6899,8 +6923,11 @@ int main(int argc, char** argv)
         uiFontOwned = false;
     }
 
-    tilesetTexture = LoadTexture(TILESET.image);
-    SetTextureFilter(tilesetTexture, TEXTURE_FILTER_POINT);
+    for (int i = 0; i < TILESET_COUNT && i < MAX_TILESETS; i++)
+    {
+        tilesetTextures[i] = LoadTexture(TILESETS[i].image);
+        SetTextureFilter(tilesetTextures[i], TEXTURE_FILTER_POINT);
+    }
 
     heartsTexture = LoadTexture("assets/ui/hearts.png");
     SetTextureFilter(heartsTexture, TEXTURE_FILTER_POINT);
@@ -7057,7 +7084,8 @@ int main(int argc, char** argv)
     room.unload();
     dialogue.shutdown();
     if (uiFontOwned) UnloadFont(uiFont);
-    UnloadTexture(tilesetTexture);
+    for (int i = 0; i < TILESET_COUNT && i < MAX_TILESETS; i++)
+        UnloadTexture(tilesetTextures[i]);
     UnloadTexture(heartsTexture);
     UnloadTexture(pickupsTexture);
     UnloadTexture(beamTexture);

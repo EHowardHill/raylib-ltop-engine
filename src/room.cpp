@@ -75,9 +75,11 @@ bool Room::solidBox(Rectangle box) const
 TileMeta Room::tileMetaAt(int tileX, int tileY) const
 {
     TileMeta meta = { 0, 0, 0, 255, 0, 0, 0, 0 };
-    if (!cfg || TILE_META_COUNT <= 0) return meta;
+    if (!cfg || TILESET_COUNT <= 0) return meta;
     if (tileX < 0 || tileY < 0 || tileX >= cfg->mapWidth || tileY >= cfg->mapHeight) return meta;
 
+    const TilesetConfig& tileset = TILESETS[cfg->tilesetIndex];
+    const TileMeta* metaBase = TILE_META + TILE_META_OFFSETS[cfg->tilesetIndex];
     int decorId = decorState ? decorState[tileY * cfg->mapWidth + tileX]
                              : cfg->decor[tileY * cfg->mapWidth + tileX];
     int ids[2] = { decorId,
@@ -86,8 +88,8 @@ TileMeta Room::tileMetaAt(int tileX, int tileY) const
     {
         int id = ids[i];
         if (id <= 0) continue;             // empty tile
-        assert(id <= TILE_META_COUNT);     // generator validates layer ids
-        TileMeta tile = TILE_META[id - 1];
+        assert(id <= tileset.tileCount);   // generator validates layer ids
+        TileMeta tile = metaBase[id - 1];
         meta.flags |= tile.flags;
         if (tile.damage > meta.damage) meta.damage = tile.damage;
         if (tile.cutResult > 0) meta.cutResult = tile.cutResult;
@@ -131,15 +133,17 @@ bool Room::bombTileAt(int tileX, int tileY)
     // collider; a cracked floor is decor).
     unsigned short result = (meta.bombResult >= 255) ? 0 : (unsigned short)meta.bombResult;
     int index = tileY * cfg->mapWidth + tileX;
+    const TileMeta* metaBase = TILE_META + TILE_META_OFFSETS[cfg->tilesetIndex];
+    int tileCount = TILESETS[cfg->tilesetIndex].tileCount;
     bool blasted = false;
-    if (decorState && decorState[index] > 0 && decorState[index] <= TILE_META_COUNT
-        && (TILE_META[decorState[index] - 1].flags & TILE_FLAG_BOMBABLE))
+    if (decorState && decorState[index] > 0 && decorState[index] <= tileCount
+        && (metaBase[decorState[index] - 1].flags & TILE_FLAG_BOMBABLE))
     {
         decorState[index] = result;
         blasted = true;
     }
-    if (colliderState && colliderState[index] > 0 && colliderState[index] <= TILE_META_COUNT
-        && (TILE_META[colliderState[index] - 1].flags & TILE_FLAG_BOMBABLE))
+    if (colliderState && colliderState[index] > 0 && colliderState[index] <= tileCount
+        && (metaBase[colliderState[index] - 1].flags & TILE_FLAG_BOMBABLE))
     {
         colliderState[index] = result;
         blasted = true;
@@ -155,6 +159,8 @@ static void drawLayer(const RoomConfig* cfg, const unsigned short* layer,
                       int columns, Texture2D tileset,
                       int x0, int y0, int x1, int y1)
 {
+    const TileMeta* metaBase = TILE_META + TILE_META_OFFSETS[cfg->tilesetIndex];
+    int tileCount = TILESETS[cfg->tilesetIndex].tileCount;
     for (int ty = y0; ty <= y1; ty++)
     {
         for (int tx = x0; tx <= x1; tx++)
@@ -165,13 +171,13 @@ static void drawLayer(const RoomConfig* cfg, const unsigned short* layer,
             int frame = id - 1;
             // Animated cycle (water shimmer, lava, ...): the tile's frame
             // comes from the baked anim list instead of the layer id.
-            if (id > 0 && id <= TILE_META_COUNT && TILE_META[id - 1].animCount > 1)
+            if (id > 0 && id <= tileCount && metaBase[id - 1].animCount > 1)
             {
-                const TileMeta& meta = TILE_META[id - 1];
+                const TileMeta& meta = metaBase[id - 1];
                 int step = (int)((float)GetTime() * TILE_ANIM_FPS
                                  + (float)(((tx + ty) & 1) * 0.5f));
                 int frameId = meta.animFrames[step % meta.animCount];
-                if (frameId > 0 && frameId <= TILE_META_COUNT)
+                if (frameId > 0 && frameId <= tileCount)
                     frame = frameId - 1;
             }
 
@@ -203,7 +209,7 @@ void Room::draw(Texture2D tileset, const Camera2D& camera) const
     if (x1 > cfg->mapWidth - 1) x1 = cfg->mapWidth - 1;
     if (y1 > cfg->mapHeight - 1) y1 = cfg->mapHeight - 1;
 
-    int columns = TILESET.columns;
+    int columns = TILESETS[cfg->tilesetIndex].columns;
     if (columns <= 0) columns = 1;
 
     const unsigned short* decor = decorState ? decorState : cfg->decor;
@@ -231,7 +237,7 @@ void Room::drawUpper(Texture2D tileset, const Camera2D& camera) const
     if (x1 > cfg->mapWidth - 1) x1 = cfg->mapWidth - 1;
     if (y1 > cfg->mapHeight - 1) y1 = cfg->mapHeight - 1;
 
-    int columns = TILESET.columns;
+    int columns = TILESETS[cfg->tilesetIndex].columns;
     if (columns <= 0) columns = 1;
 
     drawLayer(cfg, cfg->upper, columns, tileset, x0, y0, x1, y1);

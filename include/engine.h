@@ -4,6 +4,9 @@
 
 constexpr int TILE_SIZE = 32;
 constexpr float VIRTUAL_HEIGHT = 224.0f;
+// Tileset pool: the generator warns past this (fixed arrays keep the
+// console builds predictable, like every other pool).
+constexpr int MAX_TILESETS = 16;
 
 enum Direction
 {
@@ -359,6 +362,7 @@ struct RoomConfig
     int doorW;
     int mapWidth;
     int mapHeight;
+    int tilesetIndex;   // which TILESETS[] entry the room's layers index into
     const unsigned short* decor;
     const unsigned short* colliders;
     const unsigned short* upper;    // optional decor-above layer, drawn over entities

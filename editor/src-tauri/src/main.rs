@@ -239,26 +239,50 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
 }
 
 // The tileset is a single png of 32x32 tiles; derive all metadata from it.
-fn read_tileset(res: &Path) -> Option<Value> {
-    for file in list_files(res, "tiles") {
-        if !file.ends_with(".png") {
+// Tilesets for the scan: every .png in resources/tiles with its derived
+// grid shape, plus the metadata file the generator reads for it
+// (<stem>.json when present; the legacy tiles.json for the default
+// tileset; None when neither exists) and its parsed contents when found.
+fn read_tilesets(res: &Path) -> (Vec<Value>, usize) {
+    let files: Vec<String> = list_files(res, "tiles")
+        .into_iter()
+        .filter(|f| f.ends_with(".png"))
+        .collect();
+    let default_index = files
+        .iter()
+        .position(|f| f == "texture.png")
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for (i, file) in files.into_iter().enumerate() {
+        let Some((width, height)) = png_size(&res.join("tiles").join(&file)) else {
             continue;
-        }
-        let (width, height) = png_size(&res.join("tiles").join(&file))?;
+        };
         let columns = (width / 32) as u64;
-        if columns < 1 {
-            continue;
-        }
-        return Some(json!({
+        let stem = file.trim_end_matches(".png");
+        // Mirror of the generator's tileset_meta_file rule.
+        let meta_path = if res.join("tiles").join(format!("{}.json", stem)).is_file() {
+            Some(format!("{}.json", stem))
+        } else if i == default_index && res.join("tiles").join("tiles.json").is_file() {
+            Some("tiles.json".to_string())
+        } else {
+            None
+        };
+        let meta = meta_path
+            .as_ref()
+            .and_then(|m| read_json(&res.join("tiles").join(m)).ok());
+        out.push(json!({
             "file": file,
             "image": format!("resources/tiles/{}", file),
-            "columns": columns,
-            "tileCount": columns * (height / 32) as u64,
+            "columns": columns.max(1),
+            "tileCount": columns.max(1) * (height / 32) as u64,
             "tileWidth": 32,
             "tileHeight": 32,
+            "metaFile": meta_path,
+            "meta": meta,
         }));
     }
-    None
+    (out, default_index)
 }
 
 fn mime_for(path: &Path) -> &'static str {
@@ -372,6 +396,7 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
     };
 
     let mut dialogues = Vec::new();
+    let (tilesets, default_tileset) = read_tilesets(&res);
     for file in list_files(&res, "dialogue").into_iter().filter(|f| f.ends_with(".json")) {
         dialogues.push(json!({
             "file": file,
@@ -468,7 +493,8 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
     Ok(json!({
         "project": root.to_string_lossy(),
         "platform": platform,
-        "tileset": read_tileset(&res),
+        "tilesets": tilesets,
+        "defaultTileset": default_tileset,
         "dialogues": dialogues,
         "characters": characters,
         "rooms": rooms,
@@ -587,6 +613,26 @@ fn create(
             fs::write(&target, pretty4(&doc)).map_err(|e| e.to_string())?;
             Ok(json!({ "ok": true }))
         }
+        // A new tileset scaffolds the same starter sheet new games get
+        // (placeholder art until a real one is uploaded) + empty behavior
+        // metadata. Rooms reference it by this name.
+        "tileset" => {
+            if name == "texture" {
+                return Err("texture is the default tileset's name; replace it instead".to_string());
+            }
+            let png = res.join("tiles").join(format!("{}.png", name));
+            if png.exists() {
+                return Err("Already exists".to_string());
+            }
+            let bytes = BASE64.decode(STARTER_TILESET_B64.trim()).map_err(|e| e.to_string())?;
+            fs::create_dir_all(res.join("tiles")).map_err(|e| e.to_string())?;
+            fs::write(&png, bytes).map_err(|e| e.to_string())?;
+            let meta = res.join("tiles").join(format!("{}.json", name));
+            if !meta.exists() {
+                fs::write(&meta, pretty4(&json!({ "tiles": {} }))).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({ "ok": true }))
+        }
         // Custom-behavior scaffolding: a registered boilerplate unit in
         // resources/code/ plus the manifest entry the generator validates
         // against. Compile errors surface through the Build tab (or the
@@ -691,6 +737,7 @@ fn upload(state: State<ProjectState>, dir: String, name: String, data: String) -
         ("ui", &[".png"]),
         ("tiles", &[".png"]),
         ("characters", &[".png", ".json"]),
+        ("enemies", &[".png"]),
     ];
     let root = project_root(&state)?;
     let res = root.join("resources");

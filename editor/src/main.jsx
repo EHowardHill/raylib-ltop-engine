@@ -185,7 +185,14 @@ const GRANT_KINDS = ['item', 'rupees', 'arrows', 'bombs', 'magic', 'heart_contai
     'flag', 'key', 'big_key', 'bottle', 'potion_red', 'potion_green', 'potion_blue'];
 
 function RoomEditor({ room, scan, onSaved }) {
-    const tileset = scan.tileset || { image: '', columns: 1, tileCount: 0, tileWidth: 32, tileHeight: 32 };
+    // The room's tileset (shared sheets): its named reference, else the
+    // game's default. The map and palette render from this sheet, and the
+    // picker swaps it live so the layers' ids re-preview immediately.
+    const tilesets = scan.tilesets || [];
+    const defaultTileset = tilesets[scan.defaultTileset || 0];
+    const [tilesetChoice, setTilesetChoice] = useState(room.raw.tileset || '');
+    const tileset = tilesets.find(t => t.file === (tilesetChoice || (defaultTileset || {}).file))
+        || defaultTileset || { image: '', columns: 1, tileCount: 0, tileWidth: 32, tileHeight: 32 };
     const cols = tileset.columns || 1;
     const ts = tileset.tileWidth || 32;
 
@@ -648,6 +655,7 @@ function RoomEditor({ room, scan, onSaved }) {
                 // Preserve keys the editor doesn't edit (buried, ...).
                 ...(room.raw || {}),
                 width: W, height: H,
+                tileset: tilesetChoice || undefined,
                 default: def,
                 encounters: enc,
                 objects: objects,
@@ -926,6 +934,17 @@ function RoomEditor({ room, scan, onSaved }) {
                         </div>
                     )}
                     <p className="dim">Warp pads and stairs carry their targets on the map (place + edit them there); all links preview on the world graph.</p>
+
+                    <h2>Tileset</h2>
+                    <div className="field"><label>Sheet</label>
+                        <select value={tilesetChoice}
+                            onChange={e => { setTilesetChoice(e.target.value); setDirty(true); }}>
+                            <option value="">(default: {(defaultTileset || {}).file || 'none'})</option>
+                            {tilesets.map(t =>
+                                <option key={t.file} value={t.file}>{t.file} ({t.tileCount} tiles)</option>)}
+                        </select>
+                    </div>
+                    <p className="dim">The shared sheet this room's layers paint from — multiple rooms can use the same one (manage them in the Tiles tab).</p>
 
                     <h2>Resize Room</h2>
                     <div className="row">
@@ -1471,8 +1490,46 @@ function EnemiesTab({ scan, refresh }) {
             </div>
             {enemy
                 ? <EnemyEditor key={enemy.file} enemy={enemy} scan={scan} onSaved={refresh} />
-                : <p className="dim">No enemies. Create one, then upload a same-named .png in Music & Files.</p>}
+                : <p className="dim">No enemies. Create one, then upload its sheet (same-named .png) right in the editor.</p>}
         </div>
+    );
+}
+
+// Sheet upload-and-replace for an entity's png: renames whatever the user
+// picks to the canonical same-name pairing (resources/<dir>/<stem>.png), so
+// the json and its art stay linked without leaving the editor.
+function SheetUpload({ dir, file, onUploaded }) {
+    const inputRef = useRef(null);
+    const [status, setStatus] = useState('');
+    const [busy, setBusy] = useState(false);
+
+    const upload = e => {
+        const picked = e.target.files[0];
+        if (!picked) return;
+        setBusy(true);
+        const reader = new FileReader();
+        reader.onload = async () => {
+            // Whatever the picked file is called, it lands under the
+            // entity's canonical name (json stem + .png, or the tileset's
+            // own file when replacing a sheet).
+            const name = file.replace(/\.[^.]+$/, '') + '.png';
+            const result = await api('/api/upload', { dir, name, data: String(reader.result).split(',')[1] });
+            setBusy(false);
+            setStatus(result.error || 'Replaced ' + name);
+            e.target.value = '';
+            if (!result.error) onUploaded();
+        };
+        reader.readAsDataURL(picked);
+    };
+
+    return (
+        <span className="row" style={{ margin: 0 }}>
+            <input ref={inputRef} type="file" accept="image/png" style={{ display: 'none' }} onChange={upload} />
+            <button className="btn" disabled={busy} onClick={() => inputRef.current.click()}>
+                {busy ? 'Uploading…' : 'Upload ' + file.replace(/\.[^.]+$/, '') + '.png'}
+            </button>
+            {status && <span className={status.indexOf('Replaced') === 0 ? 'dim' : 'fail'}>{status}</span>}
+        </span>
     );
 }
 
@@ -1480,6 +1537,17 @@ function EnemyEditor({ enemy, scan, onSaved }) {
     const [data, setData] = useState(enemy.data);
     const [status, setStatus] = useState('');
     const [dirty, setDirty] = useState(false);
+    const [sheet, setSheet] = useState(null);
+    const [sheetVersion, setSheetVersion] = useState(0);
+
+    // Sheet preview: resources/enemies/<stem>.png, reloaded after a replace.
+    const sheetPath = 'resources/enemies/' + stem(enemy.file) + '.png';
+    useEffect(() => {
+        let alive = true;
+        resourceUrl(sheetPath).then(src => { if (alive) setSheet(src); })
+            .catch(() => { if (alive) setSheet(null); });
+        return () => { alive = false; };
+    }, [sheetPath, sheetVersion]);
 
     const stats = data.stats || {};
     const components = stats.components || {};
@@ -1547,6 +1615,12 @@ function EnemyEditor({ enemy, scan, onSaved }) {
             <h1>{enemy.name} {dirty && <span className="fail">(unsaved)</span>}</h1>
 
             <h2>Sheet & Stats</h2>
+            <div className="row">
+                <SheetUpload dir="enemies" file={enemy.file} onUploaded={() => setSheetVersion(v => v + 1)} />
+                {sheet
+                    ? <img className="sheet" src={sheet} style={{ maxHeight: 56 }} alt="" />
+                    : <span className="dim">no sheet yet — the bake draws a placeholder from the color</span>}
+            </div>
             <div className="row">
                 {numberField('Sheet columns', data.width, v => patch('width', v))}
                 <div className="field"><label>Color (rgb)</label>
@@ -1811,18 +1885,46 @@ function ItemEditor({ item, scan, onSaved }) {
 }
 
 function TilesTab({ scan, refresh }) {
-    const tileset = scan.tileset || { image: '', columns: 1, tileCount: 0, tileWidth: 32, tileHeight: 32 };
+    const confirm = useConfirm();
+    const tilesets = scan.tilesets || [];
+    const [selSet, setSelSet] = useState(Math.min(scan.defaultTileset || 0, Math.max(tilesets.length - 1, 0)));
+    const tileset = tilesets[selSet]
+        || { file: '', image: '', columns: 1, tileCount: 0, tileWidth: 32, tileHeight: 32, meta: null, metaFile: null };
     const cols = tileset.columns || 1;
     const ts = tileset.tileWidth || 32;
     const rows = Math.max(1, Math.ceil((tileset.tileCount || 1) / cols));
-    const rawTiles = (scan.tileMeta && scan.tileMeta.tiles) || {};
 
     const [sel, setSel] = useState(1);   // 1-based tile id
-    const [meta, setMeta] = useState(rawTiles);
+    const [meta, setMeta] = useState((tileset.meta && tileset.meta.tiles) || {});
     const [status, setStatus] = useState('');
     const [dirty, setDirty] = useState(false);
+    const [name, setName] = useState('');
+    const [error, setError] = useState('');
     const [img, setImg] = useState(null);
+    const [imgVersion, setImgVersion] = useState(0);
+    const [pending, setPending] = useState(null);   // freshly created tileset to select
     const canvasRef = useRef(null);
+
+    // Switching sheets swaps in that tileset's metadata (discarding unsaved
+    // tile edits, like the other tabs' select guards).
+    const selectSet = async i => {
+        if (i === selSet) return;
+        if (dirty && !await confirm('Discard unsaved tile changes?')) return;
+        setSelSet(i);
+    };
+    useEffect(() => {
+        setMeta((tileset.meta && tileset.meta.tiles) || {});
+        setSel(1);
+        setDirty(false);
+    }, [tileset.file]);
+
+    // Select a freshly created tileset once the refreshed scan carries it.
+    useEffect(() => {
+        if (pending == null) return;
+        const i = tilesets.findIndex(t => t.file === pending);
+        if (i >= 0) setSelSet(i);
+        setPending(null);
+    }, [tilesets, pending]);
 
     useEffect(() => {
         if (!tileset.image) return;
@@ -1834,13 +1936,38 @@ function TilesTab({ scan, refresh }) {
             image.src = src;
         }).catch(() => {});
         return () => { alive = false; };
-    }, [tileset.image]);
+    }, [tileset.image, imgVersion]);
 
     const entry = meta[String(sel)] || {};
 
     const patch = (key, value) => {
         setMeta(prev => ({ ...prev, [String(sel)]: { ...(prev[String(sel)] || {}), [key]: value } }));
         setDirty(true);
+    };
+
+    const create = async () => {
+        if (!name.trim()) return;
+        const result = await api('/api/create', { type: 'tileset', name: name.trim() });
+        if (result.error) return setError(result.error);
+        setName(''); setError('');
+        setPending(name.trim() + '.png');
+        await refresh();
+    };
+
+    const remove = async t => {
+        const refs = scan.rooms.filter(r => r.raw.tileset === t.file).length;
+        const isDefault = ((tilesets[scan.defaultTileset] || {}).file || '') === t.file;
+        const implicit = isDefault ? scan.rooms.filter(r => !r.raw.tileset).length : 0;
+        let msg = 'Delete ' + t.file + '?';
+        if (refs) msg += ' ' + refs + ' room(s) reference it and will fail the bake until repointed.';
+        else if (implicit) msg += ' It is the default sheet for ' + implicit + ' room(s) without an explicit tileset.';
+        if (!await confirm(msg)) return;
+        await api('/api/delete', { path: 'resources/tiles/' + t.file });
+        if (t.metaFile && t.metaFile !== 'tiles.json') {
+            await api('/api/delete', { path: 'resources/tiles/' + t.metaFile });
+        }
+        setSelSet(0);
+        refresh();
     };
 
     useEffect(() => {
@@ -1873,9 +2000,12 @@ function TilesTab({ scan, refresh }) {
     };
 
     const save = async () => {
+        // The sheet's behavior metadata: the file the generator reads for
+        // this tileset, or a fresh <stem>.json when none exists yet.
+        const metaFile = tileset.metaFile || (tileset.file.replace(/\.png$/, '') + '.json');
         await api('/api/save', {
-            path: 'resources/tiles/tiles.json',
-            content: JSON.stringify({ ...(scan.tileMeta || {}), tiles: meta }, null, 4)
+            path: 'resources/tiles/' + metaFile,
+            content: JSON.stringify({ ...(tileset.meta || {}), tiles: meta }, null, 4)
         });
         setDirty(false);
         setStatus('Saved');
@@ -1903,12 +2033,36 @@ function TilesTab({ scan, refresh }) {
     return (
         <div className="layout">
             <div className="sidebar">
-                <h2>Tile Properties</h2>
-                <p className="dim">Click a tile to edit its behavior. Amber outlines carry metadata.</p>
-                <p className="dim">Solidity is the colliders layer (paint it in Rooms), and walk sfx is per-room — the tile vocabulary covers behavior flags only.</p>
+                <h2>Tilesets</h2>
+                {tilesets.map((t, i) => (
+                    <div className="row" key={t.file}>
+                        <button className={'item' + (i === selSet ? ' active' : '')} style={{ flex: 1 }}
+                            onClick={() => selectSet(i)}>{t.file.replace(/\.png$/, '')}</button>
+                        <button className="delete" onClick={() => remove(t)}>×</button>
+                    </div>
+                ))}
+                {tilesets.length === 0 && <p className="dim">No tilesets — create one below.</p>}
+                <h2>New Tileset</h2>
+                <div className="row">
+                    <input placeholder="name" value={name} style={{ width: 92 }} onChange={e => setName(e.target.value)} />
+                    <button className="btn" onClick={create}>Create</button>
+                </div>
+                {error && <p className="fail">{error}</p>}
+                <p className="dim">Scaffolds the starter sheet — replace it with real art beside the canvas.
+                    texture.png is the default every room paints from until it picks a sheet.</p>
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-                <h1>Tile {sel - 1} <span className="dim">(id {sel})</span> {dirty && <span className="fail">(unsaved)</span>}</h1>
+                <h1>{tileset.file || '(no tileset)'} {dirty && <span className="fail">(unsaved)</span>}</h1>
+                <div className="row">
+                    <SheetUpload dir="tiles" file={tileset.file || 'texture.png'}
+                        onUploaded={() => { setImgVersion(v => v + 1); refresh(); }} />
+                    <span className="dim">
+                        {tileset.file
+                            ? 'shared by ' + scan.rooms.filter(r => (r.raw.tileset || ((tilesets[scan.defaultTileset] || {}).file || '')) === tileset.file).length
+                                + ' room(s); metadata: ' + (tileset.metaFile || tileset.file.replace(/\.png$/, '') + '.json (new)')
+                            : ''}
+                    </span>
+                </div>
                 <div className="scrollWrap">
                     <canvas ref={canvasRef} width={cols * ts} height={rows * ts}
                         style={{ width: cols * ts * 2, imageRendering: 'pixelated', cursor: 'pointer', display: 'block', background: '#3a3a44' }}
@@ -1916,7 +2070,7 @@ function TilesTab({ scan, refresh }) {
                 </div>
 
                 <div className="panel" style={{ maxWidth: 560, marginTop: 12 }}>
-                    <h2>Behavior</h2>
+                    <h2>Tile {sel - 1} Behavior <span className="dim">(id {sel} — click a tile above; amber outlines carry metadata)</span></h2>
                     <div className="row">
                         {checkField('pit (hole)', 'pit', 'The hero falls in; with a room pit-landing, drops through')}
                         {checkField('ice', 'ice', 'Momentum sliding')}
@@ -2564,6 +2718,7 @@ function CharacterEditor({ character, onSaved }) {
     const [playing, setPlaying] = useState(true);
     const [previewIdx, setPreviewIdx] = useState(0);
     const [img, setImg] = useState(null);
+    const [imgVersion, setImgVersion] = useState(0);
     const sheetRef = useRef(null);
     const stripRef = useRef(null);
     const previewRef = useRef(null);
@@ -2579,7 +2734,7 @@ function CharacterEditor({ character, onSaved }) {
             image.src = src;
         }).catch(() => {});
         return () => { alive = false; };
-    }, [pngPath]);
+    }, [pngPath, imgVersion]);
 
     // Same column logic as generate_assets.py: json width wins, else png width.
     const cols = data.width > 0 ? data.width : (img ? Math.floor(img.width / 32) : 1);
@@ -2763,6 +2918,11 @@ function CharacterEditor({ character, onSaved }) {
         <div style={{ flex: 1 }}>
             <h1>{character.file}{!character.png && <span className="fail"> (missing {stem(character.file)}.png)</span>}
                 {dirty && <span className="fail"> (unsaved changes)</span>}</h1>
+            <div className="row">
+                <SheetUpload dir="characters" file={character.file}
+                    onUploaded={() => { setImgVersion(v => v + 1); onSaved(); }} />
+                {img && <img className="sheet" src={img.src} style={{ maxHeight: 56 }} alt="" />}
+            </div>
             <div className="field"><label>Width (tiles)</label>
                 <input type="number" value={data.width != null ? data.width : ''}
                     placeholder={img ? String(Math.floor(img.width / 32)) : 'auto'}
@@ -2833,7 +2993,7 @@ function CharacterEditor({ character, onSaved }) {
                     <p className="dim">{frames.length ? 'Indices: ' + frames.join(', ') : '(empty)'}</p>
                 </div>
             ) : (
-                <p className="dim">Upload {stem(character.file)}.png in Music & Files to use the graphical frame picker. Frames can still be typed below.</p>
+                <p className="dim">Upload a sheet above ({stem(character.file)}.png) to use the graphical frame picker. Frames can still be typed below.</p>
             )}
 
             <h2>Raw Frame List <span className="dim">({anim.kind}.{anim.dir}, comma separated indices)</span></h2>
@@ -2898,6 +3058,7 @@ function FilesTab({ scan, refresh }) {
                     <option value="ui">resources/ui</option>
                     <option value="tiles">resources/tiles</option>
                     <option value="characters">resources/characters</option>
+                    <option value="enemies">resources/enemies</option>
                 </select>
                 <input type="file" onChange={upload} />
                 <span className="dim">{status}</span>

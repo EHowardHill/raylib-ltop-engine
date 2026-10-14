@@ -2,8 +2,9 @@
 """Generate include_auto/assets.h and src_auto/assets.cpp from the .json
 files in resources/, so the Raylib binary never parses json at runtime.
 Rooms store their tile layers directly in json (edited with the web editor);
-the tileset is derived from the tile png's dimensions. Also creates the
-dialogue box border bitmap if the resources folder does not contain one yet."""
+tilesets are the .png files in resources/tiles (32x32 grids, one or many —
+rooms reference one by name). Also creates the dialogue box border bitmap
+if the resources folder does not contain one yet."""
 
 import json
 import math
@@ -913,32 +914,57 @@ def load_enemies(manifest):
     return enemies
 
 
-def load_tileset():
-    """The tileset is a single png in resources/tiles: a 32x32 tile grid.
-    All metadata (columns, tile count) is derived from its dimensions, so no
-    Tiled .tsx file is needed."""
+def load_tilesets():
+    """Tilesets are the .png files in resources/tiles: each a 32x32 tile
+    grid (all metadata — columns, tile count — derives from its dimensions,
+    so no Tiled .tsx file is needed). Rooms reference one by name (file or
+    stem); rooms without a reference use the DEFAULT tileset — texture.png
+    when present, else the first by name — so existing single-tileset games
+    keep their meaning when new sheets are added."""
     directory = res("tiles")
     if not os.path.isdir(directory):
-        return None
+        return [], 0
+    tilesets = []
     for filename in sorted(os.listdir(directory)):
         if not filename.endswith(".png"):
             continue
         image_path = os.path.join(directory, filename)
         image_width, image_height = png_size(image_path)
         columns = image_width // TILE
-        return {
+        tilesets.append({
+            "file": filename,
             "image": "assets/tiles/" + filename,
             "firstGid": 1,
             "columns": columns,
             "tileCount": columns * (image_height // TILE),
             "tileWidth": TILE,
             "tileHeight": TILE,
-        }
+        })
+    names = [t["file"] for t in tilesets]
+    default_index = 0
+    if "texture.png" in names:
+        default_index = names.index("texture.png")
+    return tilesets, default_index
+
+
+def tileset_meta_file(tileset, default_tileset=False):
+    """The json a tileset's behavior metadata lives in: <stem>.json beside
+    the png when present; else the legacy tiles.json for the default
+    tileset (single-sheet games keep their file); else None."""
+    stem = tileset["file"][:-4]
+    per_sheet = res("tiles", stem + ".json")
+    if os.path.exists(per_sheet):
+        return per_sheet
+    if default_tileset:
+        legacy = res("tiles", "tiles.json")
+        if os.path.exists(legacy):
+            return legacy
     return None
 
 
-def load_tile_meta(tileset):
-    """Tile property metadata lives in resources/tiles/tiles.json (optional).
+def load_tile_meta(tileset, default_tileset=False):
+    """Tile property metadata lives beside the sheet (see
+    tileset_meta_file); the default tileset reads the legacy tiles.json.
 
     Format: {"tiles": {"<id>": {"pit": true, "damage": 1, "cuttable": true,
     "cut_result": <tile id>, "water": "deep"|"shallow", "ice": true,
@@ -963,10 +989,11 @@ def load_tile_meta(tileset):
              "anim": []}
             for _ in range(max(count, 0))]
 
-    path = res("tiles", "tiles.json")
-    if not os.path.exists(path):
+    path = tileset_meta_file(tileset, default_tileset)
+    if path is None or not os.path.exists(path):
         return meta
 
+    meta_name = os.path.basename(path)
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
 
@@ -974,10 +1001,10 @@ def load_tile_meta(tileset):
         try:
             tile_id = int(value)
         except (TypeError, ValueError):
-            warn("tiles.json %s '%s' is not a tile id" % (what, value))
+            warn("%s %s '%s' is not a tile id" % (meta_name, what, value))
             return 0
         if tile_id < 0 or tile_id > count:
-            warn("tiles.json %s %d is outside the tileset (0..%d)" % (what, tile_id, count))
+            warn("%s %s %d is outside the tileset (0..%d)" % (meta_name, what, tile_id, count))
             return 0
         return tile_id
 
@@ -985,14 +1012,14 @@ def load_tile_meta(tileset):
         try:
             tile_id = int(key)
         except ValueError:
-            warn("tile id '%s' in tiles.json is not a number" % key)
+            warn("tile id '%s' in %s is not a number" % (key, meta_name))
             continue
         if not isinstance(props, dict):
-            warn("tile %d in tiles.json has no property object" % tile_id)
+            warn("tile %d in %s has no property object" % (tile_id, meta_name))
             continue
         if tile_id < 1 or tile_id > count:
-            warn("tiles.json references tile %d, outside the tileset (1..%d)"
-                 % (tile_id, count))
+            warn("%s references tile %d, outside the tileset (1..%d)"
+                 % (meta_name, tile_id, count))
             continue
         entry = meta[tile_id - 1]
         if props.get("pit"):
@@ -1011,8 +1038,8 @@ def load_tile_meta(tileset):
             elif water == "shallow":
                 entry["flags"] |= 16
             else:
-                warn("tiles.json tile %d has unknown water depth '%s' "
-                     "(expected 'deep' or 'shallow')" % (tile_id, water))
+                warn("%s tile %d has unknown water depth '%s' "
+                     "(expected 'deep' or 'shallow')" % (meta_name, tile_id, water))
         if props.get("ice"):
             entry["flags"] |= 32
         ledge = props.get("ledge")
@@ -1022,8 +1049,8 @@ def load_tile_meta(tileset):
                 entry["ledgeDir"] = ledge_dirs[ledge]
                 entry["flags"] |= 64
             else:
-                warn("tiles.json tile %d has unknown ledge direction '%s' "
-                     "(expected down/right/left/up)" % (tile_id, ledge))
+                warn("%s tile %d has unknown ledge direction '%s' "
+                     "(expected down/right/left/up)" % (meta_name, tile_id, ledge))
         push = props.get("push")
         if push is not None:
             if (isinstance(push, (list, tuple)) and len(push) == 2
@@ -1033,8 +1060,8 @@ def load_tile_meta(tileset):
                 entry["pushX"] = clamp_push(push[0])
                 entry["pushY"] = clamp_push(push[1])
             else:
-                warn("tiles.json tile %d has a bad 'push' %r "
-                     "(expected [dx, dy] in px/s)" % (tile_id, push))
+                warn("%s tile %d has a bad 'push' %r "
+                     "(expected [dx, dy] in px/s)" % (meta_name, tile_id, push))
         if props.get("bombable"):
             entry["flags"] |= 128
             if props.get("bomb_result") is not None:
@@ -1055,11 +1082,11 @@ def load_tile_meta(tileset):
                 if len(frames) > 1:
                     entry["anim"] = frames
                 elif frames:
-                    warn("tiles.json tile %d anim cycle needs at least two"
-                         " distinct frames" % tile_id)
+                    warn("%s tile %d anim cycle needs at least two"
+                         " distinct frames" % (meta_name, tile_id))
             else:
-                warn("tiles.json tile %d has a bad 'anim' %r "
-                     "(expected a list of tile ids)" % (tile_id, anim))
+                warn("%s tile %d has a bad 'anim' %r "
+                     "(expected a list of tile ids)" % (meta_name, tile_id, anim))
     return meta
 
 
@@ -1109,17 +1136,38 @@ def load_room_layers(stem, filename, data, tile_count=0):
 
 
 def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
-               flags=None, tile_count=0):
+               flags=None, tilesets=None, default_tileset=0):
     rooms = []
     directory = res("rooms")
     if not os.path.isdir(directory):
         return rooms
+    if tilesets is None:
+        tilesets = []
+    tileset_by_name = {}
+    for i, t in enumerate(tilesets):
+        tileset_by_name[t["file"]] = i
+        tileset_by_name[t["file"][:-4]] = i  # file or stem
+
     for filename in sorted(os.listdir(directory)):
         if not filename.endswith(".json"):
             continue
         stem = filename[:-5]
         with open(os.path.join(directory, filename), "r", encoding="utf-8") as handle:
             data = json.load(handle)
+
+        # The room's tileset (shared sheets): a named reference, or the
+        # default tileset when the room doesn't carry one.
+        tileset_name = data.get("tileset")
+        tileset_index = default_tileset
+        if tileset_name:
+            tileset_index = tileset_by_name.get(str(tileset_name), -1)
+            if tileset_index < 0:
+                warn("room '%s' references unknown tileset '%s' (using the default)"
+                     % (stem, tileset_name))
+                tileset_index = default_tileset
+        elif not tilesets:
+            tileset_index = 0
+        tile_count = tilesets[tileset_index]["tileCount"] if tilesets else 0
 
         parsed = load_room_layers(stem, filename, data, tile_count)
         if parsed is None:
@@ -1414,6 +1462,7 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
 
         rooms.append({
             "name": filename,
+            "tilesetIndex": tileset_index,
             "hero": character_index.get(hero_name, -1),
             "hasSpawn": has_spawn,
             "spawnX": int(spawn[0]) if has_spawn else 0,
@@ -1834,26 +1883,52 @@ def emit_game(c, game, manifest):
     c.append("")
 
 
-def emit_tile_meta(c, meta):
-    if meta:
-        c.append("const TileMeta TILE_META[] = {")
-        per_line = 6
-        for i in range(0, len(meta), per_line):
-            chunk = meta[i:i + per_line]
-            c.append("    " + " ".join(
-                "{ %d, %d, %d, %d, %d, %d, %d, %d, %d, { %d, %d, %d, %d } }," % (
-                    m["flags"], m["damage"], m["cutResult"], m["bombResult"],
-                    m["pushX"], m["pushY"], m["ledgeDir"], m["heal"],
-                    len(m["anim"]),
-                    (m["anim"] + [0, 0, 0, 0])[0],
-                    (m["anim"] + [0, 0, 0, 0])[1],
-                    (m["anim"] + [0, 0, 0, 0])[2],
-                    (m["anim"] + [0, 0, 0, 0])[3])
-                for m in chunk))
+def emit_tilesets(c, tilesets, tile_metas):
+    """Bake the tileset table, the concatenated per-tile behavior metadata,
+    and the per-tileset offsets into it (room tile ids index their own
+    tileset's slice: TILE_META[OFFSET[room.tilesetIndex] + id - 1])."""
+    if tilesets:
+        c.append("const TilesetConfig TILESETS[] = {")
+        c.append("    " + " ".join(
+            "{ %s, %d, %d, %d, %d, %d }," % (
+                cstr(t["image"]), t["firstGid"], t["columns"],
+                t["tileCount"], t["tileWidth"], t["tileHeight"])
+            for t in tilesets))
         c.append("};")
     else:
-        c.append("const TileMeta TILE_META[] = { { 0, 0, 0, 255, 0, 0, 0, 0, 0, { 0, 0, 0, 0 } } };")
-    c.append("const int TILE_META_COUNT = %d;" % len(meta))
+        c.append("const TilesetConfig TILESETS[] = { { 0, 1, 1, 0, %d, %d } };" % (TILE, TILE))
+    c.append("const int TILESET_COUNT = %d;" % len(tilesets))
+    c.append("")
+
+    offsets = []
+    total = 0
+    flat = []
+    for meta in tile_metas:
+        offsets.append(total)
+        total += len(meta)
+        flat.extend(meta)
+    if not flat:
+        flat = [{"flags": 0, "damage": 0, "cutResult": 0, "bombResult": 255,
+                 "pushX": 0, "pushY": 0, "ledgeDir": 0, "heal": 0, "anim": []}]
+        total = len(flat)
+    c.append("const TileMeta TILE_META[] = {")
+    per_line = 6
+    for i in range(0, len(flat), per_line):
+        chunk = flat[i:i + per_line]
+        c.append("    " + " ".join(
+            "{ %d, %d, %d, %d, %d, %d, %d, %d, %d, { %d, %d, %d, %d } }," % (
+                m["flags"], m["damage"], m["cutResult"], m["bombResult"],
+                m["pushX"], m["pushY"], m["ledgeDir"], m["heal"],
+                len(m["anim"]),
+                (m["anim"] + [0, 0, 0, 0])[0],
+                (m["anim"] + [0, 0, 0, 0])[1],
+                (m["anim"] + [0, 0, 0, 0])[2],
+                (m["anim"] + [0, 0, 0, 0])[3])
+            for m in chunk))
+    c.append("};")
+    c.append("const int TILE_META_COUNT = %d;" % total)
+    c.append("const int TILE_META_OFFSETS[] = { %s };"
+             % ", ".join(str(o) for o in offsets))
     c.append("")
 
 
@@ -2004,6 +2079,7 @@ def emit_rooms(c, rooms):
             str(room["doorN"]), str(room["doorS"]),
             str(room["doorE"]), str(room["doorW"]),
             str(room["mapWidth"]), str(room["mapHeight"]),
+            str(room["tilesetIndex"]),
             decor_ref, colliders_ref, upper_ref,
             str(room["exitN"]), str(room["exitS"]),
             str(room["exitE"]), str(room["exitW"]),
@@ -3279,15 +3355,20 @@ def generate(dump_flags=False):
     enemies = load_enemies(manifest)
     enemy_index = {e["name"]: i for i, e in enumerate(enemies)}
 
-    tileset = load_tileset()
-    if tileset is None:
+    tilesets, default_tileset = load_tilesets()
+    if not tilesets:
         warn("no tileset found in resources/tiles")
+    if len(tilesets) > 16:
+        warn("%d tilesets found; the engine's pool holds 16 (extras ignored)"
+             % len(tilesets))
+        tilesets = tilesets[:16]
 
-    tile_meta = load_tile_meta(tileset)
+    tile_metas = [load_tile_meta(t, i == default_tileset)
+                  for i, t in enumerate(tilesets)]
 
     rooms = load_rooms(dialogue_index, character_index, enemy_index,
                        enemy_defs=enemies, flags=flags,
-                       tile_count=tileset["tileCount"] if tileset else 0)
+                       tilesets=tilesets, default_tileset=default_tileset)
 
     # Fixed-pool budget validation (the engine uses fixed-size arrays so
     # the console builds stay predictable; warn at bake instead of letting
@@ -3483,7 +3564,14 @@ def generate(dump_flags=False):
     h.append("")
     h.append("extern const int ENCOUNTER_TOTAL;")
     h.append("")
-    h.append("extern const TilesetConfig TILESET;")
+    h.append("// Tilesets (resources/tiles/*.png): rooms carry an index; ids in room")
+    h.append("// layers are 1-based frame indices into that room's tileset.")
+    h.append("extern const TilesetConfig TILESETS[];")
+    h.append("extern const int TILESET_COUNT;")
+    h.append("")
+    h.append("extern const TileMeta TILE_META[];")
+    h.append("extern const int TILE_META_COUNT;")
+    h.append("extern const int TILE_META_OFFSETS[];")
     h.append("")
     h.append("extern const TileMeta TILE_META[];")
     h.append("extern const int TILE_META_COUNT;")
@@ -3576,7 +3664,7 @@ def generate(dump_flags=False):
     emit_objects(c, object_types)
     emit_items(c, items)
     emit_rooms(c, rooms)
-    emit_tile_meta(c, tile_meta)
+    emit_tilesets(c, tilesets, tile_metas)
 
     c.append("const char* const WORLD_FLAG_NAMES[] = {")
     for name in flags.names:
@@ -3585,13 +3673,6 @@ def generate(dump_flags=False):
     c.append("const int WORLD_FLAG_COUNT = %d;" % len(flags.names))
     c.append("bool gWorldFlags[WORLD_FLAG_COUNT > 0 ? WORLD_FLAG_COUNT : 1] = {};")
     c.append("const int WORLD_FLAG_CRYSTAL_RED = %d;" % crystal_flag_index)
-    c.append("")
-    if tileset:
-        c.append("const TilesetConfig TILESET = { %s, %d, %d, %d, %d, %d };"
-                  % (cstr(tileset["image"]), tileset["firstGid"], tileset["columns"],
-                     tileset["tileCount"], tileset["tileWidth"], tileset["tileHeight"]))
-    else:
-        c.append("const TilesetConfig TILESET = { 0, 1, 1, 0, %d, %d };" % (TILE, TILE))
     c.append("")
 
     # Tooling mode (--flags): print the world-flag registry as JSON and
@@ -3633,9 +3714,9 @@ def generate(dump_flags=False):
         if room_kb > 128.0:
             warn("room '%s' layers bake ~%.0f KB each (> 128 KB) — "
                  "large rooms multiply the web budget" % (room["name"], room_kb))
-    print("  %d dialogues, %d characters, %d enemies, %d items, %d object types, %d rooms, %d tile meta entries"
+    print("  %d dialogues, %d characters, %d enemies, %d items, %d object types, %d rooms, %d tilesets, %d tile meta entries"
           % (len(dialogues), len(characters), len(enemies), len(items), len(object_types), len(rooms),
-             sum(1 for m in tile_meta if m["flags"] or m["damage"])))
+             len(tilesets), sum(1 for m in tile_metas for m in m if m["flags"] or m["damage"])))
     sync_runtime_assets()
 
     if len(rooms) == 0:

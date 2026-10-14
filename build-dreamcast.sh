@@ -10,9 +10,11 @@ set -e
 #         build/dreamcast/ltop.cdi  (self-boot disc image, burn with ImgBurn/
 #                                    DiscJuggler, or run in an emulator)
 #
-# NOTE (runtime): the engine loads its assets from "assets/..." disk paths.
-# The romdisk packs them under /rd/assets; wiring the engine's asset paths to
-# the console file systems (romdisk/DFS) is follow-up porting work.
+# NOTE (runtime): assets/ rides the disc's data track as plain files
+# (mkdcdisc -d); the engine chdir()s to /cd at boot so its "assets/..."
+# loads read straight off the disc. They must NOT go in a romdisk — the
+# sheet/audio set (27MB here) would blow past the console's 16MB RAM
+# before the first instruction runs.
 
 cd "$(dirname "$0")"
 
@@ -28,16 +30,18 @@ fi
 docker build -q -t ltop/dreamcast -f scripts/console/dreamcast.Dockerfile scripts/console >/dev/null
 
 # Compile + link + package inside the container
-mkdir -p build/dreamcast/romdisk
-rm -rf build/dreamcast/romdisk/assets
-cp -R assets build/dreamcast/romdisk/assets
+mkdir -p build/dreamcast
+rm -rf build/dreamcast/romdisk
 docker run --rm -v "$PWD":/src -w /src/build/dreamcast ltop/dreamcast bash -c '
     set -e
     source $KOS_BASE/environ.sh
     # -B: full rebuild each run; the engine is small and the KOS rules here do
     # not track header dependencies, so stale objects are worse than a slow link
     make -B -f /src/scripts/console/dreamcast.Makefile
-    mkdcdisc --allow-overwrite -N -n "LTOP ENGINE" -a "ltop-engine" -e ltop.elf -o ltop.cdi
+    # The data track: 1ST_READ.BIN (from the elf) + the assets/ tree, which
+    # the engine reads live at /cd (see the note up top).
+    mkdcdisc --allow-overwrite -N -n "LTOP ENGINE" -a "ltop-engine" \
+        -e ltop.elf -d /src/assets -o ltop.cdi
 '
 
 echo "Done. build/dreamcast/ltop.elf (dcload) and build/dreamcast/ltop.cdi (disc image)."
