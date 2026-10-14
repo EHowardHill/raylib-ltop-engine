@@ -56,6 +56,7 @@ private:
     void drawChoices(Rectangle box) const;
 
     Font font;
+    bool fontOwned;  // the default font is borrowed, a loaded one is ours
     Texture2D border;
     // Letter cues decode lazily through the shared cache (sfx.h).
     LazySound letterSfx;

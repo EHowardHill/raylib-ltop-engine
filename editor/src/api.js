@@ -32,3 +32,12 @@ export async function resourceUrl(relPath) {
   const { mime, data } = await invoke('read_resource', { path: relPath });
   return 'data:' + mime + ';base64,' + data;
 }
+
+// Fetch a resource file as UTF-8 text (source files the editor edits).
+export async function resourceText(relPath) {
+  const { data } = await invoke('read_resource', { path: relPath });
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}

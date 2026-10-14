@@ -126,6 +126,7 @@ Hero::Hero()
       knockX(0.0f), knockY(0.0f), swordHeldTime(0.0f), chargeCuePlayed(false),
       dashX(0.0f), dashY(0.0f), swing_(0), safeTileX(-1), safeTileY(-1),
       velX(0.0f), velY(0.0f), splashX(0.0f), splashY(0.0f), wading_(false),
+      fallFromX(0.0f), fallFromY(0.0f), fallCenterX(0.0f), fallCenterY(0.0f),
       fallRedirectRoom(-1), fallRedirectX(0), fallRedirectY(0),
       fallRedirectPending(false),
       canSwim_(false), strokeTime(0.0f), riding_(false),
@@ -315,6 +316,15 @@ void Hero::startFall()
 {
     setState(HERO_FALL);
     moving = false;
+    // Glide into the hole's center while shrinking: the fall reads as
+    // "dropping in", not "shrinking on the spot".
+    int tileX = 0;
+    int tileY = 0;
+    tileUnder(tileX, tileY);
+    fallFromX = x;
+    fallFromY = y;
+    fallCenterX = (float)(tileX * TILE_SIZE);
+    fallCenterY = (float)(tileY * TILE_SIZE);
     if (sfxLoaded) PlaySound(fallSfx);
 }
 
@@ -702,10 +712,17 @@ void Hero::update(const Room& room, float dt)
     }
 
     case HERO_FALL:
-        // Frozen over the hole, shrinking into it. On completion: damage,
-        // then respawn on the last safe tile stood on (or die at 0 hearts)
-        // — unless the room's pit-landing redirect is armed, in which
-        // case main warps the hero to the room below instead.
+        // Frozen over the hole, gliding into its center while shrinking.
+        // On completion: damage, then respawn on the last safe tile stood
+        // on (or die at 0 hearts) — unless the room's pit-landing redirect
+        // is armed, in which case main warps the hero to the room below
+        // instead.
+        {
+            float t = stateTime / FALL_DURATION;
+            if (t > 1.0f) t = 1.0f;
+            x = fallFromX + (fallCenterX - fallFromX) * t;
+            y = fallFromY + (fallCenterY - fallFromY) * t;
+        }
         if (stateTime >= FALL_DURATION)
         {
             health_ -= FALL_DAMAGE;
@@ -1106,6 +1123,52 @@ void Hero::update(const Room& room, float dt)
 // Reflection squash: how tall the mirrored copy is vs. the sprite.
 static const float REFLECT_SQUASH = 0.62f;
 
+// Animation channel for the current state (see hero.h): the optional
+// character blocks when the sheet carries them, the stand/move pair (with
+// its own cross-fallback) otherwise.
+const DirectionalFrames* Hero::animFrames() const
+{
+    if (!cfg) return 0;
+    const bool walking = (state_ == HERO_WALK || state_ == HERO_DASH);
+    const DirectionalFrames* primary = 0;
+    const DirectionalFrames* secondary = 0;
+    switch (state_)
+    {
+    case HERO_SWIM:
+        primary = &cfg->swim[facing];
+        secondary = &cfg->move[facing];
+        break;
+    case HERO_ATTACK:
+    case HERO_SPIN:
+        primary = &cfg->attack[facing];
+        secondary = &cfg->stand[facing];
+        break;
+    case HERO_HURT:
+        primary = &cfg->hurt[facing];
+        secondary = &cfg->stand[facing];
+        break;
+    case HERO_LIFT:
+        primary = &cfg->lift[facing];
+        secondary = &cfg->stand[facing];
+        break;
+    default:
+        if (carrying_)
+        {
+            primary = &cfg->lift[facing];
+            secondary = walking ? &cfg->move[facing] : &cfg->stand[facing];
+        }
+        else
+        {
+            primary = walking ? &cfg->move[facing] : &cfg->stand[facing];
+            secondary = walking ? &cfg->stand[facing] : &cfg->move[facing];
+        }
+        break;
+    }
+    if (primary->count > 0) return primary;
+    if (secondary->count > 0) return secondary;
+    return &cfg->stand[facing];
+}
+
 void Hero::drawReflection() const
 {
     // Only the plain standing/walking hero reflects; the special-state
@@ -1192,8 +1255,10 @@ void Hero::draw() const
         float scale = 1.0f - stateTime;
         if (scale < 0.05f) return;
         float w = (float)TILE_SIZE * scale;
-        Rectangle dest = { x + (float)TILE_SIZE * 0.5f - w * 0.5f,
-                           y + (float)TILE_SIZE * 0.5f - w * 0.5f, w, w };
+        // DrawTexturePro positions the drawn rect's top-left at
+        // (dest.xy - origin): the pivot goes at the tile center.
+        Rectangle dest = { x + (float)TILE_SIZE * 0.5f,
+                           y + (float)TILE_SIZE * 0.5f, w, w };
         Vector2 origin = { w * 0.5f, w * 0.5f };
         DrawTexturePro(sheet, src, dest, origin, stateTime * 720.0f, WHITE);
         return;
@@ -1307,12 +1372,10 @@ void Hero::draw() const
     {
         // Floating on the surface: a slow bob plus ripple rings that mark
         // each stroke (no blob shadow — main skips it while swimming).
-        int frame = 0;
-        const DirectionalFrames* frames = &cfg->move[facing];
-        if (frames->count <= 0) frames = &cfg->stand[facing];
-        if (frames->count <= 0) return;
+        const DirectionalFrames* frames = animFrames();
+        if (!frames || frames->count <= 0) return;
         float fps = moving ? MOVE_ANIM_FPS : STAND_ANIM_FPS;
-        frame = frames->frames[(int)(animTime * fps) % frames->count];
+        int frame = frames->frames[(int)(animTime * fps) % frames->count];
 
         float bob = sinf(animTime * SWIM_BOB_FREQ * PI) * SWIM_BOB_AMP;
         Vector2 c = { x + TILE_SIZE * 0.5f, y + TILE_SIZE * 0.72f };
@@ -1458,9 +1521,10 @@ void Hero::draw() const
     if (state_ == HERO_SPIN && swordSheet.id != 0)
     {
         // Spin: the slash arc whirls around the hero (two rotations).
+        // The pivot (dest + origin pair) sits on the hero's center.
         Rectangle src = { 0.0f, 0.0f, 64.0f, 64.0f };
         Vector2 centerPos = { x + (float)TILE_SIZE * 0.5f, y + (float)TILE_SIZE * 0.5f };
-        Rectangle dest = { centerPos.x - 32.0f, centerPos.y - 32.0f, 64.0f, 64.0f };
+        Rectangle dest = { centerPos.x, centerPos.y, 64.0f, 64.0f };
         Vector2 origin = { 32.0f, 32.0f };
         DrawTexturePro(swordSheet, src, dest, origin,
                         (stateTime / SPIN_DURATION) * 720.0f, WHITE);
@@ -1490,12 +1554,15 @@ void Hero::draw() const
         DrawTexturePro(swordSheet, src, dest, origin, 0.0f, WHITE);
     }
 
-    const DirectionalFrames* frames = (state_ == HERO_WALK || state_ == HERO_DASH) ? &cfg->move[facing] : &cfg->stand[facing];
-    if (frames->count <= 0)
-        frames = (state_ == HERO_WALK || state_ == HERO_DASH) ? &cfg->stand[facing] : &cfg->move[facing];
-    if (frames->count <= 0) return;
+    const DirectionalFrames* frames = animFrames();
+    if (!frames || frames->count <= 0) return;
 
-    float fps = (state_ == HERO_WALK || state_ == HERO_DASH) ? MOVE_ANIM_FPS : STAND_ANIM_FPS;
+    // Action channels animate at the walk cadence; the idle pair keeps
+    // its slow breathing pace.
+    float fps = (state_ == HERO_WALK || state_ == HERO_DASH
+                 || state_ == HERO_ATTACK || state_ == HERO_SPIN
+                 || (state_ == HERO_SWIM && moving))
+                    ? MOVE_ANIM_FPS : STAND_ANIM_FPS;
     int index = (int)(animTime * fps);
     if (index < 0) index = 0;
     index = frames->frames[index % frames->count];

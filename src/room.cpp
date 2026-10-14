@@ -147,6 +147,10 @@ bool Room::bombTileAt(int tileX, int tileY)
     return blasted;
 }
 
+// Animated tiles step at this rate; the parity of the tile offsets the
+// phase by half a beat so neighboring tiles shimmer out of step.
+static const float TILE_ANIM_FPS = 2.2f;
+
 static void drawLayer(const RoomConfig* cfg, const unsigned short* layer,
                       int columns, Texture2D tileset,
                       int x0, int y0, int x1, int y1)
@@ -159,6 +163,18 @@ static void drawLayer(const RoomConfig* cfg, const unsigned short* layer,
             if (id == 0) continue;
 
             int frame = id - 1;
+            // Animated cycle (water shimmer, lava, ...): the tile's frame
+            // comes from the baked anim list instead of the layer id.
+            if (id > 0 && id <= TILE_META_COUNT && TILE_META[id - 1].animCount > 1)
+            {
+                const TileMeta& meta = TILE_META[id - 1];
+                int step = (int)((float)GetTime() * TILE_ANIM_FPS
+                                 + (float)(((tx + ty) & 1) * 0.5f));
+                int frameId = meta.animFrames[step % meta.animCount];
+                if (frameId > 0 && frameId <= TILE_META_COUNT)
+                    frame = frameId - 1;
+            }
+
             Rectangle src = { (float)((frame % columns) * TILE_SIZE),
                              (float)((frame / columns) * TILE_SIZE),
                              (float)TILE_SIZE, (float)TILE_SIZE };

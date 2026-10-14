@@ -182,6 +182,10 @@ private:
     void startDeath();
     void startSpin();
     void startDash(float dx, float dy);
+    // Animation channel for the current state: the character's optional
+    // attack/lift/swim/hurt blocks when they carry frames, the stand/move
+    // pair otherwise (empty channels fall back, never a blank hero).
+    const DirectionalFrames* animFrames() const;
     bool slideWithCollision(const Room& room, float dx, float dy);
     void updateFootsteps(const Room& room, float movedDist, const char* overrideSfx = 0);
     void drawFrame(int frame, float scaleX, float scaleY, float yOff = 0.0f) const;
@@ -232,6 +236,12 @@ private:
     // safe tile from there).
     float splashX;
     float splashY;
+    // Pit fall: the hole's center the hero glides into while shrinking
+    // (takeoff position + the pit tile's sprite-aligned center).
+    float fallFromX;
+    float fallFromY;
+    float fallCenterX;
+    float fallCenterY;
     bool wading_;
     // Pit-landing redirect (see setFallRedirect / takeFallRedirect).
     int fallRedirectRoom;

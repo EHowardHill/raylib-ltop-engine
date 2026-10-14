@@ -139,8 +139,10 @@ Rectangle Enemy::box() const
 {
     if (cfg && cfg->boss)
     {
-        // 1.5x sprite centered on the tile: a bigger target.
-        return Rectangle{ x + 4.0f, y + 4.0f, 24.0f, 24.0f };
+        // The full 1.5x sprite (48x48 centered on the tile): swings that
+        // clip the big sprite connect — a charging boss that overlaps the
+        // hero's tile stays reachable by the sword, like LttP.
+        return Rectangle{ x - 8.0f, y - 8.0f, 48.0f, 48.0f };
     }
     return Rectangle{ x + BOX_X, y + BOX_Y, BOX_W, BOX_H };
 }

@@ -6,6 +6,9 @@
 #include <string.h>
 
 static const int MAX_ROWS = 8;
+// The 72px-tall box fits three 16px text lines plus the arrow row; extra
+// wrapped rows stay in the buffer but never draw over the border.
+static const int BOX_ROWS = 3;
 static const int LINE_HEIGHT = 16;
 static const int DRAW_FONT_BASE = 64;
 static const int DRAW_FONT_VIRTUAL = 16;
@@ -43,7 +46,7 @@ static bool cursorDownPressed()
 }
 
 DialogueBox::DialogueBox()
-    : font(), border(), letterSfx(), finishSfx(), errorSfx(),
+    : font(), fontOwned(false), border(), letterSfx(), finishSfx(), errorSfx(),
       current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0),
       choiceActive(false), choiceCursor(0),
       musicRequest(), musicPending(false),
@@ -60,7 +63,21 @@ DialogueBox::DialogueBox()
 
 void DialogueBox::init()
 {
-    font = LoadFontEx("assets/fonts/dialogue.otf", DRAW_FONT_BASE, NULL, 0);
+    // The game's global font (resources/game.json "font"); games that
+    // don't set one get the raylib default bitmap font instead of the
+    // hard-coded file.
+    if (GAME_FONT && GAME_FONT[0])
+    {
+        char path[600];
+        snprintf(path, sizeof(path), "assets/%s", GAME_FONT);
+        font = LoadFontEx(path, DRAW_FONT_BASE, NULL, 0);
+        fontOwned = true;
+    }
+    else
+    {
+        font = GetFontDefault();
+        fontOwned = false;
+    }
     border = LoadTexture("assets/ui/border.png");
     SetTextureFilter(border, TEXTURE_FILTER_POINT);
     // Letter cues name their files; they decode on first play through the
@@ -72,7 +89,8 @@ void DialogueBox::init()
 
 void DialogueBox::shutdown()
 {
-    UnloadFont(font);
+    if (fontOwned) UnloadFont(font);
+    fontOwned = false;
     UnloadTexture(border);
     shutdownNamedSfx();
     current = 0;
@@ -192,6 +210,14 @@ void DialogueBox::startLine()
         float patch = (float)(border.width / 3);
         float textWidth = boxWidthVirtual() - 2.0f * (patch + TEXT_PAD_X);
         wrapLine(text, textWidth);
+        // A line with options shows its choice list right away — no empty
+        // box beat between the prompt and the options (update still takes
+        // one press to finish the reveal before a pick can land).
+        if (line.choiceCount > 0 && line.choices)
+        {
+            choiceActive = true;
+            choiceCursor = 0;
+        }
         return;
     }
 
@@ -315,7 +341,8 @@ void DialogueBox::update()
 
     if (choiceActive)
     {
-        // Cursor over the option list; action selects.
+        // Cursor over the option list; action selects (after the prompt's
+        // reveal finishes — a pick never cuts the typewriter short).
         if (cursorUpPressed())
         {
             choiceCursor--;
@@ -329,6 +356,13 @@ void DialogueBox::update()
 
         if (actionPressed() && line.choices)
         {
+            if (reveal < (float)totalChars)
+            {
+                reveal = (float)totalChars;
+                PlaySound(finishSfx);
+                return;
+            }
+
             const DialogueChoice& choice = line.choices[choiceCursor];
 
             // Shop picks ("cost"): the wallet covers it or the pick
@@ -366,12 +400,6 @@ void DialogueBox::update()
         {
             reveal = (float)totalChars;
             PlaySound(finishSfx);
-        }
-        else if (line.choiceCount > 0 && line.choices)
-        {
-            // First press opens the choice list.
-            choiceActive = true;
-            choiceCursor = 0;
         }
         else
         {
@@ -455,11 +483,12 @@ void DialogueBox::drawChoices(Rectangle box) const
     int patch = border.width / 3;
     if (patch < 1) patch = 1;
 
-    // Options stack in the bottom-right corner of the box (LttP style).
+    // Options stack in the bottom-right corner of the box (LttP style),
+    // right-aligned; the cursor points at the selected option from the
+    // left, never over the text.
     float top = (box.y + box.height - (float)patch - TEXT_PAD_Y
                  - (float)(line.choiceCount * LINE_HEIGHT)) * sc;
     float right = (box.x + box.width - (float)patch - TEXT_PAD_X) * sc;
-    float cursorX = right - 14.0f * sc;
 
     for (int i = 0; i < line.choiceCount; i++)
     {
@@ -470,6 +499,7 @@ void DialogueBox::drawChoices(Rectangle box) const
 
         if (i == choiceCursor)
         {
+            float cursorX = pos.x - 12.0f * sc;
             float cy = pos.y + textSize * 0.5f;
             Vector2 a = { cursorX, cy - 5.0f * sc };
             Vector2 b = { cursorX, cy + 5.0f * sc };
@@ -549,8 +579,11 @@ void DialogueBox::draw() const
     float left = (box.x + (float)patch + TEXT_PAD_X) * sc;
     float top = (box.y + (float)patch + TEXT_PAD_Y) * sc;
 
+    // Rows beyond the third would spill past the box border; the wrap
+    // keeps them buffered, only the ones that fit draw.
+    int drawnRows = rowCount < BOX_ROWS ? rowCount : BOX_ROWS;
     int revealed = (int)reveal;
-    for (int j = 0; j < rowCount; j++)
+    for (int j = 0; j < drawnRows; j++)
     {
         int rowLen = (int)strlen(rows[j].text);
         int count = revealed - rows[j].offset;
@@ -566,7 +599,9 @@ void DialogueBox::draw() const
     }
 
     // Waiting-state prompt: a blinking arrow once the line is fully typed
-    // (skipped when the choice list takes over the box).
+    // (skipped when the choice list takes over the box). It sits on its
+    // own row below the last text line, right-aligned — never on top of
+    // the text itself.
     if (reveal >= (float)totalChars && !choiceActive
         && lineIndex >= 0 && lineIndex < current->lineCount
         && current->lines[lineIndex].choiceCount <= 0
@@ -575,7 +610,9 @@ void DialogueBox::draw() const
         int patchArrow = border.width / 3;
         if (patchArrow < 1) patchArrow = 1;
         float ax = (box.x + box.width - (float)patchArrow - TEXT_PAD_X - 2.0f) * sc;
-        float ay = (box.y + box.height - (float)patchArrow - TEXT_PAD_Y + 1.0f) * sc;
+        float ay = (box.y + (float)patchArrow + TEXT_PAD_Y
+                    + (float)((drawnRows > 0 ? drawnRows : 1) - 1) * LINE_HEIGHT
+                    + 8.0f) * sc;
         Vector2 a = { ax, ay - 3.0f * sc };
         Vector2 b = { ax + 6.0f * sc, ay - 3.0f * sc };
         Vector2 c = { ax + 3.0f * sc, ay + 3.0f * sc };

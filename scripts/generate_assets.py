@@ -269,11 +269,20 @@ def load_dialogues(flags):
     return dialogues
 
 
+# Character animation channels. stand/move are the base pair every
+# character carries; the rest are optional state channels (empty when the
+# sheet doesn't carry them — the engine falls back to the base pair, and a
+# sheet that wants placeholder art can simply duplicate frames).
+ANIM_KINDS = ("stand", "move", "attack", "lift", "swim", "hurt")
+# Enemies interpret only the base pair (EnemyConfig carries no channels).
+ENEMY_ANIM_KINDS = ("stand", "move")
+
+
 def validate_anims(owner, anims, frame_count):
     """Warn when animation frames fall outside the sprite sheet."""
     if frame_count <= 0:
         return
-    for kind in ("stand", "move"):
+    for kind in ANIM_KINDS:
         for index, direction in enumerate(DIRECTIONS):
             for frame in anims[kind][index]:
                 if frame < 0 or frame >= frame_count:
@@ -282,10 +291,12 @@ def validate_anims(owner, anims, frame_count):
 
 
 def load_directional_anims(data):
-    """Parse the stand/move per-direction frame lists shared by characters and
-    enemies: {"stand": {"down": [0, 1], ...}, "move": {...}}."""
+    """Parse the per-direction frame lists shared by characters and enemies:
+    {"stand": {"down": [0, 1], ...}, "move": {...}, "attack": {...}, ...}.
+    Characters fill every channel; enemies read the base pair (any extra
+    blocks in an enemy json are parsed but ignored by the bake)."""
     anims = {}
-    for kind in ("stand", "move"):
+    for kind in ANIM_KINDS:
         block = data.get(kind) or {}
         anims[kind] = []
         for direction in DIRECTIONS:
@@ -331,25 +342,33 @@ def load_characters():
 # --- Game identity ----------------------------------------------------------
 
 def load_game():
-    """resources/game.json (optional): {"title": ..., "slug": ...}.
+    """resources/game.json (optional): {"title": ..., "slug": ...,
+    "font": ...}.
     The title is engine chrome (title screen subtitle); the slug identifies
     the game in save files so a save from one game is never loaded by
-    another (filesystem-safe, <= 15 chars)."""
+    another (filesystem-safe, <= 15 chars). "font" is a file under
+    resources/ (e.g. "fonts/dialogue.otf") rendered for every piece of
+    engine text — absent means the raylib default bitmap font."""
     title = "UNTITLED GAME"
     slug = "game"
+    font = ""
     path = res("game.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         title = str(data.get("title") or title)
         slug = str(data.get("slug") or slug)
+        font = str(data.get("font") or "")
+        if font and not os.path.exists(res(font)):
+            warn("game font '%s' does not exist under resources/ (ignoring)" % font)
+            font = ""
     clean = re.sub(r"[^a-z0-9-]", "", str(slug).lower()) or "game"
     if clean != str(slug).lower():
         warn("game slug '%s' is not filesystem-safe; using '%s'" % (slug, clean))
     if len(clean) > 15:
-        warn("game slug '%s' is longer than 15 chars; truncating" % clean)
+        warn("game slug '%s' is longer than 15 chars; truncating" % slug)
         clean = clean[:15]
-    return {"title": title, "slug": clean}
+    return {"title": title, "slug": clean, "font": font}
 
 
 # --- Items (resources/items/<name>.json) -------------------------------------
@@ -924,7 +943,8 @@ def load_tile_meta(tileset):
     Format: {"tiles": {"<id>": {"pit": true, "damage": 1, "cuttable": true,
     "cut_result": <tile id>, "water": "deep"|"shallow", "ice": true,
     "push": [dx, dy], "ledge": "down"|"right"|"left"|"up",
-    "bombable": true, "bomb_result": <tile id>, "dig": true, "heal": true}}}
+    "bombable": true, "bomb_result": <tile id>, "dig": true, "heal": true,
+    "anim": [<tile id>, ...]}}}
     Tile ids are 1-based frame indices, matching the ids used in room layers.
     "damage" is measured in half-hearts. "cut_result" is the tile id left
     behind when the tile is cut (0 = empty). "push" is a conveyor/current/wind
@@ -933,11 +953,14 @@ def load_tile_meta(tileset):
     walls/floors; "bomb_result" (0 = empty, default) is what blasts leave.
     "dig" marks soft soil the shovel can turn over (drops + buried items).
     "heal" marks fairy-fountain water: standing on it slowly refills hearts
-    and magic.
+    and magic. "anim" lists the tile ids of an animation cycle (the base
+    tile first, up to 4; the room renderer steps them over time — water
+    shimmer, lava, etc).
     """
     count = tileset["tileCount"] if tileset else 0
     meta = [{"flags": 0, "damage": 0, "cutResult": 0, "bombResult": 255,
-             "pushX": 0, "pushY": 0, "ledgeDir": 0, "heal": 0}
+             "pushX": 0, "pushY": 0, "ledgeDir": 0, "heal": 0,
+             "anim": []}
             for _ in range(max(count, 0))]
 
     path = res("tiles", "tiles.json")
@@ -1021,6 +1044,22 @@ def load_tile_meta(tileset):
             entry["flags"] |= 256
         if props.get("heal"):
             entry["heal"] = 1
+        anim = props.get("anim")
+        if anim is not None:
+            # Animation cycle (tile ids, the base first): the room renderer
+            # steps through it over time (water shimmer, lava, ...).
+            if isinstance(anim, (list, tuple)) and anim:
+                frames = [resolve_tile(v, "anim frame")
+                          for v in anim[:4]]
+                frames = [f for f in frames if f > 0]
+                if len(frames) > 1:
+                    entry["anim"] = frames
+                elif frames:
+                    warn("tiles.json tile %d anim cycle needs at least two"
+                         " distinct frames" % tile_id)
+            else:
+                warn("tiles.json tile %d has a bad 'anim' %r "
+                     "(expected a list of tile ids)" % (tile_id, anim))
     return meta
 
 
@@ -1606,18 +1645,18 @@ def emit_dialogues(c, dialogues):
     c.append("")
 
 
-def emit_character_frame_arrays(c, base, anims):
-    for kind in ("stand", "move"):
+def emit_character_frame_arrays(c, base, anims, kinds=ENEMY_ANIM_KINDS):
+    for kind in kinds:
         for index, direction in enumerate(DIRECTIONS):
             values = anims[kind][index]
             if values:
                 emit_array(c, "int", "%s_%s_%s" % (base, kind.upper(), direction.upper()), values, per_line=24)
 
 
-def emit_character_config_entries(c, base, character, extra):
+def emit_character_config_entries(c, base, character, extra, kinds=ENEMY_ANIM_KINDS):
     c.append("    { %s, %s, %d, %d," % (cstr(character["name"]), cstr(character["image"]),
                                        character["columns"], character["frameCount"]))
-    for kind in ("stand", "move"):
+    for kind in kinds:
         frames = []
         for index, direction in enumerate(DIRECTIONS):
             values = character["anims"][kind][index]
@@ -1634,12 +1673,12 @@ def emit_character_config_entries(c, base, character, extra):
 def emit_characters(c, characters):
     for character in characters:
         base = "CHAR_%s" % sym(character["name"])
-        emit_character_frame_arrays(c, base, character["anims"])
+        emit_character_frame_arrays(c, base, character["anims"], kinds=ANIM_KINDS)
 
     c.append("const CharacterConfig CHARACTERS[] = {")
     for character in characters:
         base = "CHAR_%s" % sym(character["name"])
-        emit_character_config_entries(c, base, character, None)
+        emit_character_config_entries(c, base, character, None, kinds=ANIM_KINDS)
     c.append("};")
     c.append("const int CHARACTER_COUNT = %d;" % len(characters))
     c.append("")
@@ -1783,6 +1822,9 @@ def emit_game(c, game, manifest):
     the names game code registers; JSON references them as "custom:<name>"."""
     c.append("const char* const GAME_TITLE = %s;" % cstr(game["title"]))
     c.append("const char* const GAME_SLUG = %s;" % cstr(game["slug"]))
+    # Global text font (empty = the raylib default bitmap font): every
+    # piece of engine chrome (HUD, menus, dialogue) renders with it.
+    c.append("const char* const GAME_FONT = %s;" % cstr(game["font"]))
     c.append("")
     c.append("const char* const CUSTOM_BEHAVIOR_NAMES[] = {")
     for name in manifest:
@@ -1799,14 +1841,18 @@ def emit_tile_meta(c, meta):
         for i in range(0, len(meta), per_line):
             chunk = meta[i:i + per_line]
             c.append("    " + " ".join(
-                "{ %d, %d, %d, %d, %d, %d, %d, %d }," % (m["flags"], m["damage"],
-                                                        m["cutResult"], m["bombResult"],
-                                                        m["pushX"], m["pushY"], m["ledgeDir"],
-                                                        m["heal"])
+                "{ %d, %d, %d, %d, %d, %d, %d, %d, %d, { %d, %d, %d, %d } }," % (
+                    m["flags"], m["damage"], m["cutResult"], m["bombResult"],
+                    m["pushX"], m["pushY"], m["ledgeDir"], m["heal"],
+                    len(m["anim"]),
+                    (m["anim"] + [0, 0, 0, 0])[0],
+                    (m["anim"] + [0, 0, 0, 0])[1],
+                    (m["anim"] + [0, 0, 0, 0])[2],
+                    (m["anim"] + [0, 0, 0, 0])[3])
                 for m in chunk))
         c.append("};")
     else:
-        c.append("const TileMeta TILE_META[] = { { 0, 0, 0, 255, 0, 0, 0, 0 } };")
+        c.append("const TileMeta TILE_META[] = { { 0, 0, 0, 255, 0, 0, 0, 0, 0, { 0, 0, 0, 0 } } };")
     c.append("const int TILE_META_COUNT = %d;" % len(meta))
     c.append("")
 
@@ -3388,6 +3434,7 @@ def generate(dump_flags=False):
     h.append("// files so a save from one game is never loaded by another.")
     h.append("extern const char* const GAME_TITLE;")
     h.append("extern const char* const GAME_SLUG;")
+    h.append("extern const char* const GAME_FONT;")
     h.append("")
     h.append("// Game-defined id constants (stable, assigned by the generator from")
     h.append("// the game's own data; engine.h owns none of these).")

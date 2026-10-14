@@ -28,6 +28,14 @@ struct CharacterConfig
     int frameCount;
     DirectionalFrames stand[DIR_COUNT];
     DirectionalFrames move[DIR_COUNT];
+    // Optional state channels (character json "attack"/"lift"/"swim"/
+    // "hurt"): empty when the sheet doesn't carry them, and the hero
+    // falls back to the stand/move pair (duplicate stand frames in the
+    // json to fill the slots with placeholder art).
+    DirectionalFrames attack[DIR_COUNT];  // sword swing / spin body
+    DirectionalFrames lift[DIR_COUNT];    // hoisting + carrying overhead
+    DirectionalFrames swim[DIR_COUNT];    // deep-water stroke glide
+    DirectionalFrames hurt[DIR_COUNT];    // damage recoil
 };
 
 // One selectable option of a dialogue choice ("choice" on a line).
@@ -396,6 +404,9 @@ struct TileMeta
     signed char pushY;
     unsigned char ledgeDir; // Direction when TILE_FLAG_LEDGE is set
     unsigned char heal;     // 1 = fairy-fountain water: refills hearts/magic
+    unsigned char animCount;    // animation cycle length (ids), 0/1 = static
+    unsigned char animFrames[4]; // cycle tile ids (animFrames[0] = the base);
+                                 // the room renderer steps them over time
 };
 
 constexpr unsigned short TILE_FLAG_PIT = 0x01;      // hole: hero falls in

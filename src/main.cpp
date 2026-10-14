@@ -1465,6 +1465,27 @@ static void quitToTitle()
     startDangerMusic(NULL);
 }
 
+// Game font (resources/game.json "font"; the raylib default bitmap font
+// when the game doesn't set one): every piece of engine chrome — title
+// screen, HUD, menus, toasts — renders through it, drop-in
+// DrawText/MeasureText shapes (screen-space positions and sizes).
+static Font uiFont = {};
+static bool uiFontOwned = false;
+
+static void uiDrawText(const char* text, int posX, int posY, int size, Color tint)
+{
+    if (!text) return;
+    DrawTextEx(uiFont, text, Vector2{ (float)posX, (float)posY },
+               (float)size, (float)size / 10.0f, tint);
+}
+
+static int uiMeasureText(const char* text, int size)
+{
+    if (!text) return 0;
+    return (int)(MeasureTextEx(uiFont, text, (float)size,
+                               (float)size / 10.0f).x + 0.5f);
+}
+
 static void updateTitle()
 {
     bool prev = IsKeyPressed(KEY_UP);
@@ -1498,13 +1519,13 @@ static void drawTitleScreen()
 
     const char* title = "LTOP ENGINE";
     int titleSize = (int)(24 * scale);
-    int width = MeasureText(title, titleSize);
-    DrawText(title, (sw - width) / 2, (int)(34 * scale), titleSize, RAYWHITE);
+    int width = uiMeasureText(title, titleSize);
+    uiDrawText(title, (sw - width) / 2, (int)(34 * scale), titleSize, RAYWHITE);
 
     const char* sub = GAME_TITLE;
     int subSize = (int)(8 * scale);
-    width = MeasureText(sub, subSize);
-    DrawText(sub, (sw - width) / 2, (int)(64 * scale), subSize,
+    width = uiMeasureText(sub, subSize);
+    uiDrawText(sub, (sw - width) / 2, (int)(64 * scale), subSize,
              Color{ 170, 170, 200, 255 });
 
     // Save slots with a summary of what's inside.
@@ -1527,7 +1548,7 @@ static void drawTitleScreen()
         int size = (int)(12 * scale);
         float y = listY + (float)slot * 22.0f * scale;
         Color color = (slot == titleCursor) ? RAYWHITE : Color{ 130, 130, 150, 255 };
-        DrawText(line, (int)(listX + 16.0f * scale), (int)y, size, color);
+        uiDrawText(line, (int)(listX + 16.0f * scale), (int)y, size, color);
 
         if (slot == titleCursor)
         {
@@ -1541,8 +1562,8 @@ static void drawTitleScreen()
 
     const char* hint = "ACTION: START";
     int hintSize = (int)(8 * scale);
-    width = MeasureText(hint, hintSize);
-    DrawText(hint, (sw - width) / 2, sh - (int)(16 * scale), hintSize,
+    width = uiMeasureText(hint, hintSize);
+    uiDrawText(hint, (sw - width) / 2, sh - (int)(16 * scale), hintSize,
              Color{ 170, 170, 190, 255 });
 }
 
@@ -2331,16 +2352,16 @@ static void drawGameOver()
     {
         const char* text = "GAME OVER";
         int size = (int)(16 * scale);
-        int width = MeasureText(text, size);
-        DrawText(text, (GetScreenWidth() - width) / 2,
+        int width = uiMeasureText(text, size);
+        uiDrawText(text, (GetScreenWidth() - width) / 2,
                  (GetScreenHeight() - size) / 2 - (int)(10 * scale), size, RAYWHITE);
     }
     if (t > 2.2f && ((int)(t * 2.0f) % 2 == 0))
     {
         const char* text = "PRESS ACTION TO CONTINUE";
         int size = (int)(8 * scale);
-        int width = MeasureText(text, size);
-        DrawText(text, (GetScreenWidth() - width) / 2,
+        int width = uiMeasureText(text, size);
+        uiDrawText(text, (GetScreenWidth() - width) / 2,
                  (GetScreenHeight()) / 2 + (int)(8 * scale), size, RAYWHITE);
     }
 }
@@ -2404,9 +2425,11 @@ static void drawDarkness()
 
     BeginBlendMode(BLEND_ADDITIVE);
     Rectangle src = { 0.0f, 0.0f, (float)lightGradient.width, (float)lightGradient.height };
-    Vector2 origin = { lightGradient.width * 0.5f, lightGradient.height * 0.5f };
 
     // Hero light: wide with the passive light item, a dying ember without.
+    // DrawTexturePro positions the drawn rect's top-left at (dest.xy -
+    // origin), so the origin is the DEST half-size (a texture-space origin
+    // would throw the light off-center).
     int lightItem = lightItemOwned();
     bool hasLantern = lightItem >= 0;
     float heroRadius = hasLantern ? (float)ITEMS[lightItem].lightRadius : 30.0f;
@@ -2417,6 +2440,7 @@ static void drawDarkness()
     Rectangle dest = { (heroCenter.x - camLeft) * scale,
                        (heroCenter.y - camTop) * scale,
                        heroRadius * 2.0f * scale, heroRadius * 2.0f * scale };
+    Vector2 origin = { dest.width * 0.5f, dest.height * 0.5f };
     DrawTexturePro(lightGradient, src, dest, origin, 0.0f, heroTint);
 
     // Lit torches: warm, flickering pools of light.
@@ -2429,7 +2453,8 @@ static void drawDarkness()
         Rectangle tdest = { (o.x + 16.0f - camLeft) * scale,
                             (o.y + 10.0f - camTop) * scale,
                             radius * scale, radius * scale };
-        DrawTexturePro(lightGradient, src, tdest, origin, 0.0f,
+        Vector2 torigin = { tdest.width * 0.5f, tdest.height * 0.5f };
+        DrawTexturePro(lightGradient, src, tdest, torigin, 0.0f,
                        Color{ 255, 235, 205, 255 });
     }
     EndBlendMode();
@@ -2580,7 +2605,7 @@ static void drawHud()
         DrawTexturePro(pickupsTexture, src, dest, origin, 0.0f, WHITE);
         char text[16];
         snprintf(text, sizeof(text), "x%d", inventory.rupees);
-        DrawText(text, (int)(rx + 18.0f * scale), (int)(10.0f * scale),
+        uiDrawText(text, (int)(rx + 18.0f * scale), (int)(10.0f * scale),
                  (int)(10 * scale), RAYWHITE);
     }
 
@@ -2595,7 +2620,7 @@ static void drawHud()
         else if (item.bombCost > 0) count = inventory.bombs;
         if (count >= 0) snprintf(text, sizeof(text), "%s x%d", label, count);
         else snprintf(text, sizeof(text), "%s", label);
-        DrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - MeasureText(text, (int)(8 * scale))),
+        uiDrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - uiMeasureText(text, (int)(8 * scale))),
                  (int)(26.0f * scale), (int)(8 * scale), RAYWHITE);
     }
 
@@ -2605,7 +2630,7 @@ static void drawHud()
         char text[24];
         snprintf(text, sizeof(text), "KEY x%d%s", inventory.smallKeys,
                  inventory.bigKeys > 0 ? "  BIG x1" : "");
-        DrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - MeasureText(text, (int)(8 * scale))),
+        uiDrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - uiMeasureText(text, (int)(8 * scale))),
                  (int)(38.0f * scale), (int)(8 * scale), Color{ 250, 220, 120, 255 });
     }
 
@@ -2632,8 +2657,8 @@ static void drawHud()
         }
         const char* label = "BOSS";
         int labelSize = (int)(8 * scale);
-        int labelW = MeasureText(label, labelSize);
-        DrawText(label, ((int)bx + (int)barW / 2 - labelW / 2), (int)(by - 11.0f * scale),
+        int labelW = uiMeasureText(label, labelSize);
+        uiDrawText(label, ((int)bx + (int)barW / 2 - labelW / 2), (int)(by - 11.0f * scale),
                  labelSize, RAYWHITE);
         break;
     }
@@ -2651,7 +2676,7 @@ static void drawHud()
         float fillH = barH * fill;
         DrawRectangle((int)bx, (int)(by + (barH - fillH) * scale), (int)(barW * scale),
                       (int)(fillH * scale), Color{ 90, 150, 255, 255 });
-        DrawText("M", (int)(bx + barW * scale), (int)(by + barH * scale - 8.0f * scale),
+        uiDrawText("M", (int)(bx + barW * scale), (int)(by + barH * scale - 8.0f * scale),
                  (int)(8 * scale), Color{ 120, 170, 255, 255 });
     }
 }
@@ -2701,12 +2726,12 @@ static void drawToasts()
         float alpha = (t < 0.15f) ? t / 0.15f : (t > 0.75f ? (1.0f - t) / 0.25f : 1.0f);
         if (alpha < 0.0f) alpha = 0.0f;
         int size = (int)(10 * scale);
-        int width = MeasureText(toasts[i].text, size);
+        int width = uiMeasureText(toasts[i].text, size);
         float y = (34.0f + (float)i * 14.0f) * scale;
         DrawRectangle((GetScreenWidth() - width) / 2 - 6 * (int)scale / 2, (int)y - 2,
                       width + 6 * (int)scale, size + 4,
                       Color{ 0, 0, 0, (unsigned char)(int)(140 * alpha) });
-        DrawText(toasts[i].text, (GetScreenWidth() - width) / 2, (int)y, size,
+        uiDrawText(toasts[i].text, (GetScreenWidth() - width) / 2, (int)y, size,
                  Color{ 250, 250, 220, (unsigned char)(int)(255 * alpha) });
     }
 }
@@ -2832,12 +2857,12 @@ static void drawFluteMenu()
     }
 
     int titleSize = (int)(12 * scale);
-    DrawText("FLUTE", (int)((panel.x + 8.0f) * scale), (int)((panel.y + 6.0f) * scale),
+    uiDrawText("FLUTE", (int)((panel.x + 8.0f) * scale), (int)((panel.y + 6.0f) * scale),
              titleSize, RAYWHITE);
     {
         const char* hint = "ACTION:FLY  SWORD:BACK";
-        DrawText(hint, (int)((panel.x + panel.width - 8.0f) * scale)
-                     - MeasureText(hint, (int)(8 * scale)),
+        uiDrawText(hint, (int)((panel.x + panel.width - 8.0f) * scale)
+                     - uiMeasureText(hint, (int)(8 * scale)),
                  (int)((panel.y + 8.0f) * scale), (int)(8 * scale),
                  Color{ 170, 170, 190, 255 });
     }
@@ -3014,14 +3039,14 @@ static void drawPauseOverlay()
 
     int size = (int)(10 * scale);
     int titleSize = (int)(12 * scale);
-    DrawText(pauseTab == 0 ? "ITEMS" : "MAP",
+    uiDrawText(pauseTab == 0 ? "ITEMS" : "MAP",
              (int)((panel.x + 8.0f) * scale), (int)((panel.y + 6.0f) * scale),
              titleSize, RAYWHITE);
     {
         // Tab switcher hint, top-right of the panel.
         const char* tabs = "SWORD: SWITCH";
-        DrawText(tabs, (int)((panel.x + panel.width - 8.0f) * scale)
-                     - MeasureText(tabs, (int)(8 * scale)),
+        uiDrawText(tabs, (int)((panel.x + panel.width - 8.0f) * scale)
+                     - uiMeasureText(tabs, (int)(8 * scale)),
                  (int)((panel.y + 8.0f) * scale), (int)(8 * scale),
                  Color{ 170, 170, 190, 255 });
     }
@@ -3116,7 +3141,7 @@ static void drawPauseOverlay()
         float cx = panel.x + 8.0f + (float)(i % 3) * cellW;
         float cy = panel.y + 26.0f + (float)(i / 3) * cellH;
         const char* label = inventory.owned[i] ? ITEMS[i].label : "-----";
-        DrawText(label, (int)((cx + 12.0f) * scale), (int)(cy * scale), size,
+        uiDrawText(label, (int)((cx + 12.0f) * scale), (int)(cy * scale), size,
                  inventory.owned[i] ? RAYWHITE : Color{ 130, 130, 150, 255 });
         if (i == pauseCursor)
         {
@@ -3130,7 +3155,7 @@ static void drawPauseOverlay()
         }
         if (i == inventory.equippedItem && inventory.equippedItem >= 0)
         {
-            DrawText("E", (int)((cx + cellW - 12.0f) * scale), (int)(cy * scale),
+            uiDrawText("E", (int)((cx + cellW - 12.0f) * scale), (int)(cy * scale),
                      size, Color{ 120, 220, 140, 255 });
         }
     }
@@ -3140,14 +3165,14 @@ static void drawPauseOverlay()
     float qy = panel.y + 26.0f;
     char text[32];
     snprintf(text, sizeof(text), "RUPEES %d/%d", inventory.rupees, inventory.rupeeMax);
-    DrawText(text, (int)(qx * scale), (int)(qy * scale), size, RAYWHITE);
+    uiDrawText(text, (int)(qx * scale), (int)(qy * scale), size, RAYWHITE);
     snprintf(text, sizeof(text), "ARROWS %d/%d", inventory.arrows, inventory.arrowsMax);
-    DrawText(text, (int)(qx * scale), (int)((qy + 12.0f) * scale), size, RAYWHITE);
+    uiDrawText(text, (int)(qx * scale), (int)((qy + 12.0f) * scale), size, RAYWHITE);
     snprintf(text, sizeof(text), "BOMBS  %d/%d", inventory.bombs, inventory.bombsMax);
-    DrawText(text, (int)(qx * scale), (int)((qy + 24.0f) * scale), size, RAYWHITE);
+    uiDrawText(text, (int)(qx * scale), (int)((qy + 24.0f) * scale), size, RAYWHITE);
     snprintf(text, sizeof(text), "KEYS   %d%s", inventory.smallKeys,
              inventory.bigKeys > 0 ? "  BIG!" : "");
-    DrawText(text, (int)(qx * scale), (int)((qy + 34.0f) * scale), size, RAYWHITE);
+    uiDrawText(text, (int)(qx * scale), (int)((qy + 34.0f) * scale), size, RAYWHITE);
 
     // Bottles: one letter per slot (W water, R/G/B potions, F fairy,
     // b bee), dots while the set is short.
@@ -3169,11 +3194,11 @@ static void drawPauseOverlay()
         }
         snprintf(text, sizeof(text), "BOTTLE %s%s%s%s",
                  letters[0], letters[1], letters[2], letters[3]);
-        DrawText(text, (int)(qx * scale), (int)((qy + 46.0f) * scale), size, RAYWHITE);
+        uiDrawText(text, (int)(qx * scale), (int)((qy + 46.0f) * scale), size, RAYWHITE);
     }
 
     // Magic gauge.
-    DrawText("MAGIC", (int)(qx * scale), (int)((qy + 58.0f) * scale), size, RAYWHITE);
+    uiDrawText("MAGIC", (int)(qx * scale), (int)((qy + 58.0f) * scale), size, RAYWHITE);
     float barX = (qx + 30.0f) * scale;
     float barY = (qy + 58.0f) * scale + size * 0.5f - 3.0f * scale;
     DrawRectangle((int)barX, (int)barY, (int)(40.0f * scale), (int)(6.0f * scale),
@@ -3186,7 +3211,7 @@ static void drawPauseOverlay()
     }
 
     // Hint line.
-    DrawText("ACTION:EQUIP  DASH:SAVE+QUIT  START:CLOSE", (int)((panel.x + 8.0f) * scale),
+    uiDrawText("ACTION:EQUIP  DASH:SAVE+QUIT  START:CLOSE", (int)((panel.x + 8.0f) * scale),
              (int)((panel.y + panelH - 16.0f) * scale), (int)(8 * scale),
              Color{ 170, 170, 190, 255 });
 }
@@ -5708,19 +5733,9 @@ static void updatePoofs()
 
 static void drawGroundFx()
 {
-    // Draw inside the camera transform: pickups, poofs, particles, rocks,
-    // boomerang.
+    // Draw inside the camera transform: poofs, particles, rocks,
+    // boomerang (pickups draw above the entities — see drawPickups).
     drawParticles();
-    for (int i = 0; i < MAX_PICKUPS; i++)
-    {
-        const Pickup& p = pickups[i];
-        if (!p.active) continue;
-        float bob = sinf(p.bobTime * 3.0f) * 2.0f;
-        Rectangle src = { (float)(p.kind * 16), 0.0f, 16.0f, 16.0f };
-        Rectangle dest = { p.x, p.y + bob, 16.0f, 16.0f };
-        Vector2 origin = { 0.0f, 0.0f };
-        DrawTexturePro(pickupsTexture, src, dest, origin, 0.0f, WHITE);
-    }
 
     for (int i = 0; i < 32; i++)
     {
@@ -5894,6 +5909,99 @@ static void drawFloorObjects()
 // Depth/y-sort: hero, enemies and standing objects draw back-to-front by
 // baseline (bottom of the collision box), like LttP. Everything taller
 // south paints over what stands north of it.
+
+// Reflections render only in the water: a wading sprite's mirrored copy
+// is clipped to the water tiles its rect overlaps, so a sprite standing
+// half-on-land doesn't smear the mirror onto the bank. The scissor rect
+// math mirrors the Mode2D camera transform (drawn inside BeginMode2D).
+static void drawReflectionInWater(Rectangle reflect, void (*draw)(const void*),
+                                  const void* ctx)
+{
+    int tx0 = (int)(reflect.x / TILE_SIZE);
+    int ty0 = (int)(reflect.y / TILE_SIZE);
+    int tx1 = (int)((reflect.x + reflect.width - 0.01f) / TILE_SIZE);
+    int ty1 = (int)((reflect.y + reflect.height - 0.01f) / TILE_SIZE);
+
+    float zoom = camera.zoom;
+    float camLeft = camera.target.x - camera.offset.x / zoom;
+    float camTop = camera.target.y - camera.offset.y / zoom;
+
+    for (int ty = ty0; ty <= ty1; ty++)
+    {
+        for (int tx = tx0; tx <= tx1; tx++)
+        {
+            TileMeta meta = room.tileMetaAt(tx, ty);
+            if (!(meta.flags & (TILE_FLAG_WATER_SHALLOW | TILE_FLAG_WATER_DEEP)))
+                continue;
+            int sx = (int)((tx * TILE_SIZE - camLeft) * zoom);
+            int sy = (int)((ty * TILE_SIZE - camTop) * zoom);
+            int sw = (int)(TILE_SIZE * zoom + 0.5f);
+            int sh = (int)(TILE_SIZE * zoom + 0.5f);
+            BeginScissorMode(sx, sy, sw, sh);
+            draw(ctx);
+            EndScissorMode();
+        }
+    }
+}
+
+static void drawHeroReflectionTrampoline(const void* ctx)
+{
+    ((const Hero*)ctx)->drawReflection();
+}
+
+static void drawEnemyReflectionTrampoline(const void* ctx)
+{
+    ((const Enemy*)ctx)->drawReflection();
+}
+
+// NPC reflection: the mirrored copy of the frame drawEntitiesSorted shows
+// (kept next to it so the two stay in step).
+static void drawNpcReflection(const Npc& npc)
+{
+    if (!npc.cfg || npc.sheet.id == 0) return;
+    const DirectionalFrames* rframes = npc.moving
+        ? &npc.cfg->move[npc.facing] : &npc.cfg->stand[npc.facing];
+    if (rframes->count <= 0) rframes = &npc.cfg->stand[npc.facing];
+    if (rframes->count <= 0) return;
+    int rcolumns = npc.cfg->sheetColumns;
+    if (rcolumns <= 0) rcolumns = 1;
+    int rindex = (int)(npc.animTime * 8.0f) % rframes->count;
+    int rframe = rframes->frames[rindex];
+    if (rframe < 0) rframe = 0;
+    if (npc.cfg->frameCount > 0 && rframe >= npc.cfg->frameCount)
+        rframe = npc.cfg->frameCount - 1;
+    Rectangle rsrc = { (float)((rframe % rcolumns) * TILE_SIZE),
+                      (float)((rframe / rcolumns) * TILE_SIZE),
+                      (float)TILE_SIZE, -(float)TILE_SIZE };
+    Rectangle rdest = { npc.x, npc.y + (float)TILE_SIZE,
+                        (float)TILE_SIZE, (float)TILE_SIZE * 0.62f };
+    Vector2 rorigin = { 0.0f, 0.0f };
+    DrawTexturePro(npc.sheet, rsrc, rdest, rorigin, 0.0f,
+                   Color{ 175, 200, 240, 100 });
+}
+
+static void drawNpcReflectionTrampoline(const void* ctx)
+{
+    drawNpcReflection(*(const Npc*)ctx);
+}
+
+// Pickups draw above every entity: a heart the hero can't take yet (full
+// health) must still read as an item sitting in the room, not as a decal
+// the hero walks in front of.
+static void drawPickups()
+{
+    for (int i = 0; i < MAX_PICKUPS; i++)
+    {
+        const Pickup& p = pickups[i];
+        if (!p.active) continue;
+        float bob = sinf(p.bobTime * 3.0f) * 2.0f;
+        Rectangle src = { (float)(p.kind * 16), 0.0f, 16.0f, 16.0f };
+        Rectangle dest = { p.x, p.y + bob, 16.0f, 16.0f };
+        Vector2 origin = { 0.0f, 0.0f };
+        DrawTexturePro(pickupsTexture, src, dest, origin, 0.0f, WHITE);
+    }
+}
+
 static void drawEntitiesSorted()
 {
     struct Drawable
@@ -5971,8 +6079,15 @@ static void drawEntitiesSorted()
                            (int)(heroBox.y + heroBox.height - 2.0f),
                            8.0f, 3.0f, Color{ 20, 20, 40, 70 });
             }
-            // Wading in shallow water: a mirrored copy below the feet.
-            if (hero.wading()) hero.drawReflection();
+            // Wading in shallow water: a mirrored copy below the feet,
+            // masked to the water tiles it overlaps.
+            if (hero.wading())
+            {
+                Vector2 c = hero.center();
+                drawReflectionInWater(Rectangle{ c.x - 16.0f, c.y + 16.0f,
+                                                32.0f, 32.0f * 0.62f },
+                                      drawHeroReflectionTrampoline, &hero);
+            }
             hero.draw();
         }
         else if (d.kind == 1)
@@ -5982,7 +6097,17 @@ static void drawEntitiesSorted()
                         8.0f, 3.0f, Color{ 20, 20, 40, 70 });
             TileMeta em = room.tileMetaAt((int)((b.x + b.width * 0.5f) / TILE_SIZE),
                                           (int)((b.y + b.height * 0.5f) / TILE_SIZE));
-            if (em.flags & TILE_FLAG_WATER_SHALLOW) enemies[d.index].drawReflection();
+            // Any water underfoot reflects (deep too — zoras stand in it);
+            // the mask keeps the mirror off the bank tiles.
+            if (em.flags & (TILE_FLAG_WATER_SHALLOW | TILE_FLAG_WATER_DEEP))
+            {
+                Vector2 c = enemies[d.index].center();
+                Rectangle reflect = enemies[d.index].isBoss()
+                    ? Rectangle{ c.x - 24.0f, c.y + 32.0f, 48.0f, 48.0f * 0.62f }
+                    : Rectangle{ c.x - 16.0f, c.y + 16.0f, 32.0f, 32.0f * 0.62f };
+                drawReflectionInWater(reflect, drawEnemyReflectionTrampoline,
+                                      &enemies[d.index]);
+            }
             enemies[d.index].draw();
         }
         else if (d.kind == 3)
@@ -5991,32 +6116,17 @@ static void drawEntitiesSorted()
             Rectangle b = npcBox(npcs[d.index]);
             DrawEllipse((int)(b.x + b.width * 0.5f), (int)(b.y + b.height - 2.0f),
                         8.0f, 3.0f, Color{ 20, 20, 40, 70 });
-            // Wading NPCs reflect too (same frame the draw below shows).
+            // Wading NPCs reflect too (same frame the draw below shows),
+            // masked to the water tiles like the hero's; deep water counts
+            // (a stroll along the bank shouldn't mirror onto the grass).
             TileMeta em = room.tileMetaAt((int)((b.x + b.width * 0.5f) / TILE_SIZE),
                                           (int)((b.y + b.height * 0.5f) / TILE_SIZE));
-            if ((em.flags & TILE_FLAG_WATER_SHALLOW) && npc.cfg && npc.sheet.id != 0)
+            if (em.flags & (TILE_FLAG_WATER_SHALLOW | TILE_FLAG_WATER_DEEP))
             {
-                const DirectionalFrames* rframes = npc.moving
-                    ? &npc.cfg->move[npc.facing] : &npc.cfg->stand[npc.facing];
-                if (rframes->count <= 0) rframes = &npc.cfg->stand[npc.facing];
-                if (rframes->count > 0)
-                {
-                    int rcolumns = npc.cfg->sheetColumns;
-                    if (rcolumns <= 0) rcolumns = 1;
-                    int rindex = (int)(npc.animTime * 8.0f) % rframes->count;
-                    int rframe = rframes->frames[rindex];
-                    if (rframe < 0) rframe = 0;
-                    if (npc.cfg->frameCount > 0 && rframe >= npc.cfg->frameCount)
-                        rframe = npc.cfg->frameCount - 1;
-                    Rectangle rsrc = { (float)((rframe % rcolumns) * TILE_SIZE),
-                                      (float)((rframe / rcolumns) * TILE_SIZE),
-                                      (float)TILE_SIZE, -(float)TILE_SIZE };
-                    Rectangle rdest = { npc.x, npc.y + (float)TILE_SIZE,
-                                        (float)TILE_SIZE, (float)TILE_SIZE * 0.62f };
-                    Vector2 rorigin = { 0.0f, 0.0f };
-                    DrawTexturePro(npc.sheet, rsrc, rdest, rorigin, 0.0f,
-                                   Color{ 175, 200, 240, 100 });
-                }
+                drawReflectionInWater(Rectangle{ npc.x, npc.y + (float)TILE_SIZE,
+                                                (float)TILE_SIZE,
+                                                (float)TILE_SIZE * 0.62f },
+                                      drawNpcReflectionTrampoline, &npc);
             }
             if (npc.cfg && npc.sheet.id != 0)
             {
@@ -6676,6 +6786,7 @@ static void updateAndDraw(void)
     drawFloorObjects();
     drawGroundFx();
     drawEntitiesSorted();
+    drawPickups();
     drawObjectsOverhead();
     drawItemGet();
     // Decor-above layer (tree tops, archways): over everything that walks.
@@ -6742,8 +6853,8 @@ static void updateAndDraw(void)
         {
             const char* name = bossIntroName[0] ? bossIntroName : "BOSS";
             int size = (int)(9.0f * scale);
-            int width = MeasureText(name, size);
-            DrawText(name, (GetScreenWidth() - width) / 2,
+            int width = uiMeasureText(name, size);
+            uiDrawText(name, (GetScreenWidth() - width) / 2,
                      (int)(barH * 0.5f - size * 0.5f), size,
                      Color{ 235, 235, 245, 255 });
         }
@@ -6772,6 +6883,21 @@ int main(int argc, char** argv)
 
     InitAudioDevice();
     SetTargetFPS(60);
+
+    // The game font first: every screen of engine chrome renders through
+    // it (dialogue loads its own copy for its own scaling needs).
+    if (GAME_FONT && GAME_FONT[0])
+    {
+        char fontPath[600];
+        snprintf(fontPath, sizeof(fontPath), "assets/%s", GAME_FONT);
+        uiFont = LoadFontEx(fontPath, 64, NULL, 0);
+        uiFontOwned = true;
+    }
+    else
+    {
+        uiFont = GetFontDefault();
+        uiFontOwned = false;
+    }
 
     tilesetTexture = LoadTexture(TILESET.image);
     SetTextureFilter(tilesetTexture, TEXTURE_FILTER_POINT);
@@ -6930,6 +7056,7 @@ int main(int argc, char** argv)
     hero.unload();
     room.unload();
     dialogue.shutdown();
+    if (uiFontOwned) UnloadFont(uiFont);
     UnloadTexture(tilesetTexture);
     UnloadTexture(heartsTexture);
     UnloadTexture(pickupsTexture);

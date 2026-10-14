@@ -1,11 +1,15 @@
 * { box-sizing: border-box; }
-body { margin: 0; font: 14px -apple-system, "Segoe UI", Helvetica, sans-serif; color: #222; background: #fafafa; }
-#root { display: flex; min-height: 100vh; }
-nav { width: 170px; flex: none; background: #1e1e28; padding: 12px 10px; }
+/* The app is a fixed-viewport tool window: the nav stays put and each
+   region (main content, room-editor side panel, graphs, code editor)
+   manages its own scrolling — no page-level scroll chaining. */
+html, body, #root { height: 100%; }
+body { margin: 0; font: 14px -apple-system, "Segoe UI", Helvetica, sans-serif; color: #222; background: #fafafa; overflow: hidden; }
+#root { display: flex; height: 100%; }
+nav { width: 170px; flex: none; background: #1e1e28; padding: 12px 10px; overflow-y: auto; }
 nav button { display: block; width: 100%; text-align: left; margin: 2px 0; padding: 8px 10px;
   background: none; border: none; color: #aaa; cursor: pointer; font-size: 14px; border-radius: 6px; }
 nav button.active { background: #3b3b6a; color: #fff; }
-main { flex: 1; padding: 20px 24px; max-width: 1400px; min-width: 0; }
+main { flex: 1; padding: 20px 24px; max-width: 1400px; min-width: 0; height: 100%; overflow-y: auto; }
 h1 { font-size: 18px; margin: 0 0 14px; }
 h2 { font-size: 12px; margin: 18px 0 6px; color: #666; text-transform: uppercase; letter-spacing: .06em; }
 button.btn { padding: 6px 14px; border: 1px solid #c5c5c5; background: #fff; border-radius: 6px;
@@ -32,6 +36,9 @@ pre.build { background: #111; color: #a5d6a7; padding: 12px; border-radius: 8px;
 .sheet { image-rendering: pixelated; border: 1px solid #ccc; background: #555; max-width: 256px; }
 .mapLayout { display: flex; gap: 20px; align-items: flex-start; }
 .mapSide { flex: 1; min-width: 0; }
+/* Room-editor side panel: sticks beside the map and scrolls on its own,
+   so the map (and its palette) stay in view while tuning room data. */
+.mapLayout > .panel { position: sticky; top: 8px; max-height: calc(100vh - 40px); overflow-y: auto; }
 .panel { width: 330px; flex: none; border-left: 1px solid #e4e4e4; padding-left: 16px; }
 .toolbar { display: flex; align-items: center; gap: 4px; margin: 4px 0; flex-wrap: wrap; }
 .toolbarSep { width: 1px; height: 20px; background: #d5d5d5; margin: 0 4px; }
@@ -41,6 +48,10 @@ button.tool.marker { border-color: #b8c6e6; }
 button.tool.active { background: #2563eb; border-color: #2563eb; color: #fff; }
 .layerToggle { display: inline-flex; align-items: center; gap: 3px; margin-right: 4px; }
 .scrollWrap { overflow: auto; max-height: 68vh; background: #2a2a33; border: 1px solid #999; border-radius: 4px; }
+/* Full-height graph surfaces (world map, dialogue trees) that own their
+   scrolling instead of growing the page. */
+.graphWrap { overflow: auto; height: calc(100vh - 130px); background: #2a2a33;
+  border: 1px solid #999; border-radius: 4px; }
 .paletteWrap { max-height: 220px; max-width: 300px; }
 .statusBar { display: flex; gap: 10px; align-items: center; margin-top: 8px; font-size: 12px; color: #555;
   min-height: 20px; flex-wrap: wrap; }
@@ -49,6 +60,8 @@ button.tool.active { background: #2563eb; border-color: #2563eb; color: #fff; }
 .encRow.selected { border-color: #2563eb; background: #dbeafe; }
 .encDot { width: 10px; height: 10px; border-radius: 50%; flex: none; display: inline-block; }
 .charLayout { display: flex; gap: 20px; align-items: flex-start; }
+/* Character editor side: stays with the sheet while it scrolls. */
+.charLayout > .charSide { position: sticky; top: 8px; max-height: calc(100vh - 40px); overflow-y: auto; }
 .charSide { width: 250px; flex: none; border-left: 1px solid #e4e4e4; padding-left: 16px; }
 .modalOverlay { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex;
   align-items: center; justify-content: center; z-index: 1000; }
@@ -57,3 +70,9 @@ button.tool.active { background: #2563eb; border-color: #2563eb; color: #fff; }
 .modal h1 { font-size: 15px; }
 .modal .row { margin-top: 14px; justify-content: flex-end; }
 code { background: #eef; border-radius: 4px; padding: 0 4px; font-size: 12px; }
+/* Game-code editor: a monospace typing surface with its own scrolling. */
+textarea.codeArea { width: 100%; height: calc(100vh - 240px); min-height: 320px; resize: vertical;
+  font: 13px/1.45 "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  tab-size: 4; white-space: pre; overflow: auto; border: 1px solid #999; border-radius: 6px;
+  padding: 10px 12px; background: #14141b; color: #d7e2ea; outline: none; }
+textarea.codeArea:focus { border-color: #2563eb; }

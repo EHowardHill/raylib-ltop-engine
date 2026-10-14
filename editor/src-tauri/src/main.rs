@@ -459,6 +459,11 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
         .ok()
         .and_then(|v| v.get("behaviors").cloned())
         .unwrap_or_else(|| json!([]));
+    // Game-code sources (editable in the Code tab).
+    let code_files: Vec<String> = list_files(&res, "code")
+        .into_iter()
+        .filter(|f| f.ends_with(".cpp"))
+        .collect();
 
     Ok(json!({
         "project": root.to_string_lossy(),
@@ -475,6 +480,7 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
         "items": items,
         "tileMeta": tile_meta,
         "behaviors": behaviors,
+        "codeFiles": code_files,
         "game": read_json(&res.join("game.json")).ok(),
     }))
 }
@@ -485,7 +491,20 @@ fn save(state: State<ProjectState>, path: String, content: String) -> Result<Val
     let target = resolve_resource(&root, &path)?;
     match target.extension().and_then(|e| e.to_str()) {
         Some("json") => {}
-        _ => return Err("Only .json files can be saved".to_string()),
+        // Game-code behavior sources are editable too, confined to
+        // resources/code/ (resolve_resource already bounds everything to
+        // the project's resources/ tree).
+        Some("cpp") => {
+            let in_code_dir = target
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n == std::ffi::OsStr::new("code"))
+                .unwrap_or(false);
+            if !in_code_dir {
+                return Err(".cpp files can only be saved under resources/code/".to_string());
+            }
+        }
+        _ => return Err("Only .json files (and .cpp under resources/code/) can be saved".to_string()),
     }
     fs::write(&target, content).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true }))
@@ -521,10 +540,17 @@ fn create(
             if target.exists() {
                 return Err("Already exists".to_string());
             }
+            // The optional state channels start empty: the engine falls
+            // back to the stand/move pair until frames are filled in (or
+            // duplicated from stand as placeholders).
             let doc = json!({
                 "width": 4,
                 "stand": Value::Object(empty_directions()),
                 "move": Value::Object(empty_directions()),
+                "attack": Value::Object(empty_directions()),
+                "lift": Value::Object(empty_directions()),
+                "swim": Value::Object(empty_directions()),
+                "hurt": Value::Object(empty_directions()),
             });
             fs::write(&target, pretty4(&doc)).map_err(|e| e.to_string())?;
             Ok(json!({ "ok": true }))
@@ -566,7 +592,6 @@ fn create(
         // against. Compile errors surface through the Build tab (or the
         // editor's compile check) after saving.
         "behavior" => {
-            let sym = name.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_");
             let target = res.join("code").join(format!("{}.cpp", name));
             if target.exists() {
                 return Err("Already exists".to_string());

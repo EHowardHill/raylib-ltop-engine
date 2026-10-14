@@ -11,11 +11,13 @@
             "cut_result": 46
         },
         "59": {
-            "water": "deep"
+            "water": "deep",
+            "anim": [59, 73, 74]
         },
         "60": {
             "water": "shallow",
-            "heal": true
+            "heal": true,
+            "anim": [60, 75, 76]
         },
         "61": {
             "ice": true
@@ -49,7 +51,8 @@
             "push": [
                 0,
                 32
-            ]
+            ],
+            "anim": [66, 77, 78]
         },
         "67": {
             "ledge": "down"

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useContext, createContext } from 'react';
 import { createRoot } from 'react-dom/client';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { api, resourceUrl } from './api.js';
+import { api, resourceUrl, resourceText } from './api.js';
 import './styles.css';
 
 const stem = file => file.replace(/\.json$/, '');
@@ -82,7 +82,7 @@ function App() {
     const tabs = [
         ['rooms', 'Rooms'], ['enemies', 'Enemies'], ['items', 'Items'],
         ['tiles', 'Tiles'], ['dialogue', 'Dialogue'], ['characters', 'Characters'],
-        ['flags', 'Flags'], ['files', 'Music & Files'], ['build', 'Build']
+        ['code', 'Code'], ['flags', 'Flags'], ['files', 'Music & Files'], ['build', 'Build']
     ];
 
     return (
@@ -105,6 +105,7 @@ function App() {
                     {tab === 'dialogue' && <DialogueTab scan={scan} refresh={refresh} />}
                     {tab === 'flags' && <FlagsTab />}
                     {tab === 'characters' && <CharactersTab scan={scan} refresh={refresh} />}
+                    {tab === 'code' && <CodeTab scan={scan} refresh={refresh} />}
                     {tab === 'files' && <FilesTab scan={scan} refresh={refresh} />}
                     {tab === 'build' && <BuildTab scan={scan} refresh={refresh} />}
                     </main>
@@ -248,6 +249,22 @@ function RoomEditor({ room, scan, onSaved }) {
         if (!el) return;
         const fit = Math.min((el.clientWidth - 24) / (W * ts), (el.clientHeight - 24) / (H * ts), 1);
         setZoom(Math.max(0.25, Math.round(fit * 4) / 4));
+    }, []);
+
+    // Ctrl/cmd + wheel zooms the map; a plain wheel keeps scrolling it.
+    // (Native listener: React's wheel handler is passive and can't block
+    // the browser's pinch-zoom gesture.)
+    useEffect(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        const onWheel = e => {
+            if (!(e.ctrlKey || e.metaKey)) return;
+            e.preventDefault();
+            const factor = e.deltaY < 0 ? 1.25 : 0.8;
+            setZoom(z => Math.max(0.25, Math.min(4, Math.round(z * factor * 4) / 4)));
+        };
+        el.addEventListener('wheel', onWheel, { passive: false });
+        return () => el.removeEventListener('wheel', onWheel);
     }, []);
 
     // Keyboard shortcuts (ignored while typing in a field).
@@ -1221,7 +1238,7 @@ function WorldGraph({ rooms, current, onSelect }) {
     });
 
     return (
-        <div className="scrollWrap" style={{ flex: 1, minHeight: 0 }}>
+        <div className="graphWrap">
             <svg width={width} height={height} style={{ display: 'block' }}>
                 {links}
                 {rooms.map((r, i) => (
@@ -2418,7 +2435,7 @@ function DialogueTree({ lines, labels }) {
     });
 
     return (
-        <div className="scrollWrap" style={{ flex: 1 }}>
+        <div className="graphWrap">
             <svg width={NODE_W + 260} height={height} style={{ display: 'block' }}>
                 <defs>
                     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -2526,8 +2543,12 @@ function CharactersTab({ scan, refresh }) {
 }
 
 // Must match MOVE_ANIM_FPS / STAND_ANIM_FPS in src/hero.cpp so the preview
-// plays at the same speed the engine will.
-const ANIM_FPS = { stand: 2, move: 12 };
+// plays at the same speed the engine will. Action channels animate at the
+// walk cadence; the rest breathe at the stand pace.
+const ANIM_FPS = { stand: 2, move: 12, attack: 12, lift: 2, swim: 12, hurt: 2 };
+// Character animation channels: the base pair plus the optional state
+// blocks the hero falls back from (empty = use stand/move).
+const CHAR_KINDS = ['stand', 'move', 'attack', 'lift', 'swim', 'hurt'];
 const STRIP_CELL = 44;
 
 function CharacterEditor({ character, onSaved }) {
@@ -2764,8 +2785,8 @@ function CharacterEditor({ character, onSaved }) {
                         </div>
                         <div className="charSide">
                             <h2>Animation</h2>
-                            {['stand', 'move'].map(kind => (
-                                <div className="field" key={kind}>
+                            {CHAR_KINDS.map(kind => (
+                                <div className="field" key={kind} style={{ flexWrap: 'wrap' }}>
                                     <label>{kind}</label>
                                     {DIRECTIONS.map(dir => (
                                         <button key={dir}
@@ -2774,7 +2795,9 @@ function CharacterEditor({ character, onSaved }) {
                                     ))}
                                 </div>
                             ))}
-                            <p className="dim">stand plays at {ANIM_FPS.stand} fps, move at {ANIM_FPS.move} fps — the engine's speeds.</p>
+                            <p className="dim">attack/lift/swim/hurt are optional — empty ones fall back to
+                                stand/move (duplicate stand frames there for placeholder art).</p>
+                            <p className="dim">stand and lift play at {ANIM_FPS.stand} fps, the rest at {ANIM_FPS.move} fps — the engine's speeds.</p>
                             <h2>Preview</h2>
                             <div className="row">
                                 <canvas ref={previewRef} width={64} height={64}
@@ -2910,6 +2933,168 @@ function GameIdentity({ scan, onSaved }) {
                 <button className="btn" onClick={save}>Save</button>
                 <span className="dim">{status}</span>
             </div>
+        </div>
+    );
+}
+
+// ---- game code (resources/code/*.cpp) ---------------------------------------
+
+// Game-code behaviors, editable in the window: the file list and editor
+// live here (scaffolding and per-enemy references stay on the Enemies
+// tab). Saving writes through the same confined-to-resources/ backend
+// command; the compile check runs the engine's syntax-only pass.
+function CodeTab({ scan, refresh }) {
+    const confirm = useConfirm();
+    const [sel, setSel] = useState(0);
+    const [name, setName] = useState('');
+    const [error, setError] = useState('');
+    const [dirty, setDirty] = useState(false);
+    const [pending, setPending] = useState(null);
+    const files = scan.codeFiles || [];
+    const file = files[Math.min(sel, files.length - 1)];
+
+    // Select a freshly scaffolded file once the refreshed scan carries it.
+    useEffect(() => {
+        if (pending == null) return;
+        const i = files.findIndex(f => f === pending);
+        if (i >= 0) setSel(i);
+        setPending(null);
+    }, [files, pending]);
+
+    const select = async i => {
+        if (dirty && !await confirm('Discard unsaved changes to ' + file + '?')) return;
+        setSel(i);
+    };
+
+    const create = async () => {
+        if (!name.trim()) return;
+        if (dirty && !await confirm('Discard unsaved changes to ' + file + '?')) return;
+        const result = await api('/api/create', { type: 'behavior', name: name.trim() });
+        if (result.error) return setError(result.error);
+        setName(''); setError('');
+        setPending(name.trim() + '.cpp');
+        await refresh();
+    };
+
+    const remove = async f => {
+        if (dirty && f === file && !await confirm('Discard unsaved changes to ' + f + '?')) return;
+        if (!await confirm('Delete ' + f + '? Enemies referencing "custom:' + f.replace(/\.cpp$/, '') + '" will fail the manifest check until removed.')) return;
+        await api('/api/delete', { path: 'resources/code/' + f });
+        setSel(0);
+        refresh();
+    };
+
+    return (
+        <div className="layout">
+            <div className="sidebar">
+                <h2>Game Code</h2>
+                {files.map((f, i) => (
+                    <div className="row" key={f}>
+                        <button className={'item' + (i === sel ? ' active' : '')} style={{ flex: 1 }}
+                            onClick={() => select(i)}>{f}</button>
+                        <button className="delete" onClick={() => remove(f)}>×</button>
+                    </div>
+                ))}
+                {files.length === 0 && <p className="dim">No behaviors yet.</p>}
+                <h2>New Behavior</h2>
+                <div className="row">
+                    <input placeholder="name" value={name} style={{ width: 92 }} onChange={e => setName(e.target.value)} />
+                    <button className="btn" onClick={create}>Scaffold</button>
+                </div>
+                {error && <p className="fail">{error}</p>}
+                <p className="dim" style={{ marginTop: 10 }}>
+                    Compiled into the binary; enemies reference them as
+                    <code>custom:&lt;name&gt;</code>. Registered behaviors:
+                    {(scan.behaviors || []).map(b => ' ' + b).toString() || ' none'}
+                </p>
+            </div>
+            {file
+                ? <CodeEditor key={file} file={file} onSaved={refresh} onDirty={setDirty} />
+                : <p className="dim">Scaffold a behavior to start writing game code.</p>}
+        </div>
+    );
+}
+
+function CodeEditor({ file, onSaved, onDirty }) {
+    const [text, setText] = useState('');
+    const [loaded, setLoaded] = useState(false);
+    const [status, setStatus] = useState('');
+    const [check, setCheck] = useState(null);
+    const areaRef = useRef(null);
+
+    useEffect(() => {
+        let alive = true;
+        setLoaded(false);
+        setCheck(null);
+        resourceText('resources/code/' + file).then(t => {
+            if (!alive) return;
+            setText(t);
+            setLoaded(true);
+            onDirty(false);
+            setStatus('');
+        }).catch(err => setStatus(String(err)));
+        return () => { alive = false; };
+    }, [file]);
+
+    const edit = value => {
+        setText(value);
+        onDirty(true);
+        setStatus('');
+    };
+
+    // Tab inserts spaces (the textarea is the code editor's typing surface).
+    const onKeyDown = e => {
+        if (e.key !== 'Tab') return;
+        e.preventDefault();
+        const el = areaRef.current;
+        const start = el.selectionStart, end = el.selectionEnd;
+        setText(t => {
+            const next = t.slice(0, start) + '    ' + t.slice(end);
+            requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = start + 4; });
+            return next;
+        });
+        onDirty(true);
+    };
+
+    const save = async () => {
+        const result = await api('/api/save', { path: 'resources/code/' + file, content: text });
+        if (result.error) return setStatus(result.error);
+        onDirty(false);
+        setStatus('Saved ' + file + ' — rebuild (Build tab) to bake it into the game.');
+        onSaved();
+    };
+
+    const checkFile = async () => {
+        setCheck(null);
+        if (dirty) setStatus('Save first — the check compiles the file on disk.');
+        else setCheck(await api('/api/check_code', { file }));
+    };
+
+    return (
+        <div style={{ flex: 1, minWidth: 0 }}>
+            <h1>{file}
+                {dirty && <span className="fail"> (unsaved changes)</span>}
+                <span className="dim" style={{ fontSize: 12 }}> — resources/code/{file}</span>
+            </h1>
+            <div className="toolbar" style={{ marginBottom: 8 }}>
+                <button className="btn primary" onClick={save} disabled={!loaded}>Save</button>
+                <button className="btn" onClick={checkFile} disabled={!loaded}>Compile check</button>
+                <span className="dim">{text.split('\n').length} lines</span>
+            </div>
+            <textarea ref={areaRef} className="codeArea" spellCheck={false} value={text}
+                onChange={e => edit(e.target.value)} onKeyDown={onKeyDown}
+                placeholder={loaded ? '' : 'Loading…'} />
+            {status && <p className="dim" style={{ marginTop: 6 }}>{status}</p>}
+            {check && (
+                <div style={{ marginTop: 8 }}>
+                    {check.ok
+                        ? <p className="dim" style={{ color: '#22c55e' }}>✓ Compiles clean.</p>
+                        : <p className="fail">✗ Compile errors:</p>}
+                    {check.output && check.output.trim() && check.output !== '(web build compiled clean)' && (
+                        <pre className="build" style={{ maxHeight: 220 }}>{check.output.slice(-4000)}</pre>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
