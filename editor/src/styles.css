@@ -9,6 +9,11 @@ nav { width: 170px; flex: none; background: #1e1e28; padding: 12px 10px; overflo
 nav button { display: block; width: 100%; text-align: left; margin: 2px 0; padding: 8px 10px;
   background: none; border: none; color: #aaa; cursor: pointer; font-size: 14px; border-radius: 6px; }
 nav button.active { background: #3b3b6a; color: #fff; }
+/* The File tab is project-management (menu-bar territory), not a working
+   tab — it sits first and wears its own accent so it reads differently
+   from the workspace tabs below it. */
+nav button.file { color: #f5c85c; font-weight: 600; }
+nav button.file.active { background: #f5c85c; color: #1e1e28; }
 main { flex: 1; padding: 20px 24px; max-width: 1400px; min-width: 0; height: 100%; overflow-y: auto; }
 h1 { font-size: 18px; margin: 0 0 14px; }
 h2 { font-size: 12px; margin: 18px 0 6px; color: #666; text-transform: uppercase; letter-spacing: .06em; }
@@ -84,3 +89,6 @@ textarea.codeArea { width: 100%; height: calc(100vh - 240px); min-height: 320px;
   tab-size: 4; white-space: pre; overflow: auto; border: 1px solid #999; border-radius: 6px;
   padding: 10px 12px; background: #14141b; color: #d7e2ea; outline: none; }
 textarea.codeArea:focus { border-color: #2563eb; }
+
+label.btn { padding: 6px 14px; border: 1px solid #c5c5c5; background: #fff; border-radius: 6px;
+  cursor: pointer; font-size: 13px; display: inline-block; }

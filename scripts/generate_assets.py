@@ -100,6 +100,10 @@ def load_dialogues(flags):
        "camera": {"pan": [tileX, tileY], "time": <s>} | "hero"
        "letterbox": true|false                  # cinematic bars
        "move": {"actor": "hero"|<npc index>, "tile": [x, y], "time": <s>}
+       "face": {"actor": "hero"|<npc index>, "dir": "down"|"right"|"left"|"up"}
+       "show": "hero"|<npc index>                # mid-scene entrance (respawn
+       "hide": "hero"|<npc index>               # ...or exit: actor off-stage
+       "fade": {"to": "black"|"world", "time": <s>}   # scripted screen fade
        "choice": [{"text": ..., "set": [...], "clear": [...], "sfx": ...,
                    "give": <item>, "cost": <rupees>, "goto": ...}, ...]}
     Dialogue-level keys: "credits": true (endgame roll: centered lines over
@@ -134,6 +138,20 @@ def load_dialogues(flags):
             if isinstance(values, (str, int, float)):
                 values = [values]
             return [flags.index(v, "dialogue/%s" % filename) for v in values]
+
+        # Actor vocabulary shared by the blocking/facing/visibility cues:
+        # "hero" or a room npc index.
+        def actor_id(value, what):
+            if value is None or value == "":
+                return -1
+            if value == "hero":
+                return -2
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                warn("dialogue '%s' %s has a bad actor %r (hero or npc index)"
+                     % (filename, what, value))
+                return -1
 
         lines = []
         for entry in data.get("lines") or []:
@@ -174,21 +192,54 @@ def load_dialogues(flags):
             move_seconds = 0.0
             move = entry.get("move")
             if isinstance(move, dict):
-                actor = move.get("actor")
-                if actor == "hero":
-                    move_actor = -2
-                else:
-                    try:
-                        move_actor = int(actor)
-                    except (TypeError, ValueError):
-                        warn("dialogue '%s' move has a bad actor %r"
-                             % (filename, actor))
-                        move_actor = -1
+                move_actor = actor_id(move.get("actor"), "move")
                 move_tile = move.get("tile") or [0, 0]
                 try:
                     move_seconds = max(0.0, float(move.get("time") or 1.0))
                 except (TypeError, ValueError):
                     move_seconds = 1.0
+
+            # Face cue: turn an actor to speak without a glide.
+            face_actor = -1
+            face_dir = 0
+            face = entry.get("face")
+            if isinstance(face, dict):
+                face_actor = actor_id(face.get("actor"), "face")
+                dir_name = str(face.get("dir") or "")
+                if dir_name in DIRECTIONS:
+                    face_dir = DIRECTIONS.index(dir_name)
+                else:
+                    warn("dialogue '%s' face has a bad dir %r %s"
+                         % (filename, face.get("dir"), DIRECTIONS))
+                    face_actor = -1
+            elif face is not None:
+                warn("dialogue '%s' face must be {actor, dir}" % filename)
+
+            # Visibility cues: mid-scene entrances/exits resolved against
+            # the room's npc list (bare actors, like move's).
+            show_actor = actor_id(entry.get("show"), "show")
+            hide_actor = actor_id(entry.get("hide"), "hide")
+
+            # Screen fade: "black" hides the world, "world" brings it
+            # back; the cutscene's clock is the duration.
+            fade_to = 0
+            fade_seconds = 0.0
+            fade = entry.get("fade")
+            if isinstance(fade, dict):
+                target = str(fade.get("to") or "")
+                if target == "black":
+                    fade_to = 1
+                elif target == "world":
+                    fade_to = 2
+                else:
+                    warn("dialogue '%s' fade has a bad target %r (black/world)"
+                         % (filename, fade.get("to")))
+                try:
+                    fade_seconds = max(0.0, float(fade.get("time") or 0.5))
+                except (TypeError, ValueError):
+                    fade_seconds = 0.5
+            elif fade is not None:
+                warn("dialogue '%s' fade must be {to, time}" % filename)
 
             choices = []
             for opt in entry.get("choice") or []:
@@ -235,6 +286,12 @@ def load_dialogues(flags):
                 "moveTileX": int(move_tile[0]),
                 "moveTileY": int(move_tile[1]),
                 "moveSeconds": move_seconds,
+                "faceActor": face_actor,
+                "faceDir": face_dir,
+                "showActor": show_actor,
+                "hideActor": hide_actor,
+                "fadeTo": fade_to,
+                "fadeSeconds": fade_seconds,
                 "choices": choices,
             })
 
@@ -344,15 +401,18 @@ def load_characters():
 
 def load_game():
     """resources/game.json (optional): {"title": ..., "slug": ...,
-    "font": ...}.
+    "font": ..., "intro": <dialogue>}.
     The title is engine chrome (title screen subtitle); the slug identifies
     the game in save files so a save from one game is never loaded by
     another (filesystem-safe, <= 15 chars). "font" is a file under
     resources/ (e.g. "fonts/dialogue.otf") rendered for every piece of
-    engine text — absent means the raylib default bitmap font."""
+    engine text — absent means the raylib default bitmap font. "intro"
+    names a dialogue script a fresh game plays over the first room drop
+    (the boot intro; continue never replays it)."""
     title = "UNTITLED GAME"
     slug = "game"
     font = ""
+    intro = ""
     path = res("game.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
@@ -363,13 +423,14 @@ def load_game():
         if font and not os.path.exists(res(font)):
             warn("game font '%s' does not exist under resources/ (ignoring)" % font)
             font = ""
+        intro = str(data.get("intro") or "")
     clean = re.sub(r"[^a-z0-9-]", "", str(slug).lower()) or "game"
     if clean != str(slug).lower():
         warn("game slug '%s' is not filesystem-safe; using '%s'" % (slug, clean))
     if len(clean) > 15:
         warn("game slug '%s' is longer than 15 chars; truncating" % slug)
         clean = clean[:15]
-    return {"title": title, "slug": clean, "font": font}
+    return {"title": title, "slug": clean, "font": font, "intro": intro}
 
 
 # --- Items (resources/items/<name>.json) -------------------------------------
@@ -1653,7 +1714,7 @@ def emit_dialogues(c, dialogues):
 
             line_refs.append(
                 "    { %s, %d, %d, %d, %s, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %s, "
-                "%s, %d, %d, %d, %s, %d, %d, %d, %d, %s },"
+                "%s, %d, %d, %d, %s, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d, %s },"
                 % (cstr(line["text"]), line["gotoLine"], line["if"], line["unless"],
                    (lbase + "_SET") if line["set"] else "0", len(line["set"]),
                    (lbase + "_CLEAR") if line["clear"] else "0", len(line["clear"]),
@@ -1670,7 +1731,10 @@ def emit_dialogues(c, dialogues):
                    cfloat(line["camSeconds"]),
                    line["letterbox"], line["moveActor"],
                    line["moveTileX"], line["moveTileY"],
-                   cfloat(line["moveSeconds"])))
+                   cfloat(line["moveSeconds"]),
+                   line["faceActor"], line["faceDir"],
+                   line["showActor"], line["hideActor"],
+                   line["fadeTo"], cfloat(line["fadeSeconds"])))
 
         if line_refs:
             c.append("static const DialogueLine %s_LINES[] = {" % base)
@@ -1679,7 +1743,7 @@ def emit_dialogues(c, dialogues):
             c.append("};")
         else:
             c.append("static const DialogueLine %s_LINES[] = { { 0, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, -1, -1, 0, 0, "
-                     "0.0f, 0, 0, 0, 0.0f, -1, -1, 0, 0, 0.0f } };" % base)
+                     "0.0f, 0, 0, 0, 0.0f, -1, -1, 0, 0, 0.0f, -1, 0, -1, -1, 0, 0.0f } };" % base)
         c.append("")
 
     c.append("const Dialogue DIALOGUES[] = {")
@@ -1866,7 +1930,7 @@ def emit_rules(c):
     c.append("")
 
 
-def emit_game(c, game, manifest):
+def emit_game(c, game, manifest, intro_index):
     """Game identity + the game-code behavior manifest (resources/code/):
     the names game code registers; JSON references them as "custom:<name>"."""
     c.append("const char* const GAME_TITLE = %s;" % cstr(game["title"]))
@@ -1874,6 +1938,9 @@ def emit_game(c, game, manifest):
     # Global text font (empty = the raylib default bitmap font): every
     # piece of engine chrome (HUD, menus, dialogue) renders with it.
     c.append("const char* const GAME_FONT = %s;" % cstr(game["font"]))
+    # Boot intro: DIALOGUES[] index of the script a fresh game plays over
+    # the first room drop (-1 = none; see startNewGame).
+    c.append("const int GAME_INTRO = %d;" % intro_index)
     c.append("")
     c.append("const char* const CUSTOM_BEHAVIOR_NAMES[] = {")
     for name in manifest:
@@ -2251,6 +2318,652 @@ def create_hearts_bitmap(path):
         sheet.append(bytes(row))
 
     write_png(path, width, 16, sheet)
+    return True
+
+
+# --- UI sprite helpers ---------------------------------------------------------
+# Menu chrome is sprites, not shapes: everything except text draws from a
+# resources/ui sheet. The painters below are tiny pixel-art helpers shared
+# by the UI placeholder creators.
+
+def pix_blank(width, height):
+    return [bytearray(width * 4) for _ in range(height)]
+
+
+def pix_put(image, x, y, color):
+    if 0 <= y < len(image) and 0 <= x < len(image[0]) // 4:
+        image[y][x * 4:x * 4 + 4] = bytes(color)
+
+
+def pix_rect(image, x0, y0, w, h, color):
+    for y in range(y0, y0 + h):
+        for x in range(x0, x0 + w):
+            pix_put(image, x, y, color)
+
+
+def pix_disc(image, cx, cy, radius, color):
+    for y in range(len(image)):
+        for x in range(len(image[0]) // 4):
+            if math.hypot(x + 0.5 - cx, y + 0.5 - cy) <= radius:
+                pix_put(image, x, y, color)
+
+
+def pix_line(image, x0, y0, x1, y1, color):
+    steps = int(max(abs(x1 - x0), abs(y1 - y0))) * 2 + 1
+    for s in range(steps + 1):
+        t = float(s) / steps
+        pix_put(image, int(round(x0 + (x1 - x0) * t)),
+                int(round(y0 + (y1 - y0) * t)), color)
+
+
+def pix_outline(image, color):
+    """One-pixel outline around every opaque cluster (sprite ink)."""
+    height = len(image)
+    width = len(image[0]) // 4
+    solid = [[image[y][x * 4 + 3] != 0 for x in range(width)] for y in range(height)]
+    for y in range(height):
+        for x in range(width):
+            if solid[y][x]:
+                continue
+            near = ((x > 0 and solid[y][x - 1]) or (x < width - 1 and solid[y][x + 1])
+                    or (y > 0 and solid[y - 1][x]) or (y < height - 1 and solid[y + 1][x]))
+            if near:
+                image[y][x * 4:x * 4 + 4] = bytes(color)
+
+
+def pix_compose(frames):
+    """Uniform frame sizes, laid out in a row."""
+    frame_h = len(frames[0])
+    sheet = []
+    for y in range(frame_h):
+        row = bytearray()
+        for image in frames:
+            row.extend(image[y])
+        sheet.append(bytes(row))
+    return sheet
+
+
+UI_INK = (24, 16, 40, 255)  # shared dark outline for UI sprites
+
+
+def create_cursor_bitmap(path):
+    """Menu cursor sheet, 8x8 frames: 0 right-pointing arrow (list
+    cursors), 1 down-pointing arrow (dialogue continue prompt)."""
+    if os.path.exists(path):
+        return False
+
+    def arrow(kind):
+        image = pix_blank(8, 8)
+        for y in range(8):
+            for x in range(8):
+                if kind == "right":
+                    t = (x + 0.5 - 1.0) / 6.0
+                    inside = 0.0 <= t <= 1.0 and abs(y + 0.5 - 4.0) <= 3.0 * (1.0 - t)
+                else:
+                    t = (y + 0.5 - 1.0) / 6.0
+                    inside = 0.0 <= t <= 1.0 and abs(x + 0.5 - 4.0) <= 3.0 * (1.0 - t)
+                if inside:
+                    pix_put(image, x, y, (250, 250, 255, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    write_png(path, 16, 8, pix_compose([arrow("right"), arrow("down")]))
+    return True
+
+
+def create_map_bitmap(path):
+    """Map overview sheet (pause MAP tab + flute picker), 18x14 frames:
+    0 visited room cell, 1 current room cell, 2 hero dot, 3 chest mark,
+    4 boss mark, 5 bird wings up, 6 bird wings down, 7 horizontal
+    connection strip (8x2, top-left of its frame), 8 vertical connection
+    strip (2x8)."""
+    if os.path.exists(path):
+        return False
+
+    def cell(fill, border):
+        image = pix_blank(18, 14)
+        pix_rect(image, 0, 0, 18, 14, fill)
+        for x in range(18):
+            pix_put(image, x, 0, border)
+            pix_put(image, x, 13, border)
+        for y in range(14):
+            pix_put(image, 0, y, border)
+            pix_put(image, 17, y, border)
+        return image
+
+    def mark(shape, color):
+        image = pix_blank(18, 14)
+        for y in range(14):
+            for x in range(18):
+                dx = x + 0.5 - 9.0
+                dy = y + 0.5 - 7.0
+                if shape == "dot" and math.hypot(dx, dy) <= 2.2:
+                    pix_put(image, x, y, color)
+                if shape == "diamond" and abs(dx) + abs(dy) <= 3.0:
+                    pix_put(image, x, y, color)
+        pix_outline(image, UI_INK)
+        return image
+
+    def bird(wing_up):
+        image = pix_blank(18, 14)
+        tip = 1.0 if wing_up else 7.0
+        pix_line(image, 9, 5, 3, tip, (250, 250, 255, 255))
+        pix_line(image, 9, 5, 15, tip, (250, 250, 255, 255))
+        pix_disc(image, 9.0, 5.0, 2.0, (250, 250, 255, 255))
+        pix_put(image, 11, 3, (250, 250, 255, 255))  # beak
+        pix_outline(image, UI_INK)
+        return image
+
+    def connector(horizontal):
+        image = pix_blank(18, 14)
+        if horizontal:
+            pix_rect(image, 0, 6, 8, 2, (120, 130, 170, 255))
+        else:
+            pix_rect(image, 8, 0, 2, 8, (120, 130, 170, 255))
+        return image
+
+    frames = [
+        cell((40, 50, 90, 255), (120, 130, 170, 255)),
+        cell((90, 120, 200, 255), (240, 240, 250, 255)),
+        mark("dot", (250, 250, 255, 255)),
+        mark("diamond", (235, 200, 70, 255)),
+        mark("dot", (225, 80, 80, 255)),
+        bird(True),
+        bird(False),
+        connector(True),
+        connector(False),
+    ]
+    write_png(path, 18 * len(frames), 14, pix_compose(frames))
+    return True
+
+
+def create_items_bitmap(path, names):
+    """Item icon sheet, one 16x16 frame per item id (frame = id): the
+    pause subscreen, the HUD equipped slot, and the item-get rise all
+    draw from it. Distinct placeholder motifs per known item name; a
+    name-hued orb for anything else."""
+    if os.path.exists(path):
+        return False
+
+    steel = (188, 196, 210, 255)
+    wood = (196, 150, 90, 255)
+    gold = (216, 168, 60, 255)
+    gold_light = (250, 232, 160, 255)
+
+    def medallion(core, core_light):
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 8.0, 5.6, gold)
+        pix_disc(image, 8.0, 8.0, 3.6, core)
+        pix_put(image, 7, 6, core_light)
+        pix_put(image, 6, 7, core_light)
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_bombs():
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 9.0, 5.2, (40, 40, 48, 255))
+        pix_disc(image, 6.0, 7.0, 1.6, (110, 110, 120, 255))
+        pix_line(image, 10, 5, 12, 3, (150, 110, 70, 255))
+        pix_put(image, 12, 2, (255, 200, 80, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_boomerang():
+        image = pix_blank(16, 16)
+        pix_line(image, 4, 3, 11, 6, (240, 200, 70, 255))
+        pix_line(image, 4, 13, 11, 9, (240, 200, 70, 255))
+        pix_line(image, 4, 3, 4, 13, (240, 200, 70, 255))
+        pix_put(image, 3, 7, (255, 240, 170, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_bottle():
+        image = pix_blank(16, 16)
+        pix_rect(image, 6, 1, 4, 2, (150, 110, 70, 255))     # cork
+        pix_rect(image, 6, 3, 1, 3, (200, 230, 250, 255))    # neck
+        pix_rect(image, 9, 3, 1, 3, (200, 230, 250, 255))
+        pix_rect(image, 4, 6, 1, 9, (200, 230, 250, 255))    # body walls
+        pix_rect(image, 11, 6, 1, 9, (200, 230, 250, 255))
+        pix_rect(image, 4, 14, 8, 1, (200, 230, 250, 255))
+        pix_put(image, 5, 6, (200, 230, 250, 255))
+        pix_put(image, 10, 6, (200, 230, 250, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_bow():
+        image = pix_blank(16, 16)
+        for y in range(16):
+            for x in range(16):
+                d = math.hypot(x + 0.5 - 4.0, y + 0.5 - 8.0)
+                if 5.6 < d < 7.0 and x + 0.5 >= 4.0:
+                    pix_put(image, x, y, (150, 110, 70, 255))
+        pix_line(image, 4, 1, 4, 15, (230, 230, 230, 255))   # string
+        pix_rect(image, 4, 7, 8, 2, wood)                    # arrow shaft
+        pix_rect(image, 12, 6, 2, 4, steel)                   # head
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_wand(orb, orb_core):
+        image = pix_blank(16, 16)
+        pix_line(image, 3, 13, 9, 7, (170, 150, 120, 255))
+        pix_disc(image, 11.0, 5.0, 2.4, orb)
+        pix_put(image, 10, 4, orb_core)
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_cape():
+        image = pix_blank(16, 16)
+        for y in range(4, 14):
+            half = (y - 2) // 2
+            for x in range(8 - half, 8 + half):
+                pix_put(image, x, y, (150, 60, 160, 255))
+        pix_disc(image, 8.0, 3.0, 1.4, gold)
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_compass():
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 8.0, 5.6, gold)
+        pix_disc(image, 8.0, 8.0, 4.0, (240, 230, 190, 255))
+        pix_line(image, 8, 5, 8, 8, (225, 80, 80, 255))
+        pix_line(image, 8, 8, 8, 11, (230, 230, 240, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_flippers():
+        image = pix_blank(16, 16)
+        pix_rect(image, 2, 5, 5, 6, (90, 200, 190, 255))
+        pix_rect(image, 9, 5, 5, 6, (90, 200, 190, 255))
+        pix_rect(image, 3, 6, 1, 3, (170, 250, 240, 255))
+        pix_rect(image, 10, 6, 1, 3, (170, 250, 240, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_flute():
+        image = pix_blank(16, 16)
+        pix_rect(image, 2, 6, 12, 4, wood)
+        pix_rect(image, 12, 7, 2, 2, (150, 110, 70, 255))     # mouthpiece
+        for x in (5, 7, 9):
+            pix_put(image, x, 7, (60, 36, 20, 255))
+            pix_put(image, x, 8, (60, 36, 20, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_gloves():
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 9.0, 4.2, (150, 150, 160, 255))
+        pix_rect(image, 6, 12, 5, 3, (100, 100, 110, 255))
+        for x in (6, 8, 10):
+            pix_put(image, x, 5, (150, 150, 160, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_hammer():
+        image = pix_blank(16, 16)
+        pix_rect(image, 3, 3, 10, 5, (140, 140, 150, 255))
+        pix_rect(image, 3, 3, 3, 5, (200, 200, 210, 255))
+        pix_line(image, 8, 8, 8, 14, (150, 110, 70, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_hookshot():
+        image = pix_blank(16, 16)
+        for i, (x, y) in enumerate(((3, 12), (5, 10), (7, 8), (9, 6))):
+            pix_put(image, x, y, steel)
+            pix_put(image, x + 1, y, steel if i % 2 else (120, 128, 140, 255))
+        for y in range(16):
+            for x in range(16):
+                d = math.hypot(x + 0.5 - 12.0, y + 0.5 - 4.0)
+                if 1.8 < d < 3.0 and x + 0.5 >= 11.0:
+                    pix_put(image, x, y, steel)
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_lantern():
+        image = pix_blank(16, 16)
+        pix_rect(image, 4, 3, 8, 1, (240, 220, 160, 255))     # handle
+        pix_rect(image, 4, 4, 1, 10, gold)
+        pix_rect(image, 11, 4, 1, 10, gold)
+        pix_rect(image, 4, 14, 8, 1, gold)
+        pix_disc(image, 8.0, 9.0, 2.4, (255, 200, 90, 255))
+        pix_put(image, 7, 8, (255, 250, 200, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_mirror():
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 7.0, 5.2, gold)
+        pix_disc(image, 8.0, 7.0, 3.8, (200, 210, 225, 255))
+        pix_line(image, 6, 9, 10, 5, (250, 252, 255, 255))
+        pix_rect(image, 7, 12, 2, 3, (225, 80, 80, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_net():
+        image = pix_blank(16, 16)
+        for y in range(16):
+            for x in range(16):
+                d = math.hypot(x + 0.5 - 6.0, y + 0.5 - 6.0)
+                if 3.4 < d < 4.6:
+                    pix_put(image, x, y, (150, 110, 70, 255))
+        pix_line(image, 3, 6, 9, 6, (210, 210, 220, 255))
+        pix_line(image, 6, 3, 6, 9, (210, 210, 220, 255))
+        pix_line(image, 9, 9, 14, 14, (150, 110, 70, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_powder():
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 9.0, 4.6, (110, 160, 90, 255))
+        pix_rect(image, 7, 4, 2, 2, (80, 120, 60, 255))
+        pix_put(image, 5, 3, (230, 240, 220, 255))
+        pix_put(image, 10, 2, (230, 240, 220, 255))
+        pix_put(image, 8, 1, (230, 240, 220, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_shovel():
+        image = pix_blank(16, 16)
+        pix_rect(image, 3, 10, 3, 4, (170, 175, 185, 255))
+        pix_rect(image, 9, 10, 3, 4, (170, 175, 185, 255))
+        pix_rect(image, 4, 8, 8, 3, (170, 175, 185, 255))
+        pix_line(image, 8, 2, 8, 8, (150, 110, 70, 255))
+        pix_rect(image, 7, 1, 3, 1, (150, 110, 70, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_somaria():
+        image = pix_blank(16, 16)
+        pix_line(image, 3, 13, 8, 8, (170, 150, 120, 255))
+        pix_disc(image, 11.0, 5.0, 2.6, (120, 220, 120, 255))
+        pix_put(image, 10, 4, (220, 255, 220, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def icon_orb(name):
+        hue = sum(ord(ch) for ch in name)
+        base = (60 + hue % 160, 80 + hue % 120, 160 + hue % 80, 255)
+        image = pix_blank(16, 16)
+        pix_disc(image, 8.0, 8.0, 5.2, base)
+        pix_disc(image, 6.5, 6.5, 1.6, (250, 250, 255, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    motifs = {
+        "bombos": lambda: medallion((216, 40, 48, 255), (255, 170, 170, 255)),
+        "ether": lambda: medallion((110, 170, 240, 255), (190, 230, 255, 255)),
+        "quake": lambda: medallion((240, 140, 40, 255), (255, 220, 150, 255)),
+        "bombs": icon_bombs,
+        "boomerang": icon_boomerang,
+        "bottle": icon_bottle,
+        "bow": icon_bow,
+        "byrna": lambda: icon_wand((240, 120, 200, 255), (255, 220, 240, 255)),
+        "cape": icon_cape,
+        "compass": icon_compass,
+        "fire_rod": lambda: icon_wand((240, 120, 50, 255), (255, 220, 120, 255)),
+        "ice_rod": lambda: icon_wand((140, 210, 240, 255), (230, 250, 255, 255)),
+        "flippers": icon_flippers,
+        "flute": icon_flute,
+        "gloves": icon_gloves,
+        "hammer": icon_hammer,
+        "hookshot": icon_hookshot,
+        "lantern": icon_lantern,
+        "mirror": icon_mirror,
+        "net": icon_net,
+        "powder": icon_powder,
+        "shovel": icon_shovel,
+        "somaria": icon_somaria,
+    }
+
+    frames = [motifs.get(name, lambda n=name: icon_orb(n))() for name in names]
+    if not frames:
+        return False
+    write_png(path, 16 * len(frames), 16, pix_compose(frames))
+    return True
+
+
+def create_bottles_bitmap(path):
+    """Bottle slot sheet, 16x16 frames in Inventory contents order
+    (BOTTLE_EMPTY..BOTTLE_BEE): empty, water, red/green/blue potion,
+    fairy, bee."""
+    if os.path.exists(path):
+        return False
+
+    glass = (200, 230, 250, 255)
+
+    def bottle(contents):
+        image = pix_blank(16, 16)
+        pix_rect(image, 6, 0, 4, 2, (150, 110, 70, 255))     # cork
+        pix_rect(image, 6, 2, 1, 4, glass)                   # neck
+        pix_rect(image, 9, 2, 1, 4, glass)
+        pix_rect(image, 4, 6, 1, 9, glass)                   # body walls
+        pix_rect(image, 11, 6, 1, 9, glass)
+        pix_rect(image, 4, 14, 8, 1, glass)
+        pix_put(image, 5, 6, glass)
+        pix_put(image, 10, 6, glass)
+        if contents == 1:      # water
+            pix_rect(image, 5, 8, 6, 6, (120, 170, 240, 255))
+        elif contents in (2, 3, 4):  # potions
+            color = {(2): (216, 40, 48, 255), (3): (90, 200, 80, 255),
+                     (4): (90, 120, 240, 255)}[contents]
+            pix_rect(image, 5, 7, 6, 7, color)
+            pix_rect(image, 5, 7, 6, 1, (255, 255, 255, 90))
+        elif contents == 5:    # fairy
+            pix_disc(image, 8.0, 11.0, 2.0, (250, 170, 220, 255))
+            pix_put(image, 6, 8, (255, 255, 255, 255))
+            pix_put(image, 9, 8, (255, 255, 255, 255))
+            pix_line(image, 5, 9, 3, 7, (255, 255, 255, 220))
+            pix_line(image, 11, 9, 13, 7, (255, 255, 255, 220))
+        elif contents == 6:    # bee
+            pix_disc(image, 8.0, 11.0, 2.2, (240, 210, 80, 255))
+            pix_rect(image, 6, 10, 4, 1, (30, 30, 30, 255))
+            pix_rect(image, 6, 12, 4, 1, (30, 30, 30, 255))
+            pix_line(image, 8, 9, 8, 7, (255, 255, 255, 200))
+        pix_outline(image, UI_INK)
+        return image
+
+    frames = [bottle(i) for i in range(7)]
+    write_png(path, 16 * 7, 16, pix_compose(frames))
+    return True
+
+
+def create_misc_bitmap(path):
+    """Assorted UI chrome, 18x18 frames: 0 equipped badge, 1 boss icon,
+    2 magic spark, 3 big key, 4 items-tab icon, 5 map-tab icon, 6 sparkle,
+    7 selection frame (18x18 border), 8 medallion placeholder."""
+    if os.path.exists(path):
+        return False
+    gold = (216, 168, 60, 255)
+
+    def badge():
+        image = pix_blank(18, 18)
+        pix_disc(image, 9.0, 9.0, 3.6, (90, 200, 110, 255))
+        pix_line(image, 7, 9, 8, 10, (235, 255, 240, 255))
+        pix_line(image, 8, 10, 11, 7, (235, 255, 240, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def boss():
+        image = pix_blank(18, 18)
+        pix_disc(image, 9.0, 8.0, 3.8, (235, 235, 245, 255))
+        pix_put(image, 7, 7, (30, 30, 40, 255))
+        pix_put(image, 11, 7, (30, 30, 40, 255))
+        pix_rect(image, 8, 11, 3, 2, (235, 235, 245, 255))
+        pix_put(image, 8, 13, (30, 30, 40, 255))
+        pix_put(image, 10, 13, (30, 30, 40, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def spark(color, core):
+        image = pix_blank(18, 18)
+        for y in range(18):
+            for x in range(18):
+                if abs(x + 0.5 - 9.0) + abs(y + 0.5 - 9.0) <= 3.0:
+                    pix_put(image, x, y, color)
+                if abs(x + 0.5 - 9.0) + abs(y + 0.5 - 9.0) <= 1.0:
+                    pix_put(image, x, y, core)
+        return image
+
+    def big_key():
+        image = pix_blank(18, 18)
+        for y in range(18):
+            for x in range(18):
+                d = math.hypot(x + 0.5 - 5.0, y + 0.5 - 9.0)
+                if 2.2 < d < 3.4:
+                    pix_put(image, x, y, gold)
+        pix_put(image, 5, 9, (225, 80, 80, 255))              # gem
+        pix_rect(image, 8, 8, 8, 2, gold)
+        pix_put(image, 13, 10, gold)
+        pix_put(image, 15, 10, gold)
+        pix_outline(image, UI_INK)
+        return image
+
+    def tab_items():
+        image = pix_blank(18, 18)
+        for y in (4, 8, 12):
+            for x in (4, 8, 12):
+                pix_rect(image, x, y, 2, 2, gold)
+        pix_outline(image, UI_INK)
+        return image
+
+    def tab_map():
+        image = pix_blank(18, 18)
+        pix_rect(image, 3, 4, 6, 4, (90, 120, 200, 255))
+        pix_rect(image, 10, 9, 6, 4, (90, 120, 200, 255))
+        pix_rect(image, 9, 6, 2, 3, (120, 130, 170, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def select():
+        image = pix_blank(18, 18)
+        for x in range(18):
+            pix_put(image, x, 0, (250, 250, 255, 255))
+            pix_put(image, x, 17, (250, 250, 255, 255))
+        for y in range(18):
+            pix_put(image, 0, y, (250, 250, 255, 255))
+            pix_put(image, 17, y, (250, 250, 255, 255))
+        for i in range(3):                                   # gold corners
+            pix_put(image, i, i, gold)
+            pix_put(image, 17 - i, i, gold)
+            pix_put(image, i, 17 - i, gold)
+            pix_put(image, 17 - i, 17 - i, gold)
+        return image
+
+    def medallion():
+        image = pix_blank(18, 18)
+        pix_disc(image, 9.0, 9.0, 5.6, gold)
+        pix_disc(image, 9.0, 9.0, 3.6, (250, 232, 160, 255))
+        pix_disc(image, 9.0, 9.0, 1.6, (216, 40, 48, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    frames = [badge(), boss(), spark((120, 180, 255, 255), (230, 245, 255, 255)),
+              big_key(), tab_items(), tab_map(),
+              spark((255, 240, 160, 230), (255, 255, 240, 255)), select(), medallion()]
+    write_png(path, 18 * len(frames), 18, pix_compose(frames))
+    return True
+
+
+def create_bar_boss_bitmap(path):
+    """Boss health bar, 246x10: frame at x 0..123 (2px ink border around a
+    120x6 trough), fill at x 126.. (120x6 red with a light top edge)."""
+    if os.path.exists(path):
+        return False
+    width, height = 246, 10
+    ink = (24, 24, 44, 255)
+    trough = (70, 20, 26, 255)
+    fill = (216, 40, 48, 255)
+    image = pix_blank(width, height)
+    pix_rect(image, 0, 0, 124, 10, ink)
+    pix_rect(image, 2, 2, 120, 6, trough)
+    pix_rect(image, 126, 0, 120, 6, fill)
+    pix_rect(image, 126, 0, 120, 1, (255, 120, 120, 255))
+    pix_rect(image, 126, 5, 120, 1, (150, 26, 32, 255))
+    write_png(path, width, height, image)
+    return True
+
+
+def create_bar_magic_bitmap(path):
+    """Horizontal magic bar (pause subscreen), 84x8: frame at x 0..41 (1px
+    ink border around a 40x6 trough), fill at x 44.. (40x6 blue)."""
+    if os.path.exists(path):
+        return False
+    width, height = 84, 8
+    image = pix_blank(width, height)
+    pix_rect(image, 0, 0, 42, 8, (40, 40, 60, 255))
+    pix_rect(image, 1, 1, 40, 6, (30, 30, 50, 255))
+    pix_rect(image, 44, 0, 40, 6, (90, 150, 255, 255))
+    pix_rect(image, 44, 0, 40, 1, (150, 190, 255, 255))
+    write_png(path, width, height, image)
+    return True
+
+
+def create_gauge_magic_bitmap(path):
+    """Vertical magic gauge (HUD), 10x42: frame at x 0..6 (1px ink border
+    around a 5x40 trough), fill at x 7.. (3x40 blue, bottom-up)."""
+    if os.path.exists(path):
+        return False
+    width, height = 10, 42
+    image = pix_blank(width, height)
+    pix_rect(image, 0, 0, 7, 42, (24, 24, 44, 255))
+    pix_rect(image, 1, 1, 5, 40, (30, 30, 50, 255))
+    for y in range(8, 41, 8):                                # level ticks
+        pix_rect(image, 1, y, 5, 1, (60, 60, 90, 255))
+    pix_rect(image, 7, 0, 3, 40, (90, 150, 255, 255))
+    pix_rect(image, 7, 0, 3, 1, (150, 190, 255, 255))
+    write_png(path, width, height, image)
+    return True
+
+
+def create_counters_bitmap(path):
+    """Small counter icons (HUD keys, subscreen quantities), 10x10 frames:
+    0 rupee, 1 arrow, 2 bomb, 3 small key, 4 big key."""
+    if os.path.exists(path):
+        return False
+    gold = (216, 168, 60, 255)
+
+    def rupee():
+        image = pix_blank(10, 10)
+        pix_rect(image, 3, 1, 4, 8, (64, 200, 96, 255))
+        pix_rect(image, 4, 3, 2, 4, (140, 240, 160, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def arrow():
+        image = pix_blank(10, 10)
+        pix_rect(image, 1, 4, 6, 2, (196, 150, 90, 255))
+        pix_rect(image, 7, 3, 2, 4, (220, 220, 228, 255))
+        pix_put(image, 1, 2, (200, 60, 60, 255))
+        pix_put(image, 1, 7, (200, 60, 60, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def bomb():
+        image = pix_blank(10, 10)
+        pix_disc(image, 5.0, 6.0, 3.2, (40, 40, 48, 255))
+        pix_put(image, 4, 4, (110, 110, 120, 255))
+        pix_put(image, 7, 2, (255, 200, 80, 255))
+        pix_outline(image, UI_INK)
+        return image
+
+    def key(big):
+        image = pix_blank(10, 10)
+        ring_r = 2.4 if big else 2.0
+        for y in range(10):
+            for x in range(10):
+                d = math.hypot(x + 0.5 - 2.5, y + 0.5 - 5.0)
+                if ring_r - 1.0 < d < ring_r:
+                    pix_put(image, x, y, gold)
+        if big:
+            pix_put(image, 2, 5, (225, 80, 80, 255))
+        pix_rect(image, 4, 4, 5, 2, gold)
+        pix_put(image, 7, 6, gold)
+        pix_put(image, 8, 6, gold if big else (0, 0, 0, 0))
+        pix_outline(image, UI_INK)
+        return image
+
+    frames = [rupee(), arrow(), bomb(), key(False), key(True)]
+    write_png(path, 10 * len(frames), 10, pix_compose(frames))
     return True
 
 
@@ -3329,6 +4042,21 @@ def generate(dump_flags=False):
                  % (dialogue["name"], name))
             dialogue["nextIndex"] = -1
 
+    # Boot intro (game.json "intro"): a fresh game plays the named script
+    # over the first room drop. The auto-registered intro_seen flag banks
+    # with the fresh save, so the intro never replays (continue loads it).
+    intro_index = -1
+    if game.get("intro"):
+        name = game["intro"]
+        if name in dialogue_index:
+            intro_index = dialogue_index[name]
+        elif (name + ".json") in dialogue_index:
+            intro_index = dialogue_index[name + ".json"]
+        else:
+            warn("game.json intro references unknown dialogue '%s'" % name)
+    intro_flag_index = (flags.index("intro_seen", "game.json")
+                        if intro_index >= 0 else -1)
+
     # Item upgrade flags (silver arrows, magical boomerang) register into
     # the same world-flag registry the dialogues fill.
     for item in items:
@@ -3469,6 +4197,27 @@ def generate(dump_flags=False):
     if create_hearts_bitmap(hearts_path):
         print("created placeholder hearts sheet: %s" % os.path.relpath(hearts_path, ROOT))
 
+    # Menu chrome sheets: everything except text in the engine chrome
+    # draws from resources/ui sprites (cursors, map overview, item icons,
+    # bottles, bars/gauges, counter icons, assorted badges).
+    for creator, filename in (
+            (create_cursor_bitmap, "cursor.png"),
+            (create_map_bitmap, "map.png"),
+            (create_bottles_bitmap, "bottles.png"),
+            (create_misc_bitmap, "misc.png"),
+            (create_bar_boss_bitmap, "bar_boss.png"),
+            (create_bar_magic_bitmap, "bar_magic.png"),
+            (create_gauge_magic_bitmap, "gauge_magic.png"),
+            (create_counters_bitmap, "counters.png")):
+        target = res("ui", filename)
+        if creator(target):
+            print("created placeholder UI sheet: %s" % os.path.relpath(target, ROOT))
+
+    items_path = res("ui", "items.png")
+    if create_items_bitmap(items_path, [entry["name"] for entry in items]):
+        print("created placeholder item icon sheet: %s"
+              % os.path.relpath(items_path, ROOT))
+
     os.makedirs(res("enemies"), exist_ok=True)
     for enemy in enemies:
         image_path = res("enemies", enemy["imageName"])
@@ -3516,6 +4265,9 @@ def generate(dump_flags=False):
     h.append("extern const char* const GAME_TITLE;")
     h.append("extern const char* const GAME_SLUG;")
     h.append("extern const char* const GAME_FONT;")
+    h.append("// Boot intro (game.json \"intro\"): DIALOGUES[] index a fresh game")
+    h.append("// plays over the first room drop (-1 = none).")
+    h.append("extern const int GAME_INTRO;")
     h.append("")
     h.append("// Game-defined id constants (stable, assigned by the generator from")
     h.append("// the game's own data; engine.h owns none of these).")
@@ -3583,6 +4335,8 @@ def generate(dump_flags=False):
     h.append("extern const int WORLD_FLAG_COUNT;")
     h.append("// Crystal-switch state (blue = unset / red = set); saved like story state.")
     h.append("extern const int WORLD_FLAG_CRYSTAL_RED;")
+    h.append("// Boot-intro memory (set when the intro plays; -1 = no intro).")
+    h.append("extern const int WORLD_FLAG_INTRO_SEEN;")
     h.append("")
 
     # Baked asset indexing: name -> index lookups over every data family,
@@ -3656,7 +4410,7 @@ def generate(dump_flags=False):
     c.append("// Generated by scripts/generate_assets.py - do not edit by hand.")
     c.append('#include "assets.h"')
     c.append("")
-    emit_game(c, game, manifest)
+    emit_game(c, game, manifest, intro_index)
     emit_rules(c)
     emit_dialogues(c, dialogues)
     emit_characters(c, characters)
@@ -3673,6 +4427,9 @@ def generate(dump_flags=False):
     c.append("const int WORLD_FLAG_COUNT = %d;" % len(flags.names))
     c.append("bool gWorldFlags[WORLD_FLAG_COUNT > 0 ? WORLD_FLAG_COUNT : 1] = {};")
     c.append("const int WORLD_FLAG_CRYSTAL_RED = %d;" % crystal_flag_index)
+    # Boot-intro memory: set when the intro plays, banked with the fresh
+    # save so it never replays (-1 = this game has no intro).
+    c.append("const int WORLD_FLAG_INTRO_SEEN = %d;" % intro_flag_index)
     c.append("")
 
     # Tooling mode (--flags): print the world-flag registry as JSON and

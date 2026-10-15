@@ -566,6 +566,18 @@ static CutsceneMove cutsceneMove = {};
 static int letterboxWanted = 0;  // target state: 1 = bars on
 static float letterboxT = 0.0f;  // eased slide (0..1)
 
+// Scripted screen fade (the "fade" cue): the whole world dips to black
+// and back on the script's clock. Like the letterbox bars, the target
+// eases in updateCutscene; stragglers release on a room change.
+static int scriptFadeWanted = 0;    // target state: 1 = black
+static float scriptFadeT = 0.0f;    // eased amount (0..1)
+static float scriptFadeDuration = 0.5f;
+
+// Hidden hero (the "hide" cue on the hero): the sprite steps out of the
+// draw list while the world keeps playing underneath. Room changes
+// restore it (a room is never entered hidden).
+static bool heroHidden = false;
+
 static void updateCutscene(float dt)
 {
     // Camera pan: glide, then hold at the target.
@@ -629,6 +641,20 @@ static void updateCutscene(float dt)
     else if (letterboxT > target) letterboxT -= dt / 0.25f;
     if (letterboxT < 0.0f) letterboxT = 0.0f;
     if (letterboxT > 1.0f) letterboxT = 1.0f;
+
+    // Scripted screen fade eases toward its own target state.
+    float fadeTarget = (float)scriptFadeWanted;
+    if (scriptFadeDuration > 0.0f)
+    {
+        if (scriptFadeT < fadeTarget) scriptFadeT += dt / scriptFadeDuration;
+        else if (scriptFadeT > fadeTarget) scriptFadeT -= dt / scriptFadeDuration;
+    }
+    else
+    {
+        scriptFadeT = fadeTarget;
+    }
+    if (scriptFadeT < 0.0f) scriptFadeT = 0.0f;
+    if (scriptFadeT > 1.0f) scriptFadeT = 1.0f;
 }
 
 static void applyCutsceneCameraRequest(int action, int tileX, int tileY, float seconds)
@@ -677,6 +703,92 @@ static void applyCutsceneMoveRequest(int actor, int tileX, int tileY, float seco
     cutsceneMove.t = 0.0f;
     cutsceneMove.duration = seconds > 0.0f ? seconds : 1.0f;
     cutsceneMove.active = true;
+}
+
+// Spawn one NPC slot from its baked entry (loadRoom's per-entry
+// initialization, factored out so the "show" cue can re-run it for a
+// mid-scene entrance at the spawn tile).
+static void applyNpcSpawn(int i, const NpcSpawn& spawn)
+{
+    npcs[i].active = true;
+    npcs[i].cfg = &CHARACTERS[spawn.character];
+    npcs[i].sheet = (spawn.character < 16) ? characterSheets[spawn.character] : Texture2D{};
+    npcs[i].x = (float)(spawn.tileX * TILE_SIZE);
+    npcs[i].y = (float)(spawn.tileY * TILE_SIZE);
+    npcs[i].facing = DIR_DOWN;
+    npcs[i].wander = spawn.wander;
+    npcs[i].path = spawn.pathCount > 0 ? spawn.path : 0;
+    npcs[i].pathCount = spawn.pathCount;
+    npcs[i].pathIndex = 0;
+    npcs[i].dialogue = spawn.dialogue;
+    npcs[i].modeTime = 0.0f;
+    npcs[i].timer = 0.5f + worldRng.nextFloat() * 2.0f;
+    npcs[i].animTime = 0.0f;
+    npcs[i].moving = false;
+    npcs[i].lastFacingPick = -1;
+}
+
+// Face cue: turn an actor to speak without a glide. The hero steers
+// through its cardinal-dominant faceVector; NPCs turn in place.
+static void applyCutsceneFaceRequest(int actor, int dir)
+{
+    if (dir < 0 || dir >= DIR_COUNT) return;
+    if (actor == -2)
+    {
+        static const float DIR_VEC[DIR_COUNT][2] = {
+            { 0.0f, 1.0f },   // down
+            { 1.0f, 0.0f },   // right
+            { -1.0f, 0.0f },  // left
+            { 0.0f, -1.0f },  // up
+        };
+        hero.faceVector(DIR_VEC[dir][0], DIR_VEC[dir][1]);
+    }
+    else if (actor >= 0 && actor < MAX_NPCS && npcs[actor].active)
+    {
+        npcs[actor].facing = (Direction)dir;
+    }
+}
+
+// Actor-visibility cues: mid-scene entrances/exits the spawn tables
+// can't express (they evaluate only at room entry). Showing an NPC
+// respawns it at its spawn tile; hiding one parks it (a straggler glide
+// onto the same actor releases); the hero only steps out of the draw
+// list.
+static void applyCutsceneShowRequest(int actor)
+{
+    if (actor == -2)
+    {
+        heroHidden = false;
+        return;
+    }
+    if (actor < 0 || actor >= MAX_NPCS) return;
+    const RoomConfig& rc = room.config();
+    if (actor >= rc.npcCount) return;
+    const NpcSpawn& spawn = rc.npcs[actor];
+    if (spawn.character < 0 || spawn.character >= CHARACTER_COUNT) return;
+    applyNpcSpawn(actor, spawn);
+}
+
+static void applyCutsceneHideRequest(int actor)
+{
+    if (actor == -2)
+    {
+        heroHidden = true;
+        return;
+    }
+    if (actor < 0 || actor >= MAX_NPCS) return;
+    npcs[actor].active = false;
+    if (cutsceneMove.active && cutsceneMove.actor == actor)
+        cutsceneMove.active = false;
+}
+
+// Scripted fade: to black / back to the world over the given time.
+static void applyCutsceneFadeRequest(int to, float seconds)
+{
+    if (to == 1) scriptFadeWanted = 1;
+    else if (to == 2) scriptFadeWanted = 0;
+    else return;
+    scriptFadeDuration = seconds > 0.01f ? seconds : 0.5f;
 }
 
 static Rectangle npcBox(const Npc& npc)
@@ -1451,6 +1563,16 @@ static void startNewGame(int slot)
     saveSlotInUse = slot;
     resetGameState();
     loadRoom(0);
+    // Boot intro (game.json "intro"): a fresh game plays the named
+    // script over the first room drop. The auto-registered intro flag is
+    // banked here (and with the fresh save right below), so the intro
+    // never replays — not on continue, not after the flag banks.
+    if (GAME_INTRO >= 0 && GAME_INTRO < DIALOGUE_COUNT)
+    {
+        if (WORLD_FLAG_INTRO_SEEN >= 0 && WORLD_FLAG_INTRO_SEEN < WORLD_FLAG_COUNT)
+            gWorldFlags[WORLD_FLAG_INTRO_SEEN] = true;
+        dialogue.open(DIALOGUES[GAME_INTRO]);
+    }
     gameState = STATE_PLAYING;
     saveToFile(slot);  // bank the fresh start
 }
@@ -1498,6 +1620,192 @@ static int uiMeasureText(const char* text, int size)
                                (float)size / 10.0f).x + 0.5f);
 }
 
+// --- Menu chrome ------------------------------------------------------------
+// SNES rule: everything except text draws from a sprite. The engine
+// chrome (title, HUD, pause subscreen, flute picker, toasts, item-get)
+// renders from resources/ui sheets — the generator synthesizes
+// placeholders for all of them, so a game is testable before art exists.
+
+static Texture2D uiBorderTexture = {};    // 24x24 nine-patch panel
+static Texture2D uiCursorTexture = {};    // 8x8 frames
+static Texture2D uiMapTexture = {};       // 18x14 frames
+static Texture2D uiItemsTexture = {};     // 16x16 frames, frame = item id
+static Texture2D uiBottlesTexture = {};   // 16x16 frames, frame = contents
+static Texture2D uiMiscTexture = {};      // 18x18 frames
+static Texture2D uiBossBarTexture = {};   // frame 124x10 + fill 120x6
+static Texture2D uiMagicBarTexture = {};  // frame 42x8 + fill 40x6
+static Texture2D uiMagicGaugeTexture = {}; // frame 7x42 + fill 3x40
+static Texture2D uiCountersTexture = {};  // 10x10 frames
+static Texture2D heartsTexture = {};      // 16x16 frames: full/half/empty
+
+// cursor.png frames
+static const int UICURSOR_RIGHT = 0;  // list cursor
+static const int UICURSOR_DOWN = 1;   // dialogue continue prompt
+// map.png frames
+static const int UIMAP_CELL = 0;
+static const int UIMAP_CELL_CURRENT = 1;
+static const int UIMAP_HERO = 2;
+static const int UIMAP_CHEST = 3;
+static const int UIMAP_BOSS = 4;
+static const int UIMAP_BIRD_UP = 5;
+static const int UIMAP_BIRD_DOWN = 6;
+static const int UIMAP_CONN_H = 7;    // 8x2 strip at frame-local (0,6)
+static const int UIMAP_CONN_V = 8;    // 2x8 strip at frame-local (8,0)
+// misc.png frames
+static const int UIMISC_BADGE = 0;     // equipped marker
+static const int UIMISC_BOSS = 1;
+static const int UIMISC_MAGIC = 2;
+static const int UIMISC_BIGKEY = 3;
+static const int UIMISC_TAB_ITEMS = 4;
+static const int UIMISC_TAB_MAP = 5;
+static const int UIMISC_SPARKLE = 6;
+static const int UIMISC_SELECT = 7;    // 18x18 selection frame
+static const int UIMISC_MEDALLION = 8;
+// counters.png frames
+static const int UICOUNT_RUPEE = 0;
+static const int UICOUNT_ARROW = 1;
+static const int UICOUNT_BOMB = 2;
+static const int UICOUNT_KEY = 3;
+static const int UICOUNT_BIGKEY = 4;
+
+// Virtual-pixel sprite blit: source rect (texture pixels) drawn at
+// virtual coordinates scaled to the screen.
+static void drawUiSprite(Texture2D texture, Rectangle src, float vx, float vy,
+                         float vw, float vh, Color tint)
+{
+    if (texture.id == 0) return;
+    float scale = virtualScale();
+    Rectangle dest = { vx * scale, vy * scale, vw * scale, vh * scale };
+    DrawTexturePro(texture, src, dest, Vector2{ 0.0f, 0.0f }, 0.0f, tint);
+}
+
+static void drawUiFrame(Texture2D texture, int frame, float frameW, float frameH,
+                        float vx, float vy, Color tint)
+{
+    Rectangle src = { (float)frame * frameW, 0.0f, frameW, frameH };
+    drawUiSprite(texture, src, vx, vy, frameW, frameH, tint);
+}
+
+// Panel chrome: the ui/border.png nine-patch stretched over a virtual-px
+// rect (menus, toasts; the dialogue box draws its own copy).
+static void drawUiNinePatch(Rectangle panel, Color tint)
+{
+    if (uiBorderTexture.id == 0) return;
+    float scale = virtualScale();
+    int patch = uiBorderTexture.width / 3;
+    if (patch < 1) patch = 1;
+    NPatchInfo npatch;
+    npatch.source = Rectangle{ 0.0f, 0.0f,
+                               (float)uiBorderTexture.width, (float)uiBorderTexture.height };
+    npatch.left = patch;
+    npatch.top = patch;
+    npatch.right = patch;
+    npatch.bottom = patch;
+    npatch.layout = NPATCH_NINE_PATCH;
+    Rectangle dest = { panel.x * scale, panel.y * scale,
+                       panel.width * scale, panel.height * scale };
+    DrawTextureNPatch(uiBorderTexture, npatch, dest, Vector2{ 0.0f, 0.0f },
+                      0.0f, tint);
+}
+
+// Item icon (resources/ui/items.png, frame = item id) at 16 virtual px.
+static void drawItemIcon(int item, float vx, float vy, Color tint)
+{
+    if (item < 0 || item >= ITEM_COUNT) return;
+    drawUiFrame(uiItemsTexture, item, 16.0f, 16.0f, vx, vy, tint);
+}
+
+static void mapLayout(float* xs, float* ys, int roomCount);
+
+// The visited-room map shared by the pause MAP tab and the flute
+// picker: sprite cells laid out from the exits graph, connection strips
+// underneath, the hero dot on the current room, compass chest/boss
+// marks, and the flute bird perched on the cursor room.
+static void drawMapOverview(Rectangle area, int birdRoom, bool compassMarks)
+{
+    static float mapX[MAX_ROOM_MARKS];
+    static float mapY[MAX_ROOM_MARKS];
+    int roomTotal = ROOM_COUNT < MAX_ROOM_MARKS ? ROOM_COUNT : MAX_ROOM_MARKS;
+    mapLayout(mapX, mapY, roomTotal);
+
+    const float cellW = 18.0f;
+    const float cellH = 14.0f;
+    const float pitchX = 26.0f;
+    const float pitchY = 22.0f;
+
+    // Center the visited bounds in the area.
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (int i = 0; i < roomTotal; i++)
+    {
+        if (!roomVisited[i]) continue;
+        if (mapX[i] < minX) minX = mapX[i];
+        if (mapX[i] > maxX) maxX = mapX[i];
+        if (mapY[i] < minY) minY = mapY[i];
+        if (mapY[i] > maxY) maxY = mapY[i];
+    }
+    float originX = (minX + maxX) * 0.5f;
+    float originY = (minY + maxY) * 0.5f;
+    float baseX = area.x + area.width * 0.5f - originX * pitchX - cellW * 0.5f;
+    float baseY = area.y + area.height * 0.5f - originY * pitchY - cellH * 0.5f;
+
+    // Connections first: strips between cell centers; the cells draw
+    // over any part that crosses them.
+    for (int i = 0; i < roomTotal; i++)
+    {
+        if (!roomVisited[i]) continue;
+        const RoomConfig& cfg = ROOMS[i];
+        const int edges[4] = { cfg.exitNorth, cfg.exitSouth, cfg.exitEast, cfg.exitWest };
+        for (int e = 0; e < 4; e++)
+        {
+            int target = edges[e];
+            if (target < 0 || target >= roomTotal || !roomVisited[target]) continue;
+            if (target < i) continue;  // draw each link once
+            float x0 = baseX + mapX[i] * pitchX + cellW * 0.5f;
+            float y0 = baseY + mapY[i] * pitchY + cellH * 0.5f;
+            float x1 = baseX + mapX[target] * pitchX + cellW * 0.5f;
+            float y1 = baseY + mapY[target] * pitchY + cellH * 0.5f;
+            if (x0 != x1)
+            {
+                float left = x0 < x1 ? x0 : x1;
+                Rectangle src = { UIMAP_CONN_H * 18.0f, 6.0f, 8.0f, 2.0f };
+                drawUiSprite(uiMapTexture, src, left, y0 - 1.0f,
+                            fabsf(x1 - x0), 2.0f, WHITE);
+            }
+            if (y0 != y1)
+            {
+                float top = y0 < y1 ? y0 : y1;
+                Rectangle src = { UIMAP_CONN_V * 18.0f + 8.0f, 0.0f, 2.0f, 8.0f };
+                drawUiSprite(uiMapTexture, src, x1 - 1.0f, top,
+                            2.0f, fabsf(y1 - y0), WHITE);
+            }
+        }
+    }
+
+    // Visited room cells; the current one wears the hero dot, compass
+    // marks land on chest/boss rooms, the bird rides the cursor room.
+    bool compass = compassMarks && compassItemOwned();
+    for (int i = 0; i < roomTotal; i++)
+    {
+        if (!roomVisited[i]) continue;
+        float cx = baseX + mapX[i] * pitchX;
+        float cy = baseY + mapY[i] * pitchY;
+        drawUiFrame(uiMapTexture, i == currentRoom ? UIMAP_CELL_CURRENT : UIMAP_CELL,
+                    cellW, cellH, cx, cy, WHITE);
+        if (compass && ROOMS[i].hasChest)
+            drawUiFrame(uiMapTexture, UIMAP_CHEST, 18.0f, 14.0f, cx - 6.0f, cy, WHITE);
+        if (compass && ROOMS[i].hasBoss)
+            drawUiFrame(uiMapTexture, UIMAP_BOSS, 18.0f, 14.0f, cx + 4.0f, cy + 1.0f, WHITE);
+        if (i == currentRoom)
+            drawUiFrame(uiMapTexture, UIMAP_HERO, 18.0f, 14.0f, cx, cy, WHITE);
+        if (i == birdRoom)
+        {
+            int flap = (int)((float)GetTime() * 12.0f) % 2;
+            drawUiFrame(uiMapTexture, flap ? UIMAP_BIRD_DOWN : UIMAP_BIRD_UP,
+                        18.0f, 14.0f, cx, cy - 4.0f, WHITE);
+        }
+    }
+}
+
 static void updateTitle()
 {
     bool prev = IsKeyPressed(KEY_UP);
@@ -1540,35 +1848,53 @@ static void drawTitleScreen()
     uiDrawText(sub, (sw - width) / 2, (int)(64 * scale), subSize,
              Color{ 170, 170, 200, 255 });
 
-    // Save slots with a summary of what's inside.
+    // Save slots: sparse text over icons (SNES-style), a summary of
+    // what's inside each.
     float listX = sw * 0.5f - 100.0f * scale;
     float listY = 104.0f * scale;
     for (int slot = 0; slot < SAVE_SLOT_COUNT; slot++)
     {
-        char line[96];
+        char line[32];
         SaveData peek;
-        if (peekSave(slot, peek))
-        {
-            snprintf(line, sizeof(line), "SLOT %d   %d HEARTS   %d RUPEES",
-                     slot + 1, peek.maxHealth / 2, peek.rupees);
-        }
-        else
-        {
-            snprintf(line, sizeof(line), "SLOT %d   - EMPTY -", slot + 1);
-        }
+        bool used = peekSave(slot, peek);
+        snprintf(line, sizeof(line), "SLOT %d", slot + 1);
 
         int size = (int)(12 * scale);
         float y = listY + (float)slot * 22.0f * scale;
         Color color = (slot == titleCursor) ? RAYWHITE : Color{ 130, 130, 150, 255 };
         uiDrawText(line, (int)(listX + 16.0f * scale), (int)y, size, color);
 
+        if (used)
+        {
+            // Heart + rupee icons with the counts beside them.
+            Rectangle src = { 0.0f, 0.0f, 16.0f, 16.0f };
+            Rectangle dest = { listX + 70.0f * scale, y - 2.0f * scale,
+                               16.0f * scale, 16.0f * scale };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(heartsTexture, src, dest, origin, 0.0f, color);
+            snprintf(line, sizeof(line), "%d", peek.maxHealth / 2);
+            uiDrawText(line, (int)(listX + 88.0f * scale), (int)(y + 2.0f * scale),
+                     (int)(10 * scale), color);
+
+            src = Rectangle{ 16.0f, 0.0f, 16.0f, 16.0f };  // rupee frame
+            dest = Rectangle{ listX + 110.0f * scale, y - 2.0f * scale,
+                              16.0f * scale, 16.0f * scale };
+            DrawTexturePro(pickupsTexture, src, dest, origin, 0.0f, color);
+            snprintf(line, sizeof(line), "%d", peek.rupees);
+            uiDrawText(line, (int)(listX + 128.0f * scale), (int)(y + 2.0f * scale),
+                     (int)(10 * scale), color);
+        }
+        else
+        {
+            uiDrawText("- EMPTY -", (int)(listX + 70.0f * scale), (int)(y + 2.0f * scale),
+                     (int)(10 * scale), color);
+        }
+
         if (slot == titleCursor)
         {
             float cy = y + size * 0.5f;
-            Vector2 a = { listX + 6.0f * scale, cy - 5.0f * scale };
-            Vector2 b = { listX + 6.0f * scale, cy + 5.0f * scale };
-            Vector2 c = { listX + 14.0f * scale, cy };
-            DrawTriangle(a, b, c, RAYWHITE);
+            drawUiFrame(uiCursorTexture, UICURSOR_RIGHT, 8.0f, 8.0f,
+                        listX / scale + 6.0f, cy / scale - 4.0f, WHITE);
         }
     }
 
@@ -2174,11 +2500,15 @@ static void clearWorldSystems()
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     for (int i = 0; i < MAX_NPCS; i++) npcs[i].active = false;
     // Cutscene stragglers never survive a room change: pans release, a
-    // blocking glide stops mid-stride, the bars ease back out.
+    // blocking glide stops mid-stride, the bars ease back out, a scripted
+    // fade lifts, and a hidden hero steps back into the world.
     cutsceneCam.active = false;
     cutsceneCam.panning = false;
     cutsceneMove.active = false;
     letterboxWanted = 0;
+    scriptFadeWanted = 0;
+    scriptFadeT = 0.0f;
+    heroHidden = false;
 }
 
 static bool encounterAvailable(const Encounter& encounter)
@@ -2333,7 +2663,6 @@ static void startAmbient(const char* file)
     PlayMusicStream(ambientMusic);
 }
 
-static Texture2D heartsTexture = {};
 static bool paused = false;
 
 // Room-edge transition: walking off a map edge glides the hero into the
@@ -2625,75 +2954,92 @@ static void drawHud()
                  (int)(10 * scale), RAYWHITE);
     }
 
-    // Equipped item + its quantity (arrows/bombs), under the rupee counter.
+    // Equipped item icon + its quantity (arrows/bombs), under the rupee
+    // counter.
     if (inventory.equippedItem >= 0 && inventory.equippedItem < ITEM_COUNT)
     {
         const ItemConfig& item = ITEMS[inventory.equippedItem];
-        const char* label = item.label;
-        char text[24];
+        float viewW = (float)GetScreenWidth() / scale;
+        drawItemIcon(inventory.equippedItem, viewW - 6.0f - 16.0f, 24.0f, WHITE);
+        char text[16];
         int count = -1;
         if (item.arrowCost > 0) count = inventory.arrows;
         else if (item.bombCost > 0) count = inventory.bombs;
-        if (count >= 0) snprintf(text, sizeof(text), "%s x%d", label, count);
-        else snprintf(text, sizeof(text), "%s", label);
-        uiDrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - uiMeasureText(text, (int)(8 * scale))),
-                 (int)(26.0f * scale), (int)(8 * scale), RAYWHITE);
+        if (count >= 0)
+        {
+            snprintf(text, sizeof(text), "x%d", count);
+            uiDrawText(text, (int)((viewW - 26.0f) * scale)
+                     - uiMeasureText(text, (int)(8 * scale)),
+                     (int)(29.0f * scale), (int)(8 * scale), RAYWHITE);
+        }
     }
 
-    // Key counts (small + big), under the equipped item.
+    // Key counts (small + big icons), under the equipped item.
     if (inventory.smallKeys > 0 || inventory.bigKeys > 0)
     {
-        char text[24];
-        snprintf(text, sizeof(text), "KEY x%d%s", inventory.smallKeys,
-                 inventory.bigKeys > 0 ? "  BIG x1" : "");
-        uiDrawText(text, (int)((float)GetScreenWidth() - 6.0f * scale - uiMeasureText(text, (int)(8 * scale))),
+        float viewW = (float)GetScreenWidth() / scale;
+        float x = viewW - 6.0f;
+        if (inventory.bigKeys > 0)
+        {
+            x -= 18.0f;
+            drawUiFrame(uiMiscTexture, UIMISC_BIGKEY, 18.0f, 18.0f, x, 34.0f,
+                        Color{ 250, 220, 120, 255 });
+        }
+        x -= 16.0f;
+        Rectangle src = { 9.0f * 16.0f, 0.0f, 16.0f, 16.0f };  // small key pickup
+        drawUiSprite(pickupsTexture, src, x, 34.0f, 16.0f, 16.0f,
+                     Color{ 250, 220, 120, 255 });
+        char text[16];
+        snprintf(text, sizeof(text), "x%d", inventory.smallKeys);
+        uiDrawText(text, (int)((x - 2.0f) * scale)
+                 - uiMeasureText(text, (int)(8 * scale)),
                  (int)(38.0f * scale), (int)(8 * scale), Color{ 250, 220, 120, 255 });
     }
 
     // Arena boss (and mid-fight mini-boss) health bar, bottom-center while
-    // the fight rages.
+    // the fight rages: sprite frame + fill, skull icon above.
     for (int i = 0; i < enemyCount; i++)
     {
         const Enemy& boss = enemies[i];
         if (!boss.alive() || !boss.isArenaLock()) continue;
 
-        float barW = 120.0f * scale;
-        float barH = 6.0f * scale;
-        float bx = ((float)GetScreenWidth() - barW) * 0.5f;
-        float by = (VIRTUAL_HEIGHT - 26.0f) * scale;
-        DrawRectangle((int)bx - 2, (int)by - 2, (int)barW + 4, (int)barH + 4,
-                      Color{ 20, 20, 40, 220 });
-        DrawRectangle((int)bx, (int)by, (int)barW, (int)barH,
-                      Color{ 70, 20, 26, 255 });
+        float viewW = (float)GetScreenWidth() / scale;
+        float barW = 120.0f;
+        float barH = 6.0f;
+        float bx = (viewW - barW) * 0.5f;
+        float by = VIRTUAL_HEIGHT - 26.0f;
+        Rectangle frameSrc = { 0.0f, 0.0f, 124.0f, 10.0f };
+        drawUiSprite(uiBossBarTexture, frameSrc, bx - 2.0f, by - 2.0f,
+                    124.0f, 10.0f, WHITE);
         if (boss.maxHealth() > 0)
         {
             float fill = (float)boss.health() / (float)boss.maxHealth();
-            DrawRectangle((int)bx, (int)by, (int)(barW * fill), (int)barH,
-                          Color{ 216, 40, 48, 255 });
+            Rectangle fillSrc = { 126.0f, 0.0f, 120.0f * fill, 6.0f };
+            drawUiSprite(uiBossBarTexture, fillSrc, bx, by, barW * fill, barH, WHITE);
         }
-        const char* label = "BOSS";
-        int labelSize = (int)(8 * scale);
-        int labelW = uiMeasureText(label, labelSize);
-        uiDrawText(label, ((int)bx + (int)barW / 2 - labelW / 2), (int)(by - 11.0f * scale),
-                 labelSize, RAYWHITE);
+        drawUiFrame(uiMiscTexture, UIMISC_BOSS, 18.0f, 18.0f,
+                    bx + barW * 0.5f - 9.0f, by - 20.0f, WHITE);
         break;
     }
 
-    // Magic gauge, bottom-left: thin vertical bar, LttP style.
+    // Magic gauge, bottom-left: sprite frame + bottom-up fill, LttP style.
     if (inventory.magicMax > 0)
     {
         float barH = 40.0f;
-        float barW = 5.0f;
-        float bx = 8.0f * scale;
-        float by = (VIRTUAL_HEIGHT - 8.0f - barH) * scale;
-        DrawRectangle((int)bx, (int)by, (int)(barW * scale), (int)(barH * scale),
-                      Color{ 30, 30, 50, 200 });
-        float fill = (float)inventory.magic / (float)inventory.magicMax;
-        float fillH = barH * fill;
-        DrawRectangle((int)bx, (int)(by + (barH - fillH) * scale), (int)(barW * scale),
-                      (int)(fillH * scale), Color{ 90, 150, 255, 255 });
-        uiDrawText("M", (int)(bx + barW * scale), (int)(by + barH * scale - 8.0f * scale),
-                 (int)(8 * scale), Color{ 120, 170, 255, 255 });
+        float frameX = 7.0f;
+        float frameY = VIRTUAL_HEIGHT - 7.0f - barH - 1.0f;
+        Rectangle frameSrc = { 0.0f, 0.0f, 7.0f, 42.0f };
+        drawUiSprite(uiMagicGaugeTexture, frameSrc, frameX, frameY, 7.0f, 42.0f, WHITE);
+        if (inventory.magic > 0)
+        {
+            float fill = (float)inventory.magic / (float)inventory.magicMax;
+            float fillH = barH * fill;
+            Rectangle fillSrc = { 7.0f, 40.0f - fillH, 3.0f, fillH };
+            drawUiSprite(uiMagicGaugeTexture, fillSrc, frameX + 2.0f,
+                         frameY + 1.0f + (barH - fillH), 3.0f, fillH, WHITE);
+        }
+        drawUiFrame(uiMiscTexture, UIMISC_MAGIC, 18.0f, 18.0f, frameX - 6.0f,
+                    frameY - 20.0f, Color{ 120, 170, 255, 255 });
     }
 }
 
@@ -2703,7 +3049,6 @@ static void mapLayout(float* xs, float* ys, int roomCount);
 
 static int pauseCursor = 0;
 static int pauseTab = 0;  // 0 = items, 1 = map
-static Texture2D uiBorderTexture = {};
 
 // Generic toasts: small top-center banners (autosave cues, hints).
 static const float TOAST_LIFE = 2.0f;
@@ -2744,9 +3089,14 @@ static void drawToasts()
         int size = (int)(10 * scale);
         int width = uiMeasureText(toasts[i].text, size);
         float y = (34.0f + (float)i * 14.0f) * scale;
-        DrawRectangle((GetScreenWidth() - width) / 2 - 6 * (int)scale / 2, (int)y - 2,
-                      width + 6 * (int)scale, size + 4,
-                      Color{ 0, 0, 0, (unsigned char)(int)(140 * alpha) });
+        float viewW = (float)GetScreenWidth() / scale;
+        // Sprite banner (the ui nine-patch, tinted by the fade) behind
+        // the text.
+        Rectangle banner = { (viewW - (float)width / scale) * 0.5f - 12.0f,
+                             y / scale - 3.0f,
+                             (float)width / scale + 24.0f, 18.0f };
+        Color tint = { 255, 255, 255, (unsigned char)(int)(255 * alpha) };
+        drawUiNinePatch(banner, tint);
         uiDrawText(toasts[i].text, (GetScreenWidth() - width) / 2, (int)y, size,
                  Color{ 250, 250, 220, (unsigned char)(int)(255 * alpha) });
     }
@@ -2846,35 +3196,13 @@ static void drawFluteMenu()
 
     // Panel, same nine-patch chrome as the pause subscreen.
     float panelW = 200.0f;
-    float panelH = 108.0f;
+    float panelH = 120.0f;
     Rectangle panel = { (viewWidth - panelW) * 0.5f, (viewHeight - panelH) * 0.5f,
                         panelW, panelH };
-    if (uiBorderTexture.id != 0)
-    {
-        int patch = uiBorderTexture.width / 3;
-        if (patch < 1) patch = 1;
-        NPatchInfo npatch;
-        npatch.source = Rectangle{ 0.0f, 0.0f,
-                                   (float)uiBorderTexture.width, (float)uiBorderTexture.height };
-        npatch.left = patch;
-        npatch.top = patch;
-        npatch.right = patch;
-        npatch.bottom = patch;
-        npatch.layout = NPATCH_NINE_PATCH;
-        Rectangle dest = { panel.x * scale, panel.y * scale,
-                           panel.width * scale, panel.height * scale };
-        Vector2 origin = { 0.0f, 0.0f };
-        DrawTextureNPatch(uiBorderTexture, npatch, dest, origin, 0.0f, WHITE);
-    }
-    else
-    {
-        DrawRectangle((int)(panel.x * scale), (int)(panel.y * scale),
-                      (int)(panel.width * scale), (int)(panel.height * scale), Color{ 16, 24, 96, 255 });
-    }
+    drawUiNinePatch(panel, WHITE);
 
-    int titleSize = (int)(12 * scale);
-    uiDrawText("FLUTE", (int)((panel.x + 8.0f) * scale), (int)((panel.y + 6.0f) * scale),
-             titleSize, RAYWHITE);
+    // Flute icon title + hint.
+    drawItemIcon(ITEM_FLUTE, panel.x + 8.0f, panel.y + 4.0f, WHITE);
     {
         const char* hint = "ACTION:FLY  SWORD:BACK";
         uiDrawText(hint, (int)((panel.x + panel.width - 8.0f) * scale)
@@ -2883,83 +3211,11 @@ static void drawFluteMenu()
                  Color{ 170, 170, 190, 255 });
     }
 
-    // The visited-room map, same geometry as the pause map tab.
-    static float mapX[MAX_ROOM_MARKS];
-    static float mapY[MAX_ROOM_MARKS];
-    int roomTotal = ROOM_COUNT < MAX_ROOM_MARKS ? ROOM_COUNT : MAX_ROOM_MARKS;
-    mapLayout(mapX, mapY, roomTotal);
-
-    float cellW = 18.0f;
-    float cellH = 14.0f;
-    float pitchX = 26.0f;
-    float pitchY = 22.0f;
-
-    // Center the visited bounds in the panel.
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-    for (int i = 0; i < roomTotal; i++)
-    {
-        if (i < MAX_ROOM_MARKS && !roomVisited[i]) continue;
-        if (mapX[i] < minX) minX = mapX[i];
-        if (mapX[i] > maxX) maxX = mapX[i];
-        if (mapY[i] < minY) minY = mapY[i];
-        if (mapY[i] > maxY) maxY = mapY[i];
-    }
-    float originX = (minX + maxX) * 0.5f;
-    float originY = (minY + maxY) * 0.5f;
-    float baseX = panel.x + panel.width * 0.5f - originX * pitchX - cellW * 0.5f;
-    float baseY = panel.y + panel.height * 0.5f - originY * pitchY - cellH * 0.5f;
-
-    // Connections between visited rooms first (lines under boxes).
-    for (int i = 0; i < roomTotal; i++)
-    {
-        if (!roomVisited[i]) continue;
-        const RoomConfig& cfg = ROOMS[i];
-        const int edges[4] = { cfg.exitNorth, cfg.exitSouth, cfg.exitEast, cfg.exitWest };
-        for (int e = 0; e < 4; e++)
-        {
-            int target = edges[e];
-            if (target < 0 || target >= roomTotal || !roomVisited[target]) continue;
-            if (target < i) continue;  // draw each link once
-            int x0 = (int)((baseX + mapX[i] * pitchX + cellW * 0.5f) * scale);
-            int y0 = (int)((baseY + mapY[i] * pitchY + cellH * 0.5f) * scale);
-            int x1 = (int)((baseX + mapX[target] * pitchX + cellW * 0.5f) * scale);
-            int y1 = (int)((baseY + mapY[target] * pitchY + cellH * 0.5f) * scale);
-            DrawLine(x0, y0, x1, y1, Color{ 120, 130, 170, 255 });
-        }
-    }
-
-    // Visited room boxes; the cursor room wears the bird.
-    for (int i = 0; i < roomTotal; i++)
-    {
-        if (!roomVisited[i]) continue;
-        Rectangle cell = { (baseX + mapX[i] * pitchX) * scale,
-                           (baseY + mapY[i] * pitchY) * scale,
-                           cellW * scale, cellH * scale };
-        bool current = (i == currentRoom);
-        DrawRectangleRec(cell, current ? Color{ 90, 120, 200, 255 }
-                                       : Color{ 40, 50, 90, 255 });
-        DrawRectangleLinesEx(cell, 1.0f, current ? RAYWHITE : Color{ 120, 130, 170, 255 });
-        if (current)
-        {
-            DrawCircle((int)(cell.x + cell.width * 0.5f),
-                       (int)(cell.y + cell.height * 0.5f), 2.5f * scale, RAYWHITE);
-        }
-
-        if (i == fluteCursor)
-        {
-            // The bird: a flapping silhouette perched over the target.
-            float flap = sinf((float)GetTime() * 12.0f);
-            Vector2 bird = { cell.x + cell.width * 0.5f,
-                             cell.y + cell.height * 0.5f - 6.0f * scale };
-            Vector2 wingL = { bird.x - 7.0f * scale,
-                              bird.y - 1.0f * scale - flap * 3.0f * scale };
-            Vector2 wingR = { bird.x + 7.0f * scale,
-                              bird.y - 1.0f * scale - flap * 3.0f * scale };
-            DrawCircle((int)bird.x, (int)bird.y, (int)(2.0f * scale), RAYWHITE);
-            DrawLineEx(bird, wingL, 2.0f * scale, RAYWHITE);
-            DrawLineEx(bird, wingR, 2.0f * scale, RAYWHITE);
-        }
-    }
+    // The visited-room map, same renderer as the pause map tab; the
+    // bird perches on the cursor room.
+    Rectangle mapArea = { panel.x + 8.0f, panel.y + 24.0f,
+                          panel.width - 16.0f, panel.height - 32.0f };
+    drawMapOverview(mapArea, fluteCursor, false);
 }
 
 static void updatePauseMenu()
@@ -3027,39 +3283,15 @@ static void drawPauseOverlay()
 
     // Panel.
     float panelW = 200.0f;
-    float panelH = 108.0f;
+    float panelH = 120.0f;
     Rectangle panel = { (viewWidth - panelW) * 0.5f, (viewHeight - panelH) * 0.5f,
                         panelW, panelH };
-    if (uiBorderTexture.id != 0)
-    {
-        int patch = uiBorderTexture.width / 3;
-        if (patch < 1) patch = 1;
-        NPatchInfo npatch;
-        npatch.source = Rectangle{ 0.0f, 0.0f,
-                                   (float)uiBorderTexture.width, (float)uiBorderTexture.height };
-        npatch.left = patch;
-        npatch.top = patch;
-        npatch.right = patch;
-        npatch.bottom = patch;
-        npatch.layout = NPATCH_NINE_PATCH;
-        Rectangle dest = { panel.x * scale, panel.y * scale,
-                           panel.width * scale, panel.height * scale };
-        Vector2 origin = { 0.0f, 0.0f };
-        DrawTextureNPatch(uiBorderTexture, npatch, dest, origin, 0.0f, WHITE);
-    }
-    else
-    {
-        DrawRectangle((int)(panel.x * scale), (int)(panel.y * scale),
-                      (int)(panel.width * scale), (int)(panel.height * scale), Color{ 16, 24, 96, 255 });
-    }
+    drawUiNinePatch(panel, WHITE);
 
-    int size = (int)(10 * scale);
-    int titleSize = (int)(12 * scale);
-    uiDrawText(pauseTab == 0 ? "ITEMS" : "MAP",
-             (int)((panel.x + 8.0f) * scale), (int)((panel.y + 6.0f) * scale),
-             titleSize, RAYWHITE);
+    // Tab icon title + tab switcher hint, top of the panel.
+    drawUiFrame(uiMiscTexture, pauseTab == 0 ? UIMISC_TAB_ITEMS : UIMISC_TAB_MAP,
+                18.0f, 18.0f, panel.x + 8.0f, panel.y + 4.0f, WHITE);
     {
-        // Tab switcher hint, top-right of the panel.
         const char* tabs = "SWORD: SWITCH";
         uiDrawText(tabs, (int)((panel.x + panel.width - 8.0f) * scale)
                      - uiMeasureText(tabs, (int)(8 * scale)),
@@ -3069,166 +3301,89 @@ static void drawPauseOverlay()
 
     if (pauseTab == 1)
     {
-        // Map tab: visited rooms laid out by the exits graph.
-        static float mapX[MAX_ROOM_MARKS];
-        static float mapY[MAX_ROOM_MARKS];
-        int roomTotal = ROOM_COUNT < MAX_ROOM_MARKS ? ROOM_COUNT : MAX_ROOM_MARKS;
-        mapLayout(mapX, mapY, roomTotal);
-
-        float cellW = 18.0f;
-        float cellH = 14.0f;
-        float pitchX = 26.0f;
-        float pitchY = 22.0f;
-
-        // Center the visited bounds in the panel.
-        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-        for (int i = 0; i < roomTotal; i++)
-        {
-            if (i < MAX_ROOM_MARKS && !roomVisited[i]) continue;
-            if (mapX[i] < minX) minX = mapX[i];
-            if (mapX[i] > maxX) maxX = mapX[i];
-            if (mapY[i] < minY) minY = mapY[i];
-            if (mapY[i] > maxY) maxY = mapY[i];
-        }
-        float originX = (minX + maxX) * 0.5f;
-        float originY = (minY + maxY) * 0.5f;
-        float baseX = panel.x + panel.width * 0.5f - originX * pitchX - cellW * 0.5f;
-        float baseY = panel.y + panel.height * 0.5f - originY * pitchY - cellH * 0.5f;
-
-        // Connections between visited rooms first (lines under boxes).
-        for (int i = 0; i < roomTotal; i++)
-        {
-            if (!roomVisited[i]) continue;
-            const RoomConfig& cfg = ROOMS[i];
-            const int edges[4] = { cfg.exitNorth, cfg.exitSouth, cfg.exitEast, cfg.exitWest };
-            for (int e = 0; e < 4; e++)
-            {
-                int target = edges[e];
-                if (target < 0 || target >= roomTotal || !roomVisited[target]) continue;
-                if (target < i) continue;  // draw each link once
-                int x0 = (int)((baseX + mapX[i] * pitchX + cellW * 0.5f) * scale);
-                int y0 = (int)((baseY + mapY[i] * pitchY + cellH * 0.5f) * scale);
-                int x1 = (int)((baseX + mapX[target] * pitchX + cellW * 0.5f) * scale);
-                int y1 = (int)((baseY + mapY[target] * pitchY + cellH * 0.5f) * scale);
-                DrawLine(x0, y0, x1, y1, Color{ 120, 130, 170, 255 });
-            }
-        }
-
-        // Visited room boxes; the current room glows with a hero dot.
-        for (int i = 0; i < roomTotal; i++)
-        {
-            if (!roomVisited[i]) continue;
-            Rectangle cell = { (baseX + mapX[i] * pitchX) * scale,
-                               (baseY + mapY[i] * pitchY) * scale,
-                               cellW * scale, cellH * scale };
-            bool current = (i == currentRoom);
-            DrawRectangleRec(cell, current ? Color{ 90, 120, 200, 255 }
-                                           : Color{ 40, 50, 90, 255 });
-            DrawRectangleLinesEx(cell, 1.0f, current ? RAYWHITE : Color{ 120, 130, 170, 255 });
-            if (current)
-            {
-                DrawCircle((int)(cell.x + cell.width * 0.5f),
-                           (int)(cell.y + cell.height * 0.5f), 2.5f * scale, RAYWHITE);
-            }
-
-            // Compass (as data): with the passive owned, the map marks
-            // chest rooms (gold) and boss rooms (red).
-            if (compassItemOwned() && (ROOMS[i].hasChest || ROOMS[i].hasBoss))
-            {
-                if (ROOMS[i].hasChest)
-                    DrawRectangle((int)(cell.x + cell.width * 0.18f),
-                                  (int)(cell.y + cell.height * 0.5f - 2.0f * scale),
-                                  (int)(4.0f * scale), (int)(4.0f * scale),
-                                  Color{ 235, 200, 70, 255 });
-                if (ROOMS[i].hasBoss)
-                    DrawCircle((int)(cell.x + cell.width * 0.72f),
-                               (int)(cell.y + cell.height * 0.55f),
-                               2.5f * scale, Color{ 225, 80, 80, 255 });
-            }
-        }
+        // Map tab: visited rooms laid out by the exits graph, with the
+        // compass chest/boss marks when the passive is owned.
+        Rectangle mapArea = { panel.x + 8.0f, panel.y + 24.0f,
+                              panel.width - 16.0f, panel.height - 32.0f };
+        drawMapOverview(mapArea, -1, true);
         return;
     }
 
-    // Item grid (one row of up to three cells; a fourth wraps).
-    float cellW = 56.0f;
-    float cellH = 18.0f;
-    for (int i = 0; i < ITEM_COUNT; i++)
+    // Item grid: 16x16 icon cells, six per row (blank when unowned, the
+    // LttP subscreen treatment); the selection frame rides the cursor,
+    // the equipped badge marks the equipped item.
+    int size = (int)(10 * scale);
+    float gridX = panel.x + 8.0f;
+    float gridY = panel.y + 26.0f;
+    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
     {
-        float cx = panel.x + 8.0f + (float)(i % 3) * cellW;
-        float cy = panel.y + 26.0f + (float)(i / 3) * cellH;
-        const char* label = inventory.owned[i] ? ITEMS[i].label : "-----";
-        uiDrawText(label, (int)((cx + 12.0f) * scale), (int)(cy * scale), size,
-                 inventory.owned[i] ? RAYWHITE : Color{ 130, 130, 150, 255 });
+        float cx = gridX + (float)(i % 6) * 16.0f;
+        float cy = gridY + (float)(i / 6) * 16.0f;
+        if (inventory.owned[i])
+            drawItemIcon(i, cx, cy, RAYWHITE);
         if (i == pauseCursor)
-        {
-            // Cursor triangle pointing at the cell.
-            float ax = (cx + 2.0f) * scale;
-            float ay = (cy * scale) + size * 0.5f;
-            Vector2 a = { ax, ay - 4.0f * scale };
-            Vector2 b = { ax, ay + 4.0f * scale };
-            Vector2 c = { ax + 6.0f * scale, ay };
-            DrawTriangle(a, b, c, RAYWHITE);
-        }
+            drawUiFrame(uiMiscTexture, UIMISC_SELECT, 18.0f, 18.0f,
+                        cx - 1.0f, cy - 1.0f, WHITE);
         if (i == inventory.equippedItem && inventory.equippedItem >= 0)
-        {
-            uiDrawText("E", (int)((cx + cellW - 12.0f) * scale), (int)(cy * scale),
-                     size, Color{ 120, 220, 140, 255 });
-        }
+            drawUiFrame(uiMiscTexture, UIMISC_BADGE, 18.0f, 18.0f,
+                        cx + 4.0f, cy + 4.0f, WHITE);
     }
 
-    // Quantities column.
-    float qx = panel.x + 8.0f + 3.0f * cellW + 6.0f;
+    // Quantities column: counter icons with the counts beside them.
+    float qx = panel.x + 112.0f;
     float qy = panel.y + 26.0f;
-    char text[32];
-    snprintf(text, sizeof(text), "RUPEES %d/%d", inventory.rupees, inventory.rupeeMax);
-    uiDrawText(text, (int)(qx * scale), (int)(qy * scale), size, RAYWHITE);
-    snprintf(text, sizeof(text), "ARROWS %d/%d", inventory.arrows, inventory.arrowsMax);
-    uiDrawText(text, (int)(qx * scale), (int)((qy + 12.0f) * scale), size, RAYWHITE);
-    snprintf(text, sizeof(text), "BOMBS  %d/%d", inventory.bombs, inventory.bombsMax);
-    uiDrawText(text, (int)(qx * scale), (int)((qy + 24.0f) * scale), size, RAYWHITE);
-    snprintf(text, sizeof(text), "KEYS   %d%s", inventory.smallKeys,
-             inventory.bigKeys > 0 ? "  BIG!" : "");
-    uiDrawText(text, (int)(qx * scale), (int)((qy + 34.0f) * scale), size, RAYWHITE);
-
-    // Bottles: one letter per slot (W water, R/G/B potions, F fairy,
-    // b bee), dots while the set is short.
-    if (inventory.bottles > 0)
+    char text[24];
+    struct QuantityRow
     {
-        const char* letters[Inventory::BOTTLE_MAX] = {};
-        for (int i = 0; i < Inventory::BOTTLE_MAX; i++)
-        {
-            switch (inventory.bottleContents[i])
-            {
-            case Inventory::BOTTLE_WATER: letters[i] = "W"; break;
-            case Inventory::BOTTLE_POTION_RED: letters[i] = "R"; break;
-            case Inventory::BOTTLE_POTION_GREEN: letters[i] = "G"; break;
-            case Inventory::BOTTLE_POTION_BLUE: letters[i] = "B"; break;
-            case Inventory::BOTTLE_FAIRY: letters[i] = "F"; break;
-            case Inventory::BOTTLE_BEE: letters[i] = "b"; break;
-            default: letters[i] = "-"; break;
-            }
-        }
-        snprintf(text, sizeof(text), "BOTTLE %s%s%s%s",
-                 letters[0], letters[1], letters[2], letters[3]);
-        uiDrawText(text, (int)(qx * scale), (int)((qy + 46.0f) * scale), size, RAYWHITE);
+        int icon;
+        const char* format;
+        int a;
+        int b;
+    };
+    QuantityRow rows[5] = {
+        { UICOUNT_RUPEE, "%d", inventory.rupees, inventory.rupeeMax },
+        { UICOUNT_ARROW, "%d/%d", inventory.arrows, inventory.arrowsMax },
+        { UICOUNT_BOMB, "%d/%d", inventory.bombs, inventory.bombsMax },
+        { UICOUNT_KEY, "%d", inventory.smallKeys, 0 },
+        { UICOUNT_BIGKEY, "%d", inventory.bigKeys, 0 },
+    };
+    for (int r = 0; r < 5; r++)
+    {
+        if (rows[r].icon == UICOUNT_BIGKEY && inventory.bigKeys <= 0) continue;
+        float ry = qy + (float)r * 12.0f;
+        drawUiFrame(uiCountersTexture, rows[r].icon, 10.0f, 10.0f, qx, ry, WHITE);
+        if (rows[r].b > 0) snprintf(text, sizeof(text), rows[r].format, rows[r].a, rows[r].b);
+        else snprintf(text, sizeof(text), rows[r].format, rows[r].a);
+        uiDrawText(text, (int)((qx + 14.0f) * scale), (int)(ry * scale), size, RAYWHITE);
     }
 
-    // Magic gauge.
-    uiDrawText("MAGIC", (int)(qx * scale), (int)((qy + 58.0f) * scale), size, RAYWHITE);
-    float barX = (qx + 30.0f) * scale;
-    float barY = (qy + 58.0f) * scale + size * 0.5f - 3.0f * scale;
-    DrawRectangle((int)barX, (int)barY, (int)(40.0f * scale), (int)(6.0f * scale),
-                  Color{ 40, 40, 60, 255 });
+    // Bottles: one decanter icon per owned slot (contents frame), under
+    // the item grid.
+    for (int i = 0; i < Inventory::BOTTLE_MAX; i++)
+    {
+        if (i >= inventory.bottles) break;
+        drawUiFrame(uiBottlesTexture, inventory.bottleContents[i], 16.0f, 16.0f,
+                    gridX + (float)i * 17.0f, gridY + 68.0f, WHITE);
+    }
+
+    // Magic bar (sprite frame + fill) with the magic icon, under the
+    // quantities.
+    drawUiFrame(uiMiscTexture, UIMISC_MAGIC, 18.0f, 18.0f, qx, qy + 62.0f, WHITE);
+    float barX = qx + 20.0f;
+    float barY = qy + 67.0f;
+    Rectangle frameSrc = { 0.0f, 0.0f, 42.0f, 8.0f };
+    drawUiSprite(uiMagicBarTexture, frameSrc, barX, barY, 42.0f, 8.0f, WHITE);
     if (inventory.magicMax > 0)
     {
         float fill = (float)inventory.magic / (float)inventory.magicMax;
-        DrawRectangle((int)barX, (int)barY, (int)(40.0f * fill * scale), (int)(6.0f * scale),
-                      Color{ 90, 150, 255, 255 });
+        Rectangle fillSrc = { 44.0f, 0.0f, 40.0f * fill, 6.0f };
+        drawUiSprite(uiMagicBarTexture, fillSrc, barX + 1.0f, barY + 1.0f,
+                     40.0f * fill, 6.0f, WHITE);
     }
 
     // Hint line.
     uiDrawText("ACTION:EQUIP  DASH:SAVE+QUIT  START:CLOSE", (int)((panel.x + 8.0f) * scale),
-             (int)((panel.y + panelH - 16.0f) * scale), (int)(8 * scale),
+             (int)((panel.y + panelH - 11.0f) * scale), (int)(8 * scale),
              Color{ 170, 170, 190, 255 });
 }
 
@@ -3496,22 +3651,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         if (spawn.unlessFlag >= 0 && spawn.unlessFlag < WORLD_FLAG_COUNT
             && gWorldFlags[spawn.unlessFlag]) continue;
 
-        npcs[i].active = true;
-        npcs[i].cfg = &CHARACTERS[spawn.character];
-        npcs[i].sheet = (spawn.character < 16) ? characterSheets[spawn.character] : Texture2D{};
-        npcs[i].x = (float)(spawn.tileX * TILE_SIZE);
-        npcs[i].y = (float)(spawn.tileY * TILE_SIZE);
-        npcs[i].facing = DIR_DOWN;
-        npcs[i].wander = spawn.wander;
-        npcs[i].path = spawn.pathCount > 0 ? spawn.path : 0;
-        npcs[i].pathCount = spawn.pathCount;
-        npcs[i].pathIndex = 0;
-        npcs[i].dialogue = spawn.dialogue;
-        npcs[i].modeTime = 0.0f;
-        npcs[i].timer = 0.5f + worldRng.nextFloat() * 2.0f;
-        npcs[i].animTime = 0.0f;
-        npcs[i].moving = false;
-        npcs[i].lastFacingPick = -1;
+        applyNpcSpawn(i, spawn);
     }
 
     // Placed pickups (hearts in grass, buried rupees): spawned fresh on
@@ -6029,11 +6169,16 @@ static void drawEntitiesSorted()
     Drawable list[1 + 16 + MAX_OBJECTS + MAX_NPCS];
     int n = 0;
 
-    list[n].kind = 0;
-    list[n].index = 0;
+    // A hidden hero (the "hide" cue) steps out of the draw list; the
+    // world keeps playing underneath it.
     Rectangle heroBox = hero.box();
-    list[n].baseline = heroBox.y + heroBox.height;
-    n++;
+    if (!heroHidden)
+    {
+        list[n].kind = 0;
+        list[n].index = 0;
+        list[n].baseline = heroBox.y + heroBox.height;
+        n++;
+    }
 
     for (int i = 0; i < enemyCount; i++)
     {
@@ -6208,19 +6353,25 @@ static void drawEntitiesSorted()
     }
 }
 
-// Item-get hold-up: the grant hovers over the hero with sparkle rays
-// (after the sorted entity pass so it rides above everything).
+// Item-get hold-up: the grant hovers over the hero with orbiting
+// sparkle sprites (after the sorted entity pass so it rides above
+// everything).
 static void drawItemGet()
 {
     if (!itemGet.active) return;
 
-    // Sparkle rays orbiting the grant.
+    // Sparkles orbiting the grant (sprite frames, pulsing).
     for (int i = 0; i < 6; i++)
     {
         float angle = itemGet.t * 3.0f + (float)i * 1.047f;
         float sx = itemGet.itemX + cosf(angle) * 14.0f;
         float sy = itemGet.itemY + sinf(angle) * 10.0f;
-        DrawCircle((int)sx, (int)sy, 1.5f, Color{ 255, 240, 160, 230 });
+        Color tint = (i % 2 == 0) ? Color{ 255, 240, 160, 230 }
+                                 : Color{ 255, 255, 240, 190 };
+        Rectangle src = { UIMISC_SPARKLE * 18.0f, 0.0f, 18.0f, 18.0f };
+        Rectangle dest = { sx - 9.0f, sy - 9.0f, 18.0f, 18.0f };
+        Vector2 origin = { 0.0f, 0.0f };
+        DrawTexturePro(uiMiscTexture, src, dest, origin, 0.0f, tint);
     }
 
     if (itemGet.pickupFrame >= 0)
@@ -6229,13 +6380,52 @@ static void drawItemGet()
         Rectangle dest = { itemGet.itemX - 8.0f, itemGet.itemY - 8.0f, 16.0f, 16.0f };
         Vector2 origin = { 0.0f, 0.0f };
         DrawTexturePro(pickupsTexture, src, dest, origin, 0.0f, WHITE);
+        return;
     }
-    else
+
+    // Grants without a pickup frame get their own sprite: items show
+    // their subscreen icon, keys the key sprites, everything else the
+    // medallion placeholder. (World space: the camera transform already
+    // carries the scale.)
+    Vector2 origin = { 0.0f, 0.0f };
+    int kind = itemGet.grantKind;
+    if (kind >= 0 && kind < GRANT_KIND_COUNT)
     {
-        // Medallion placeholder for items/keys with no pickup sprite.
-        DrawCircle((int)itemGet.itemX, (int)itemGet.itemY, 9.0f, Color{ 216, 168, 60, 255 });
-        DrawCircle((int)itemGet.itemX, (int)itemGet.itemY, 6.0f, Color{ 250, 232, 160, 255 });
+        switch (GRANT_RULES[kind].effect)
+        {
+        case GRANTEFFECT_GIVE_ITEM:
+            if (itemGet.grantParam >= 0 && itemGet.grantParam < ITEM_COUNT)
+            {
+                Rectangle src = { (float)(itemGet.grantParam * 16), 0.0f, 16.0f, 16.0f };
+                Rectangle dest = { itemGet.itemX - 8.0f, itemGet.itemY - 8.0f,
+                                   16.0f, 16.0f };
+                DrawTexturePro(uiItemsTexture, src, dest, origin, 0.0f, WHITE);
+                return;
+            }
+            break;
+        case GRANTEFFECT_ADD_SMALL_KEY:
+        {
+            Rectangle src = { 9.0f * 16.0f, 0.0f, 16.0f, 16.0f };
+            Rectangle dest = { itemGet.itemX - 8.0f, itemGet.itemY - 8.0f,
+                               16.0f, 16.0f };
+            DrawTexturePro(pickupsTexture, src, dest, origin, 0.0f, WHITE);
+            return;
+        }
+        case GRANTEFFECT_ADD_BIG_KEY:
+        {
+            Rectangle src = { UIMISC_BIGKEY * 18.0f, 0.0f, 18.0f, 18.0f };
+            Rectangle dest = { itemGet.itemX - 9.0f, itemGet.itemY - 9.0f,
+                               18.0f, 18.0f };
+            DrawTexturePro(uiMiscTexture, src, dest, origin, 0.0f, WHITE);
+            return;
+        }
+        default:
+            break;
+        }
     }
+    Rectangle src = { UIMISC_MEDALLION * 18.0f, 0.0f, 18.0f, 18.0f };
+    Rectangle dest = { itemGet.itemX - 9.0f, itemGet.itemY - 9.0f, 18.0f, 18.0f };
+    DrawTexturePro(uiMiscTexture, src, dest, origin, 0.0f, WHITE);
 }
 
 // Lifted, carried and thrown objects ride above the hero sprite: drawn
@@ -6564,8 +6754,9 @@ static void updateAndDraw(void)
             PlaySound(sndItemGet);
         }
 
-        // Cutscene cues: camera pans/returns, letterbox state, and actor
-        // blocking — one of each per shown line, like music/warp.
+        // Cutscene cues: camera pans/returns, letterbox state, actor
+        // blocking, actor facing/visibility, and screen fades — one of
+        // each per shown line, like music/warp.
         {
             int camAction = 0;
             int camTileX = 0;
@@ -6584,6 +6775,24 @@ static void updateAndDraw(void)
             float moveSeconds = 0.0f;
             if (dialogue.takeMoveRequest(actor, moveTileX, moveTileY, moveSeconds))
                 applyCutsceneMoveRequest(actor, moveTileX, moveTileY, moveSeconds);
+
+            int faceActor = -1;
+            int faceDir = 0;
+            if (dialogue.takeFaceRequest(faceActor, faceDir))
+                applyCutsceneFaceRequest(faceActor, faceDir);
+
+            int showActor = -1;
+            if (dialogue.takeShowRequest(showActor))
+                applyCutsceneShowRequest(showActor);
+
+            int hideActor = -1;
+            if (dialogue.takeHideRequest(hideActor))
+                applyCutsceneHideRequest(hideActor);
+
+            int fadeTo = 0;
+            float fadeSeconds = 0.0f;
+            if (dialogue.takeFadeRequest(fadeTo, fadeSeconds))
+                applyCutsceneFadeRequest(fadeTo, fadeSeconds);
         }
     }
     else if (!paused && !fluteWasOpen)
@@ -6818,6 +7027,16 @@ static void updateAndDraw(void)
     drawTint();
     drawWeather();
 
+    // Scripted screen fade (the "fade" cue): the whole world dips to
+    // black and back on the cutscene's clock (under the HUD, bars, and
+    // dialogue text, like the room-load fade).
+    if (scriptFadeT > 0.001f)
+    {
+        unsigned char alpha = (unsigned char)(int)(clampf(scriptFadeT, 0.0f, 1.0f) * 255.0f);
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(),
+                      Color{ 0, 0, 0, alpha });
+    }
+
     // Room-load fade (spawns, death-continue, warps, mirror travel):
     // arrivals dip through the destination room's palette — its ambient
     // tint, darkened — instead of plain black, the LttP screen-transition
@@ -6943,6 +7162,31 @@ int main(int argc, char** argv)
 
     uiBorderTexture = LoadTexture("assets/ui/border.png");
     SetTextureFilter(uiBorderTexture, TEXTURE_FILTER_POINT);
+
+    // Menu chrome sheets (cursors, map overview, item icons, bottles,
+    // bars/gauges, counters, misc badges): the generator guarantees
+    // these exist in assets/ui.
+    struct UiSheetLoad
+    {
+        Texture2D& texture;
+        const char* path;
+    };
+    UiSheetLoad uiSheets[] = {
+        { uiCursorTexture, "assets/ui/cursor.png" },
+        { uiMapTexture, "assets/ui/map.png" },
+        { uiItemsTexture, "assets/ui/items.png" },
+        { uiBottlesTexture, "assets/ui/bottles.png" },
+        { uiMiscTexture, "assets/ui/misc.png" },
+        { uiBossBarTexture, "assets/ui/bar_boss.png" },
+        { uiMagicBarTexture, "assets/ui/bar_magic.png" },
+        { uiMagicGaugeTexture, "assets/ui/gauge_magic.png" },
+        { uiCountersTexture, "assets/ui/counters.png" },
+    };
+    for (UiSheetLoad& sheet : uiSheets)
+    {
+        sheet.texture = LoadTexture(sheet.path);
+        SetTextureFilter(sheet.texture, TEXTURE_FILTER_POINT);
+    }
 
     // Character sheets (the hero + every NPC character).
     for (int i = 0; i < CHARACTER_COUNT && i < 16; i++)
@@ -7091,6 +7335,15 @@ int main(int argc, char** argv)
     UnloadTexture(beamTexture);
     UnloadTexture(boomerangTexture);
     UnloadTexture(uiBorderTexture);
+    UnloadTexture(uiCursorTexture);
+    UnloadTexture(uiMapTexture);
+    UnloadTexture(uiItemsTexture);
+    UnloadTexture(uiBottlesTexture);
+    UnloadTexture(uiMiscTexture);
+    UnloadTexture(uiBossBarTexture);
+    UnloadTexture(uiMagicBarTexture);
+    UnloadTexture(uiMagicGaugeTexture);
+    UnloadTexture(uiCountersTexture);
     for (int i = 0; i < 16; i++)
     {
         if (characterSheets[i].id != 0) UnloadTexture(characterSheets[i]);

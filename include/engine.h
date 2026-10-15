@@ -101,6 +101,19 @@ struct DialogueLine
     int moveTileX;
     int moveTileY;
     float moveSeconds;      // blocking glide duration
+    // Turn an actor to speak without a glide (move already faces the
+    // stride; turning in place is its own beat).
+    int faceActor;          // -1 = none, -2 = the hero, else room npc index
+    int faceDir;            // Direction enum
+    // Actor visibility: per-line entrances/exits. NPC spawn tables
+    // evaluate only at room entry, so mid-scene traffic needs these
+    // (resolved against the room's npc list).
+    int showActor;          // -1 = none, -2 = the hero, else npc index
+    int hideActor;          // -1 = none, -2 = the hero, else npc index
+    // Screen fade: image scenes get their cuts, in-world scenes their
+    // punctuation (full-screen fades are the sanctioned non-sprite chrome).
+    int fadeTo;             // 0 = none, 1 = to black, 2 = back to the world
+    float fadeSeconds;      // fade duration
 };
 
 struct Dialogue

@@ -452,18 +452,46 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
     }
 
     // Entity placement support: the object type compositions, the enemy
-    // roster, and the item list (chest grant pickers).
+    // roster, and the item list (chest grant pickers). Types and enemies
+    // carry their sprite's existence so the Files tab can audit what art
+    // is still a bake-time placeholder.
     let object_types = read_json(&res.join("objects").join("types.json"))
         .ok()
         .and_then(|v| v.get("types").cloned())
-        .unwrap_or_else(|| json!([]));
+        .map(|types| {
+            types
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| {
+                    let image = t
+                        .get("image")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| t.get("name").and_then(Value::as_str).map(|n| format!("{}.png", n)))
+                        .unwrap_or_default();
+                    let mut out = t.clone();
+                    out["png"] = json!(res.join("objects").join(&image).is_file());
+                    out
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     let mut enemies = Vec::new();
     for file in list_files(&res, "enemies").into_iter().filter(|f| f.ends_with(".json")) {
+        let data = read_json(&res.join("enemies").join(&file))?;
+        let image = data
+            .get("image")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| file.trim_end_matches(".json").to_string() + ".png");
         enemies.push(json!({
             "name": file.trim_end_matches(".json"),
             "file": file,
-            "data": read_json(&res.join("enemies").join(&file))?,
+            "png": res.join("enemies").join(&image).is_file(),
+            "data": data,
         }));
     }
 
@@ -501,6 +529,10 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
         "music": list_files(&res, "music"),
         "audio": list_files(&res, "audio"),
         "ui": list_files(&res, "ui"),
+        "pickups": list_files(&res, "pickups"),
+        "effects": list_files(&res, "effects"),
+        "objects": list_files(&res, "objects"),
+        "fonts": list_files(&res, "fonts"),
         "objectTypes": object_types,
         "enemies": enemies,
         "items": items,
@@ -738,6 +770,10 @@ fn upload(state: State<ProjectState>, dir: String, name: String, data: String) -
         ("tiles", &[".png"]),
         ("characters", &[".png", ".json"]),
         ("enemies", &[".png"]),
+        ("pickups", &[".png"]),
+        ("effects", &[".png"]),
+        ("objects", &[".png"]),
+        ("fonts", &[".png", ".ttf", ".otf"]),
     ];
     let root = project_root(&state)?;
     let res = root.join("resources");
@@ -871,15 +907,18 @@ async fn play(state: State<'_, ProjectState>, room: String, tile: Option<String>
                 "error": "Build succeeded but no ./main exists — test-from-here needs the native binary (macOS host)"
             }));
         }
+        let room = room.trim().to_string();
         let mut command = std::process::Command::new(&binary);
-        command.arg("--room").arg(&room)
-            .current_dir(&engine)
+        if !room.is_empty() {
+            command.arg("--room").arg(&room);
+            if let Some(t) = &tile {
+                command.arg("--tile").arg(t);
+            }
+        }
+        command.current_dir(&engine)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Some(t) = &tile {
-            command.arg("--tile").arg(t);
-        }
         command.spawn().map_err(|e| e.to_string())?;
         Ok(json!({ "ok": true }))
     })
@@ -1014,6 +1053,36 @@ fn new_game(app: AppHandle, state: State<ProjectState>, name: String) -> Result<
     Ok(json!({ "ok": true, "path": path }))
 }
 
+// Save-slot tools (the engine writes save<slot>.dat beside the binary on
+// desktop targets — see src/main.cpp saveFilePath).
+#[tauri::command]
+fn save_slots(state: State<'_, ProjectState>) -> Result<Value, String> {
+    let engine = engine_root(&state)?;
+    let slots: Vec<Value> = (0..3)
+        .map(|slot| {
+            let path = engine.join(format!("save{}.dat", slot));
+            match fs::metadata(&path) {
+                Ok(meta) => json!({ "slot": slot, "exists": true, "bytes": meta.len() }),
+                Err(_) => json!({ "slot": slot, "exists": false, "bytes": 0 }),
+            }
+        })
+        .collect();
+    Ok(json!({ "ok": true, "slots": slots }))
+}
+
+#[tauri::command]
+fn delete_save(state: State<'_, ProjectState>, slot: i64) -> Result<Value, String> {
+    if slot < 0 || slot > 2 {
+        return Err("Slot out of range".to_string());
+    }
+    let engine = engine_root(&state)?;
+    let path = engine.join(format!("save{}.dat", slot));
+    if path.is_file() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({ "ok": true }))
+}
+
 // ---- boot -----------------------------------------------------------------
 
 fn main() {
@@ -1055,6 +1124,8 @@ fn main() {
             read_resource,
             set_project,
             new_game,
+            save_slots,
+            delete_save,
             list_flags,
             check_code
         ])

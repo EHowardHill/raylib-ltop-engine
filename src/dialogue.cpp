@@ -46,7 +46,8 @@ static bool cursorDownPressed()
 }
 
 DialogueBox::DialogueBox()
-    : font(), fontOwned(false), border(), letterSfx(), finishSfx(), errorSfx(),
+    : font(), fontOwned(false), border(), cursor(), letterSfx(), finishSfx(),
+      errorSfx(),
       current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0),
       choiceActive(false), choiceCursor(0),
       musicRequest(), musicPending(false),
@@ -55,7 +56,10 @@ DialogueBox::DialogueBox()
       camPending(false), camAction(0), camTileX(0), camTileY(0),
       camSeconds(0.0f), letterboxPending(false), letterboxState(-1),
       movePending(false), moveActor(-1), moveTileX(0), moveTileY(0),
-      moveSeconds(0.0f), nextDialogue(-1), nextPending(false),
+      moveSeconds(0.0f), facePending(false), faceActor(-1), faceDir(0),
+      showPending(false), showActor(-1), hidePending(false), hideActor(-1),
+      fadePending(false), fadeTo(0), fadeSeconds(0.0f),
+      nextDialogue(-1), nextPending(false),
       waitTimer(0.0f)
 {
     for (int i = 0; i < MAX_ROWS; i++) rows[i].offset = 0;
@@ -80,6 +84,10 @@ void DialogueBox::init()
     }
     border = LoadTexture("assets/ui/border.png");
     SetTextureFilter(border, TEXTURE_FILTER_POINT);
+    // Menu cursor arrows (list + continue prompts) — sprites, like every
+    // other piece of chrome.
+    cursor = LoadTexture("assets/ui/cursor.png");
+    SetTextureFilter(cursor, TEXTURE_FILTER_POINT);
     // Letter cues name their files; they decode on first play through the
     // shared lazy cache.
     letterSfx = { "message.wav" };
@@ -92,6 +100,7 @@ void DialogueBox::shutdown()
     if (fontOwned) UnloadFont(font);
     fontOwned = false;
     UnloadTexture(border);
+    UnloadTexture(cursor);
     shutdownNamedSfx();
     current = 0;
     musicPending = false;
@@ -138,6 +147,10 @@ void DialogueBox::open(const Dialogue& dialogue)
     camPending = false;
     letterboxPending = false;
     movePending = false;
+    facePending = false;
+    showPending = false;
+    hidePending = false;
+    fadePending = false;
     nextPending = false;
     startLine();
 }
@@ -201,6 +214,28 @@ void DialogueBox::startLine()
             moveTileY = line.moveTileY;
             moveSeconds = line.moveSeconds;
             movePending = true;
+        }
+        if (line.faceActor != -1)
+        {
+            faceActor = line.faceActor;
+            faceDir = line.faceDir;
+            facePending = true;
+        }
+        if (line.showActor != -1)
+        {
+            showActor = line.showActor;
+            showPending = true;
+        }
+        if (line.hideActor != -1)
+        {
+            hideActor = line.hideActor;
+            hidePending = true;
+        }
+        if (line.fadeTo != 0)
+        {
+            fadeTo = line.fadeTo;
+            fadeSeconds = line.fadeSeconds;
+            fadePending = true;
         }
 
         choiceActive = false;
@@ -463,6 +498,40 @@ bool DialogueBox::takeMoveRequest(int& actor, int& tileX, int& tileY, float& sec
     return true;
 }
 
+bool DialogueBox::takeFaceRequest(int& actor, int& dir)
+{
+    if (!facePending) return false;
+    facePending = false;
+    actor = faceActor;
+    dir = faceDir;
+    return true;
+}
+
+bool DialogueBox::takeShowRequest(int& actor)
+{
+    if (!showPending) return false;
+    showPending = false;
+    actor = showActor;
+    return true;
+}
+
+bool DialogueBox::takeHideRequest(int& actor)
+{
+    if (!hidePending) return false;
+    hidePending = false;
+    actor = hideActor;
+    return true;
+}
+
+bool DialogueBox::takeFadeRequest(int& to, float& seconds)
+{
+    if (!fadePending) return false;
+    fadePending = false;
+    to = fadeTo;
+    seconds = fadeSeconds;
+    return true;
+}
+
 bool DialogueBox::takeNextRequest(int& dialogue)
 {
     if (!nextPending) return false;
@@ -499,12 +568,12 @@ void DialogueBox::drawChoices(Rectangle box) const
 
         if (i == choiceCursor)
         {
-            float cursorX = pos.x - 12.0f * sc;
-            float cy = pos.y + textSize * 0.5f;
-            Vector2 a = { cursorX, cy - 5.0f * sc };
-            Vector2 b = { cursorX, cy + 5.0f * sc };
-            Vector2 c2 = { cursorX + 8.0f * sc, cy };
-            DrawTriangle(a, b, c2, RAYWHITE);
+            // Cursor sprite pointing at the option from the left.
+            Rectangle src = { 0.0f, 0.0f, 8.0f, 8.0f };
+            Rectangle dest = { pos.x - 12.0f * sc, pos.y + textSize * 0.5f - 4.0f * sc,
+                               8.0f * sc, 8.0f * sc };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(cursor, src, dest, origin, 0.0f, RAYWHITE);
         }
     }
 }
@@ -609,14 +678,15 @@ void DialogueBox::draw() const
     {
         int patchArrow = border.width / 3;
         if (patchArrow < 1) patchArrow = 1;
-        float ax = (box.x + box.width - (float)patchArrow - TEXT_PAD_X - 2.0f) * sc;
+        float ax = (box.x + box.width - (float)patchArrow - TEXT_PAD_X - 4.0f) * sc;
         float ay = (box.y + (float)patchArrow + TEXT_PAD_Y
                     + (float)((drawnRows > 0 ? drawnRows : 1) - 1) * LINE_HEIGHT
                     + 8.0f) * sc;
-        Vector2 a = { ax, ay - 3.0f * sc };
-        Vector2 b = { ax + 6.0f * sc, ay - 3.0f * sc };
-        Vector2 c = { ax + 3.0f * sc, ay + 3.0f * sc };
-        DrawTriangle(a, b, c, RAYWHITE);
+        // Continue prompt: the down-arrow cursor sprite.
+        Rectangle src = { 8.0f, 0.0f, 8.0f, 8.0f };
+        Rectangle dest = { ax, ay - 4.0f * sc, 8.0f * sc, 8.0f * sc };
+        Vector2 origin = { 0.0f, 0.0f };
+        DrawTexturePro(cursor, src, dest, origin, 0.0f, RAYWHITE);
     }
 
     drawChoices(box);

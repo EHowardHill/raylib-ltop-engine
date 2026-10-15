@@ -37,6 +37,10 @@ public:
     bool takeCameraRequest(int& action, int& tileX, int& tileY, float& seconds);
     bool takeLetterboxRequest(int& state);
     bool takeMoveRequest(int& actor, int& tileX, int& tileY, float& seconds);
+    bool takeFaceRequest(int& actor, int& dir);
+    bool takeShowRequest(int& actor);
+    bool takeHideRequest(int& actor);
+    bool takeFadeRequest(int& to, float& seconds);
     bool takeNextRequest(int& dialogue);
 
 private:
@@ -58,6 +62,7 @@ private:
     Font font;
     bool fontOwned;  // the default font is borrowed, a loaded one is ours
     Texture2D border;
+    Texture2D cursor;  // ui/cursor.png: 0 = list arrow, 1 = continue arrow
     // Letter cues decode lazily through the shared cache (sfx.h).
     LazySound letterSfx;
     LazySound finishSfx;
@@ -95,6 +100,16 @@ private:
     int moveTileX;
     int moveTileY;
     float moveSeconds;
+    bool facePending;
+    int faceActor;
+    int faceDir;
+    bool showPending;
+    int showActor;
+    bool hidePending;
+    int hideActor;
+    bool fadePending;
+    int fadeTo;
+    float fadeSeconds;
     int nextDialogue;
     bool nextPending;
     float waitTimer;  // auto-advance beat: counts past the full reveal

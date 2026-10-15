@@ -1,0 +1,58 @@
+{
+    "lines": [
+        {
+            "letterbox": true,
+            "camera": {
+                "pan": [
+                    14,
+                    9
+                ],
+                "time": 2.2
+            },
+            "wait": 2.4
+        },
+        {
+            "text": "Long ago, the valley lay quiet beneath a long shadow...",
+            "wait": 3.0
+        },
+        {
+            "text": "...until one small house kept one small lamp lit.",
+            "camera": {
+                "pan": [
+                    4,
+                    5
+                ],
+                "time": 1.8
+            },
+            "wait": 2.8
+        },
+        {
+            "text": "On this morning, the lamp was yours.",
+            "wait": 2.6
+        },
+        {
+            "fade": {
+                "to": "black",
+                "time": 0.8
+            },
+            "wait": 1.0
+        },
+        {
+            "fade": {
+                "to": "world",
+                "time": 0.8
+            },
+            "camera": "hero",
+            "wait": 0.9
+        },
+        {
+            "text": "Morning!",
+            "face": {
+                "actor": "hero",
+                "dir": "down"
+            },
+            "letterbox": false,
+            "wait": 1.8
+        }
+    ]
+}

@@ -2,11 +2,24 @@
     "lines": [
         {
             "letterbox": true,
-            "camera": { "pan": [6, 7], "time": 1.2 },
+            "camera": {
+                "pan": [
+                    6,
+                    7
+                ],
+                "time": 1.2
+            },
             "wait": 1.6
         },
         {
-            "move": { "actor": 0, "tile": [5, 6], "time": 1.4 },
+            "move": {
+                "actor": 0,
+                "tile": [
+                    5,
+                    6
+                ],
+                "time": 1.4
+            },
             "wait": 1.8
         },
         {
@@ -14,13 +27,32 @@
             "wait": 2.8
         },
         {
-            "text": "Rest now. You've earned it.",
-            "wait": 2.2
+            "text": "VILLAGER: Rest now. You've earned it.",
+            "face": {
+                "actor": 0,
+                "dir": "down"
+            },
+            "wait": 2.4
+        },
+        {
+            "move": {
+                "actor": 0,
+                "tile": [
+                    0,
+                    7
+                ],
+                "time": 1.6
+            },
+            "wait": 1.8
+        },
+        {
+            "hide": 0,
+            "wait": 0.6
         },
         {
             "camera": "hero",
             "letterbox": false,
-            "wait": 0.4
+            "wait": 0.6
         }
     ]
 }
