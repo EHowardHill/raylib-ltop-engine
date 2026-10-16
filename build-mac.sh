@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e
+cd "$(dirname "$0")"
 
 # Generate the header files and source files needed to compile the game
 # All generated files will be placed in either include_auto or src_auto

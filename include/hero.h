@@ -39,6 +39,10 @@ public:
     void load(const CharacterConfig& config);
     void unload();
     void place(int tileX, int tileY);
+    // Tile-fit check for scripted placements: the hero's collision box
+    // at the tile position must be free — place/nudge are collision-free
+    // by design, so callers validate before moving him there.
+    bool canOccupyTile(int tileX, int tileY, const Room& room) const;
     void update(const Room& room, float dt);
     void draw() const;
     // Shallow-water reflection: a flipped, translucent copy of the sprite
@@ -171,7 +175,10 @@ public:
     void revive();
     // Take damage from an external source (enemies, projectiles); knockback
     // pushes along knockDir (expected normalized, (0,0) means straight up).
-    void hurt(int halfHearts, Vector2 knockDir);
+    // Damage + knockback (no-op during i-frames or states that can't be
+    // hurt); returns true when the damage landed — callers use it to
+    // couple reactions (the enemy contact bounce) to actual hits.
+    bool hurt(int halfHearts, Vector2 knockDir);
 
     // True while the hero is wading in shallow water (footstep sfx swap).
     bool wading() const { return wading_; }

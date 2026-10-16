@@ -25,14 +25,14 @@ static DialogueBox dialogue;
 
 static Music music = {};
 static bool musicLoaded = false;
-static char musicFile[512] = "";
+static char musicFile[600] = "";  // sized like the path buffers it copies
 
 // Danger layer: a room's alternate track that swells over the bgm while
 // an arena fight (boss or mini-boss) lives — the dynamic music crossfade.
 // Same no-restart convention as the bgm; the mix lerps ~1.2s each way.
 static Music dangerMusic = {};
 static bool dangerLoaded = false;
-static char dangerFile[512] = "";
+static char dangerFile[600] = "";  // sized like the path buffers it copies
 static float dangerMix = 0.0f;   // 0 = calm bgm, 1 = full danger
 
 // Tileset sheets (one texture per baked tileset; rooms carry their index).
@@ -58,7 +58,8 @@ static bool* encounterFired = 0;
 static Rng worldRng(0xC0FFEE1Du);
 static Enemy enemies[16];
 static int enemyCount = 0;
-static Texture2D enemySheets[16] = {};
+static Texture2D enemySheets[32] = {};  // sized like the object pool: games
+                                        // can bake past 16 enemy types
 
 static const int MAX_PICKUPS = 32;
 struct Pickup
@@ -803,6 +804,10 @@ static void applyCutsceneMoveRequest(int actor, int tileX, int tileY, float seco
     {
         return;
     }
+    // The hero's glide lands collision-checked: a script tile inside a
+    // wall would embed him for good (nudge is collision-free by design).
+    // NPCs skip the check — they don't collide with the room.
+    if (actor == -2 && !hero.canOccupyTile(tileX, tileY, room)) return;
     cutsceneMove.toX = (float)tileX * TILE_SIZE + TILE_SIZE * 0.5f;
     cutsceneMove.toY = (float)tileY * TILE_SIZE + TILE_SIZE * 0.5f;
     cutsceneMove.t = 0.0f;
@@ -1021,6 +1026,9 @@ static void spawnBeam(float x, float y, Direction facing)
         projectiles[i].active = true;
         projectiles[i].friendly = true;
         projectiles[i].beam = true;
+        projectiles[i].arrow = false;
+        projectiles[i].element = ELEMENT_NONE;  // slots recycle: no stale
+                                                // rod-element visuals
         projectiles[i].dir = (int)facing;
         projectiles[i].id = nextBeamSwingId--;  // unique per beam
         projectiles[i].x = x;
@@ -1125,14 +1133,16 @@ static int currentRoom = 0;
 static const int MAX_DOOR_SLOTS = 1024;
 static bool doorOpened[MAX_DOOR_SLOTS] = {};
 
-// Bosses stay dead (LttP): keyed by room * MAX_ENEMY_SLOTS + spawn slot.
-static const int MAX_BOSS_SLOTS = 512;
-static bool bossDefeated[MAX_BOSS_SLOTS] = {};
-
 // Visited rooms, for the pause-screen map. Bounded like the other
 // registries since ROOM_COUNT is extern.
 static const int MAX_ROOM_MARKS = 128;
 static bool roomVisited[MAX_ROOM_MARKS] = {};
+
+// Bosses stay dead (LttP): keyed by room * MAX_ENEMY_SLOTS + spawn slot.
+// Sized for every room (MAX_ROOM_MARKS * 16), so no room's defeat flag
+// can fall off the end and silently respawn the boss.
+static const int MAX_BOSS_SLOTS = MAX_ROOM_MARKS * 16;
+static bool bossDefeated[MAX_BOSS_SLOTS] = {};
 
 // Dungeon treatment: per-room bitmask of defeated spawn slots (rooms cap
 // at 16 spawns, so one ushort holds a room's set). Snapshotted on the way
@@ -1265,6 +1275,25 @@ static void snapshotRoomState(int room)
     }
 }
 
+// Departure snapshot: the room being left hands its state to the
+// registries — dungeon dead-masks (session-lifetime fallen) and the
+// settled-object state (moved blocks, latched switches, lit torches).
+// A room change runs it (see loadRoom), and so does the pause menu's
+// save+quit — quitting must bank what the room looks like NOW, not
+// what it looked like at the last room exit.
+static void snapshotDeparture(int roomIndex)
+{
+    if (roomIndex >= 0 && roomIndex < ROOM_COUNT
+        && ROOMS[roomIndex].dungeon && roomIndex < MAX_ROOM_MARKS)
+    {
+        unsigned short mask = 0;
+        for (int i = 0; i < enemyCount && i < 16; i++)
+            if (!enemies[i].alive()) mask |= (unsigned short)(1 << i);
+        dungeonDead[roomIndex] = mask;
+    }
+    snapshotRoomState(roomIndex);
+}
+
 static bool bossAliveInRoom()
 {
     // The arena seal holds while a boss OR a mid-fight mini-boss lives.
@@ -1309,6 +1338,9 @@ static int oppositeEdge(int edge)
 
 static void markDoorOpened(int roomIndex, int edge)
 {
+    // Validated like its sibling doorKind(): a bogus room index must not
+    // index ROOMS.
+    if (roomIndex < 0 || roomIndex >= ROOM_COUNT) return;
     int slot = roomIndex * 4 + edge;
     if (slot >= 0 && slot < MAX_DOOR_SLOTS) doorOpened[slot] = true;
     // Pair-sync: the same door seen from the linked room opens too.
@@ -1368,7 +1400,7 @@ struct ItemGetSequence
 static ItemGetSequence itemGet = {};
 static DialogueLine itemGetLines[1] = {};
 static char itemGetText[160] = "";
-static Dialogue itemGetDialogue = { "item-get", 1, itemGetLines };
+static Dialogue itemGetDialogue = { "item-get", 1, itemGetLines, false, -1 };
 
 // --- Save system -----------------------------------------------------------
 // Forward declarations: the save/flow helpers below call into systems that
@@ -1387,8 +1419,9 @@ static void drawTitleScreen();
 // the browser.
 static void loadRoomFromSave(int room, int tileX, int tileY);
 static const int SAVE_MAGIC = 0x4C544F50;  // "LTOP"
-static const int SAVE_VERSION = 9;  // v9: settled-object registry (room-local
-                                     // blocks/switches/levers/torches persist)
+static const int SAVE_VERSION = 10;  // v10: boss registry sized for every room
+                                     // (MAX_ROOM_MARKS * 16); v9 settled-object
+                                     // registry unchanged otherwise
 static const int SAVE_SLOT_COUNT = 3;     // selectable once a title screen exists
 static const int SAVE_FLAG_CAP = 256;
 static const int SAVE_ENCOUNTER_CAP = 512;
@@ -1648,6 +1681,7 @@ static int titlePhase = 1;
 // near the title screen code).
 static void enterLogoScreen();
 static void enterTitleScreen(int phase);
+static void cancelRoomTransition();  // defined with the edge-transition state
 
 // Fresh session: every piece of process-global state back to defaults
 // (called when starting/continuing a slot so slots don't leak into each
@@ -1659,6 +1693,8 @@ static void resetGameState()
     for (int i = 0; i < MAX_DOOR_SLOTS; i++) doorOpened[i] = false;
     for (int i = 0; i < MAX_BOSS_SLOTS; i++) bossDefeated[i] = false;
     for (int i = 0; i < MAX_ROOM_MARKS; i++) roomVisited[i] = false;
+    for (int i = 0; i < MAX_ROOM_MARKS; i++) dungeonDead[i] = 0;
+    settledCount = 0;
     if (encounterFired)
         for (int i = 0; i < ENCOUNTER_TOTAL; i++) encounterFired[i] = false;
     blastCount = 0;
@@ -1711,6 +1747,12 @@ static void quitToTitle()
 {
     dialogue.close();  // no half-finished boxes across sessions
     clearSceneImage();  // nor a lingering storybook picture
+    // A mid-transition quit is safe to drop: the swap (and its save)
+    // hasn't happened, so the old room's save is still the truth.
+    cancelRoomTransition();
+    // Bank the room as it looks NOW (a room change snapshots on exit;
+    // so does quitting — save+quit reverts nothing).
+    snapshotDeparture(currentRoom);
     saveToFile(saveSlotInUse);
     startAmbient(NULL);
     startDangerMusic(NULL);
@@ -2278,6 +2320,8 @@ static void spawnArrow(float x, float y, Direction facing, float speed,
         projectiles[i].friendly = true;
         projectiles[i].beam = false;
         projectiles[i].arrow = true;
+        projectiles[i].element = ELEMENT_NONE;  // slots recycle: no stale
+                                                // rod-element visuals
         projectiles[i].dir = (int)facing;
         projectiles[i].id = nextBeamSwingId--;
         projectiles[i].x = x - 8.0f;
@@ -2330,6 +2374,8 @@ static void spawnElementProjectile(float x, float y, Direction facing, int eleme
         projectiles[i].dy = dy;
         projectiles[i].speed = 200.0f;
         projectiles[i].damage = 0;
+        projectiles[i].enemyDamage = 0;  // magic bolts hit without it;
+                                        // slots recycle regardless
         return;
     }
 }
@@ -2583,37 +2629,47 @@ static void useEquippedItem()
         return;
     }
 
-    // Costs, in the order the vocabulary defines them: magic, bombs,
-    // arrows (with the optional rupee fallback). An unaffordable cost
-    // plays the error cue and cancels the use.
-    if (item.magicCost > 0 && !inventory.consumeMagic(item.magicCost))
+    // Toggle items (Byrna/Cape) cost nothing to turn OFF — the use
+    // below just drops the aura, and their runtime drain is the real
+    // price. Everything else pays up front.
+    bool toggleOff =
+        (item.useKind == ITEM_USE_BYRNA && byrnaActive)
+        || (item.useKind == ITEM_USE_CAPE && capeActive);
+
+    if (!toggleOff)
     {
-        PlaySound(sndError);
-        return;
-    }
-    if (item.bombCost > 0)
-    {
-        if (inventory.bombs < item.bombCost)
+        // Costs, in the order the vocabulary defines them: magic, bombs,
+        // arrows (with the optional rupee fallback). An unaffordable cost
+        // plays the error cue and cancels the use.
+        if (item.magicCost > 0 && !inventory.consumeMagic(item.magicCost))
         {
             PlaySound(sndError);
             return;
         }
-        inventory.addBombs(-item.bombCost);
-    }
-    if (item.arrowCost > 0)
-    {
-        if (inventory.arrows >= item.arrowCost)
+        if (item.bombCost > 0)
         {
-            inventory.addArrows(-item.arrowCost);
+            if (inventory.bombs < item.bombCost)
+            {
+                PlaySound(sndError);
+                return;
+            }
+            inventory.addBombs(-item.bombCost);
         }
-        else if (item.arrowRupeeFallback && inventory.rupees > 0)
+        if (item.arrowCost > 0)
         {
-            inventory.addRupees(-1);
-        }
-        else
-        {
-            PlaySound(sndError);
-            return;
+            if (inventory.arrows >= item.arrowCost)
+            {
+                inventory.addArrows(-item.arrowCost);
+            }
+            else if (item.arrowRupeeFallback && inventory.rupees > 0)
+            {
+                inventory.addRupees(-1);
+            }
+            else
+            {
+                PlaySound(sndError);
+                return;
+            }
         }
     }
 
@@ -2937,21 +2993,50 @@ static void startAmbient(const char* file)
 
 static bool paused = false;
 
-// Room-edge transition: walking off a map edge glides the hero into the
-// linked room (camera follows, world frozen) — the LttP scroll-in.
-static const float ROOM_TRANSITION_DURATION = 0.42f;
+// Room-edge transition, fade style: the hero strides out of the map
+// under a dip to black, the swap happens under full cover, and the hero
+// walks on into the linked room as it fades back in. The world freezes
+// through the whole thing.
+static const float ROOM_TRANSITION_DURATION = 0.42f;  // walk-in glide
+static const float ROOM_TRANSITION_WALK_OUT = 0.30f;   // walk-off + fade-out
 static const float ROOM_FADE_DURATION = 0.30f;
 struct RoomTransition
 {
     bool active;
-    float t;
+    float t;        // walk-in glide progress (0..1), armed by loadRoom
     float startX;
     float startY;
     float endX;
     float endY;
+    int phase;      // 0 = walking off the old map, 1 = gliding into the new
+    float phaseT;   // seconds into the walk-off
+    int targetRoom; // swap destination (phase 0)
+    int motion;     // travel direction
 };
 static RoomTransition roomTransition = {};
 static float roomFade = 0.0f;
+
+// Edge-transition fade-out (drawn over the world, under the HUD): the
+// walk-off dips through the departing room's palette to black — the
+// same tinted treatment as the room-load fade-in on the other side.
+static void drawTransitionFadeOut()
+{
+    if (!roomTransition.active || roomTransition.phase != 0) return;
+    float alpha = clampf(roomTransition.phaseT / ROOM_TRANSITION_WALK_OUT, 0.0f, 1.0f);
+    if (alpha <= 0.0f) return;
+    const RoomConfig& rc = room.config();
+    unsigned char fr = 0;
+    unsigned char fg = 0;
+    unsigned char fb = 0;
+    if (rc.tintR < 255 || rc.tintG < 255 || rc.tintB < 255)
+    {
+        fr = (unsigned char)(rc.tintR * 2 / 5);
+        fg = (unsigned char)(rc.tintG * 2 / 5);
+        fb = (unsigned char)(rc.tintB * 2 / 5);
+    }
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(),
+                  Color{ fr, fg, fb, (unsigned char)(int)(alpha * 255.0f) });
+}
 
 static void drawGameOver()
 {
@@ -3018,12 +3103,13 @@ static void updateLantern(float dt)
 
 // Dark rooms: build the lightmap (ambient gloom + additive radial lights
 // from the hero's lantern and lit torches) and multiply it over the frame.
-static void drawDarkness()
+// Dark rooms, in two composable halves: the lightmap renders into its
+// own texture (needs the DEFAULT framebuffer — raylib render targets
+// don't nest), and the multiply blit composites it onto whatever
+// target is current (screen frame, or the edge-scroll snapshot).
+static bool lightmapReady(int sw, int sh)
 {
-    if (!room.config().dark) return;
-
-    int sw = GetScreenWidth();
-    int sh = GetScreenHeight();
+    if (!room.config().dark) return false;
 
     // Recreate the render texture on resize.
     if (lightRT.texture.width != sw || lightRT.texture.height != sh)
@@ -3031,7 +3117,14 @@ static void drawDarkness()
         if (lightRT.texture.id != 0) UnloadRenderTexture(lightRT);
         lightRT = LoadRenderTexture(sw, sh);
     }
-    if (lightRT.texture.id == 0 || lightGradient.id == 0) return;
+    return lightRT.texture.id != 0 && lightGradient.id != 0;
+}
+
+static void renderLightmap()
+{
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    if (!lightmapReady(sw, sh)) return;
 
     float scale = virtualScale();
     float camLeft = camera.target.x - camera.offset.x / camera.zoom;
@@ -3076,6 +3169,13 @@ static void drawDarkness()
     }
     EndBlendMode();
     EndTextureMode();
+}
+
+static void compositeDarkness()
+{
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    if (!lightmapReady(sw, sh)) return;
 
     // Multiply the lightmap over the frame (dark areas dim, lights keep).
     BeginBlendMode(BLEND_MULTIPLIED);
@@ -3348,12 +3448,9 @@ static void drawToasts()
     for (int i = 0; i < 3; i++)
     {
         if (toasts[i].text[0] == '\0') continue;
-        toasts[i].age += frameDt();
-        if (toasts[i].age >= TOAST_LIFE)
-        {
-            toasts[i].text[0] = '\0';
-            continue;
-        }
+        // Age (and expiry) advances in the update path, on the game's
+        // clock — a frozen world holds the banner.
+        if (toasts[i].age >= TOAST_LIFE) continue;
         float t = toasts[i].age / TOAST_LIFE;
         // Quick fade in, hold, quick fade out.
         float alpha = (t < 0.15f) ? t / 0.15f : (t > 0.75f ? (1.0f - t) / 0.25f : 1.0f);
@@ -3724,23 +3821,9 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
 {
     assert(index >= 0 && index < ROOM_COUNT);  // callers resolve ids at bake
 
-    // Dungeon rooms keep their fallen: snapshot which spawn slots are dead
-    // before leaving, so re-entry skips them (session-lifetime; overworld
-    // rooms respawn fresh). Slot i in the mask is spawn i in the baked
-    // set — dead slots stay dead-empty so the identity holds.
-    if (currentRoom >= 0 && currentRoom < ROOM_COUNT
-        && ROOMS[currentRoom].dungeon && currentRoom < MAX_ROOM_MARKS)
-    {
-        unsigned short mask = 0;
-        for (int i = 0; i < enemyCount && i < 16; i++)
-            if (!enemies[i].alive()) mask |= (unsigned short)(1 << i);
-        dungeonDead[currentRoom] = mask;
-    }
-
-    // Settled-object registry: moved/sunk blocks, latched switches, pulled
-    // levers, lit torches persist across reloads and sessions — snapshot
-    // the room being left, re-apply to the room being entered.
-    snapshotRoomState(currentRoom);
+    // Dungeon rooms keep their fallen + settled objects: snapshot the
+    // room being left before the swap (see snapshotDeparture).
+    snapshotDeparture(currentRoom);
 
     currentRoom = index;
     const RoomConfig& cfg = ROOMS[index];
@@ -3814,14 +3897,26 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
     prevTileY = -1;
 
     // Spawn the room's enemy set fresh (defeated enemies stay dead until the
-    // room reloads).
+    // room reloads). A room with a "hides" pot reserves one enemy slot:
+    // the ambush must always have somewhere to spawn — a full pool would
+    // play the cue and poof with no enemy (slot 15 isn't a baked spawn,
+    // so the dungeon dead-mask identity keeps holding).
     clearWorldSystems();
-    enemyCount = cfg.enemyCount < 16 ? cfg.enemyCount : 16;
+    bool roomHidesEnemy = false;
+    for (int i = 0; i < cfg.objectCount && i < MAX_OBJECTS; i++)
+        if (objInteractions(cfg.objects[i].type, OBJINT_HIDES))
+        {
+            roomHidesEnemy = true;
+            break;
+        }
+    int enemyCap = (roomHidesEnemy && cfg.enemyCount > 15) ? 15 : 16;
+    enemyCount = cfg.enemyCount < enemyCap ? cfg.enemyCount : enemyCap;
     bool bossLives = false;
     for (int i = 0; i < enemyCount; i++)
     {
         const EnemySpawn& spawn = cfg.enemies[i];
-        if (spawn.enemy < 0 || spawn.enemy >= ENEMY_COUNT) continue;
+        if (spawn.enemy < 0 || spawn.enemy >= ENEMY_COUNT
+            || spawn.enemy >= 32) continue;  // 32 = the sheet pool size
         // Dungeon rooms keep their fallen across re-entries (the mask was
         // snapshotted on the way out); the slot stays dead-empty.
         if (cfg.dungeon && index < MAX_ROOM_MARKS
@@ -3876,6 +3971,7 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         objects[i].slideToY = objects[i].y;
         objects[i].slideT = 0.0f;
         objects[i].switchActive = false;
+        objects[i].opened = false;
         // Settled state (saved, bake-slot keyed): a moved or sunk block
         // reappears where it was left, a latched switch or pulled lever
         // stays solved, a lit torch stays lit.
@@ -3902,10 +3998,12 @@ static void loadRoom(int index, int enterMotion, int tileX, int tileY)
         objects[i].pathT = 0.0f;
         objects[i].modeTimer = 0.0f;
         // Chests stay open across reloads (permanent-until-save registry).
+        // Anything else keeps what the settled restore set above —
+        // forcing opened=false here would snuff a latched torch.
+        if (objInteracts(objects[i], OBJINT_CHEST))
         {
             int slot = index * MAX_OBJECTS + i;
-            objects[i].opened = (objInteracts(objects[i], OBJINT_CHEST)
-                                 && slot >= 0 && slot < MAX_CHEST_SLOTS
+            objects[i].opened = (slot >= 0 && slot < MAX_CHEST_SLOTS
                                  && chestOpened[slot]);
         }
     }
@@ -4462,8 +4560,8 @@ static void updateItemGet(float dt)
 
     if (itemGet.t >= RISE_DURATION && !itemGet.dialogueOpened)
     {
-        // Hold-up: apply the grant, then play the description dialogue.
-        applyChestGrant(itemGet.grantKind, itemGet.grantParam);
+        // Hold-up: the grant already landed when the chest opened / boss
+        // died (before the save banked it) — here the dialogue plays.
         buildGrantText(itemGet.grantKind, itemGet.grantParam);
         itemGetLines[0].text = itemGetText;
         itemGetLines[0].gotoLine = -1;
@@ -4483,6 +4581,26 @@ static void updateItemGet(float dt)
         itemGetLines[0].giveItem = -1;
         itemGetLines[0].choiceCount = 0;
         itemGetLines[0].choices = 0;
+        // Cutscene block: these are reused statics, so every field needs
+        // an explicit reset — a leftover cue (image scene, actor move)
+        // would re-fire on the next pickup.
+        itemGetLines[0].waitSeconds = 0.0f;
+        itemGetLines[0].camAction = 0;
+        itemGetLines[0].camTileX = 0;
+        itemGetLines[0].camTileY = 0;
+        itemGetLines[0].camSeconds = 0.0f;
+        itemGetLines[0].letterbox = -1;
+        itemGetLines[0].moveActor = -1;
+        itemGetLines[0].moveTileX = 0;
+        itemGetLines[0].moveTileY = 0;
+        itemGetLines[0].moveSeconds = 0.0f;
+        itemGetLines[0].faceActor = -1;
+        itemGetLines[0].faceDir = 0;
+        itemGetLines[0].showActor = -1;
+        itemGetLines[0].hideActor = -1;
+        itemGetLines[0].fadeTo = 0;
+        itemGetLines[0].fadeSeconds = 0.0f;
+        itemGetLines[0].imageScene = -1;
         itemGet.dialogueOpened = true;
         dialogue.open(itemGetDialogue);
     }
@@ -4724,6 +4842,11 @@ static bool updateObjectActions()
             PlaySound(sndChestOpen);
             playJingle(sndFanfare);
 
+            // Grant now, before the save banks the opened chest — a
+            // rise interrupted by a save+quit must not lose the item.
+            // The rise + dialogue below still present it.
+            applyChestGrant(o.aux2, o.aux3);
+
             // Grant rises from the chest to over the hero's head.
             Vector2 heroCenter = hero.center();
             itemGet.active = true;
@@ -4792,7 +4915,8 @@ static bool updateObjectActions()
     // Pot ambush ("hides" enemy): lifting reveals what was living
     // underneath — the room's shutter logic sees it too, like LttP.
     if (objInteracts(objects[best], OBJINT_HIDES) && objects[best].aux1 >= 0
-        && enemyCount < 16 && objects[best].aux1 < ENEMY_COUNT)
+        && enemyCount < 16 && objects[best].aux1 < ENEMY_COUNT
+        && objects[best].aux1 < 32)  // the sheet pool size
     {
         enemies[enemyCount].spawn(ENEMIES[objects[best].aux1],
                                   enemySheets[objects[best].aux1],
@@ -5518,11 +5642,29 @@ static void updateObjects()
             o.pushTimer = 0.0f;
 
             // Settle-shove: the hero squeezed onto the destination gets
-            // pushed back out along the slide direction.
+            // pushed back out along the slide direction — collision-
+            // checked, so the shove can't wedge him into a wall: straight
+            // back first, then sidesteps out from between block and wall.
             int guard = 0;
             while (overlap(hero.box(), objectBox(o)) && guard < 10)
             {
-                hero.nudge(-dirX * 4.0f, -dirY * 4.0f);
+                const Vector2 cands[3] = {
+                    { -dirX * 4.0f, -dirY * 4.0f },
+                    { dirY * 4.0f, -dirX * 4.0f },
+                    { -dirY * 4.0f, dirX * 4.0f },
+                };
+                bool freed = false;
+                for (int c = 0; c < 3; c++)
+                {
+                    Rectangle cand = hero.box();
+                    cand.x += cands[c].x;
+                    cand.y += cands[c].y;
+                    if (room.solidBox(cand)) continue;
+                    hero.nudge(cands[c].x, cands[c].y);
+                    freed = true;
+                    break;
+                }
+                if (!freed) break;  // boxed in: don't embed further
                 guard++;
             }
 
@@ -5727,6 +5869,10 @@ static void updateEnemies()
                 const RoomConfig& rc = room.config();
                 if (rc.bossFlag >= 0 && rc.bossFlag < WORLD_FLAG_COUNT)
                     gWorldFlags[rc.bossFlag] = true;
+                // The container grants now, before the save banks the
+                // kill — a rise interrupted by a save+quit must not
+                // lose it (the rise + dialogue below still present it).
+                applyChestGrant(GRANT_HEART_CONTAINER, 0);
                 saveToFile(saveSlotInUse);
 
                 itemGet.active = true;
@@ -5772,11 +5918,15 @@ static void updateEnemies()
         // Contact damage: pushed away from the enemy (dashing plows
         // through without taking damage). Behavior-set "harmless" holds
         // contact off — a submerged zora is scenery until it surfaces.
+        // The bounce is mutual: the attacker recoils too, so a
+        // same-speed pursuer can't ride right back in and pin the hero
+        // against a wall through every i-frame expiry.
         if (!dashContact && !enemy.isHarmless() && overlap(enemy.box(), heroBox))
         {
             float hdx = heroCenter.x - enemyCenter.x;
             float hdy = heroCenter.y - enemyCenter.y;
-            hero.hurt(enemy.contactDamage(), Vector2{ hdx, hdy });
+            if (hero.hurt(enemy.contactDamage(), Vector2{ hdx, hdy }))
+                enemy.bounce(Vector2{ -hdx, -hdy });
         }
     }
 }
@@ -5822,6 +5972,9 @@ static void updateProjectiles()
                     p.dx = cosf(angle);
                     p.dy = sinf(angle);
                     p.friendly = true;
+                    p.id = nextBeamSwingId--;  // fresh negative id: a
+                                               // deflected shot can hit
+                                               // strike-immune bosses
                     PlaySound(sndTink);
                     continue;
                 }
@@ -5840,6 +5993,9 @@ static void updateProjectiles()
                 p.dx = -p.dx;
                 p.dy = -p.dy;
                 p.friendly = true;
+                p.id = nextBeamSwingId--;  // fresh negative id: a batted
+                                           // volley can hit strike-immune
+                                           // bosses, and repeat hits land
                 PlaySound(sndTink);
                 continue;
             }
@@ -6744,7 +6900,11 @@ static void drawObjectsOverhead()
 // a linked room -> glide into it.
 static void maybeStartRoomTransition()
 {
-    if (roomTransition.active || dialogue.isActive() || hero.dead()) return;
+    // Like the warps: an item-get hold-up freezes the world, edges
+    // included — a boss seal dropping or a chest opening on the same
+    // frame as an edge crossing must not scroll mid-grant.
+    if (roomTransition.active || itemGet.active
+        || dialogue.isActive() || hero.dead()) return;
 
     const RoomConfig& cfg = room.config();
     Vector2 dir = hero.inputDir();
@@ -6854,19 +7014,61 @@ static void maybeStartRoomTransition()
         return;
     }
 
-    loadRoom(target, motion);
-    saveToFile(saveSlotInUse);  // LttP-style autosave on room change
-    showToast("SAVED");
+    // Arm the fade-style transition: the hero keeps striding out of the
+    // map under a dip to black; the swap + save happen under full cover
+    // at the end of the walk-off (see updateRoomTransition).
+    roomTransition.active = true;
+    roomTransition.t = 0.0f;
+    roomTransition.phase = 0;
+    roomTransition.phaseT = 0.0f;
+    roomTransition.targetRoom = target;
+    roomTransition.motion = motion;
+}
+
+// Drop an in-progress edge transition where it stands (a mid-transition
+// quit): the swap and its save never happened, so the old room's state
+// is the truth.
+static void cancelRoomTransition()
+{
+    roomTransition.active = false;
 }
 
 static void updateRoomTransition(float dt)
 {
-    // Glide the hero from the off-map start to the entry tile (ease-out).
-    // The camera stays on the ordinary clamped hero-follow, so it sits
-    // at the entry band from the first frame of the new room — the hero
-    // strides in at the edge of the frame, and nothing snaps when the
-    // transition ends (following the off-map start unclamped showed
-    // the void past the map and jumped the whole view at the landing).
+    if (roomTransition.phase == 0)
+    {
+        // Walk-off: the hero strides past the edge (collision-free nudge,
+        // camera clamped at the map band) while the screen dips to black
+        // through the departing room's palette.
+        roomTransition.phaseT += dt;
+        float dirX = (roomTransition.motion == DIR_LEFT) ? -1.0f
+                    : (roomTransition.motion == DIR_RIGHT) ? 1.0f : 0.0f;
+        float dirY = (roomTransition.motion == DIR_UP) ? -1.0f
+                    : (roomTransition.motion == DIR_DOWN) ? 1.0f : 0.0f;
+        float step = 96.0f * dt;  // the walk speed: the stride continues
+        hero.nudge(dirX * step, dirY * step);
+        // Legs + footsteps keep ticking while the world is frozen (the
+        // hero walks out, he doesn't statue-slide out).
+        hero.advanceWalkCycle(room, dt, step);
+        if (roomTransition.phaseT >= ROOM_TRANSITION_WALK_OUT)
+        {
+            // Full cover: swap rooms (the save banks here, exactly like
+            // the old at-trigger save), then fade back in over the
+            // walk-in glide loadRoom armed.
+            loadRoom(roomTransition.targetRoom, roomTransition.motion);
+            saveToFile(saveSlotInUse);  // LttP-style autosave on room change
+            showToast("SAVED");
+            roomFade = 1.0f;  // the fade back in (destination tint)
+            roomTransition.phase = 1;
+        }
+        return;
+    }
+
+    // Walk-in: glide the hero from the off-map start to the entry tile
+    // (ease-out). The camera stays on the ordinary clamped hero-follow,
+    // so it sits at the entry band from the first frame of the new room
+    // — the hero strides in at the edge of the frame, and nothing snaps
+    // when the transition ends.
     roomTransition.t += dt / ROOM_TRANSITION_DURATION;
     if (roomTransition.t >= 1.0f)
     {
@@ -6880,8 +7082,6 @@ static void updateRoomTransition(float dt)
     float dx = nx - (c.x - TILE_SIZE * 0.5f);
     float dy = ny - (c.y - TILE_SIZE * 0.5f);
     hero.nudge(dx, dy);
-    // Legs + footsteps keep ticking while the world is frozen (update()
-    // isn't called): the hero walks in, it doesn't statue-slide in.
     hero.advanceWalkCycle(room, dt, sqrtf(dx * dx + dy * dy));
 }
 
@@ -6988,6 +7188,41 @@ static void drawDoorways()
     }
 }
 
+// The in-world layers under the lightmap/chrome: room, actors, fx.
+// Safe inside any target (screen frame or render texture).
+static void drawWorldLayers()
+{
+    BeginMode2D(camera);
+    room.draw(roomTilesetTexture(), camera);
+    drawFloorObjects();
+    drawGroundFx();
+    drawEntitiesSorted();
+    drawPickups();
+    drawObjectsOverhead();
+    drawItemGet();
+    // Decor-above layer (tree tops, archways): over everything that walks.
+    room.drawUpper(roomTilesetTexture(), camera);
+    // Edge doors: archways and slabs at the wall midpoints.
+    drawDoorways();
+    EndMode2D();
+}
+
+// The in-world view (everything under the HUD and the screen chrome):
+// room, actors, fx, lightmap, tint, weather. Drawn on screen during
+// play, and into the edge-scroll snapshot at a room change.
+static void drawWorldView()
+{
+    // The lightmap renders at the default framebuffer (targets don't
+    // nest), before anything draws the world this frame.
+    renderLightmap();
+    drawWorldLayers();
+    compositeDarkness();
+
+    // Ambient tint and weather layers, under the HUD like the lightmap.
+    drawTint();
+    drawWeather();
+}
+
 static void updateAndDraw(void)
 {
     if (musicLoaded) UpdateMusicStream(music);
@@ -7080,7 +7315,10 @@ static void updateAndDraw(void)
         {
             inventory.give(giveItem);
             static char giveText[96];
-            snprintf(giveText, sizeof(giveText), "GOT %s", ITEMS[giveItem].label);
+            if (giveItem >= 0 && giveItem < ITEM_COUNT)
+                snprintf(giveText, sizeof(giveText), "GOT %s", ITEMS[giveItem].label);
+            else
+                snprintf(giveText, sizeof(giveText), "GOT SOMETHING");
             showToast(giveText);
             PlaySound(sndItemGet);
         }
@@ -7281,6 +7519,20 @@ static void updateAndDraw(void)
         if (flashTime < 0.0f) flashTime = 0.0f;
     }
 
+    // Toasts age on the game's clock, not the draw pass: a frozen world
+    // (pause, dialogue, item-get) holds the banner instead of letting it
+    // expire unseen.
+    if (gameState == STATE_PLAYING && !paused && !dialogue.isActive()
+        && !itemGet.active && !roomTransition.active && !hero.dead())
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            if (toasts[i].text[0] == '\0') continue;
+            toasts[i].age += frameDt();
+            if (toasts[i].age >= TOAST_LIFE) toasts[i].text[0] = '\0';
+        }
+    }
+
     // Low-health beeping (flashing handled in the HUD).
     if (hero.healthHalves() > 0 && hero.healthHalves() <= 2 && !paused)
     {
@@ -7352,26 +7604,11 @@ static void updateAndDraw(void)
     }
     else
     {
-    BeginMode2D(camera);
-    room.draw(roomTilesetTexture(), camera);
-    drawFloorObjects();
-    drawGroundFx();
-    drawEntitiesSorted();
-    drawPickups();
-    drawObjectsOverhead();
-    drawItemGet();
-    // Decor-above layer (tree tops, archways): over everything that walks.
-    room.drawUpper(roomTilesetTexture(), camera);
-    // Edge doors: archways and slabs at the wall midpoints.
-    drawDoorways();
-    EndMode2D();
+    drawWorldView();
 
-    // Dark rooms: lantern + torch lightmap over the world (HUD stays lit).
-    drawDarkness();
-
-    // Ambient tint and weather layers, under the HUD like the lightmap.
-    drawTint();
-    drawWeather();
+    // Edge-transition fade-out: the walk-off dips to black under the HUD
+    // (the fade back in rides the room-load fade below, over the walk-on).
+    drawTransitionFadeOut();
     }
 
     // Scripted screen fade (the "fade" cue): the whole world dips to
@@ -7547,7 +7784,7 @@ int main(int argc, char** argv)
         SetTextureFilter(characterSheets[i], TEXTURE_FILTER_POINT);
     }
 
-    for (int i = 0; i < ENEMY_COUNT && i < 16; i++)
+    for (int i = 0; i < ENEMY_COUNT && i < 32; i++)
     {
         enemySheets[i] = LoadTexture(ENEMIES[i].image);
         SetTextureFilter(enemySheets[i], TEXTURE_FILTER_POINT);
@@ -7680,9 +7917,9 @@ int main(int argc, char** argv)
                 {
                     // Tuning sandbox: the named enemy drops in two tiles
                     // from the hero (clamped inside the map). The sheet
-                    // pool holds 16 textures, like the room spawner.
+                    // pool holds 32 textures, like the room spawner.
                     int enemyIndex_ = enemyIndex(testEnemy);
-                    if (enemyIndex_ >= 0 && enemyIndex_ < 16)
+                    if (enemyIndex_ >= 0 && enemyIndex_ < 32)
                     {
                         Vector2 heroTile = { floorf(hero.center().x / TILE_SIZE),
                                              floorf(hero.center().y / TILE_SIZE) };
@@ -7742,15 +7979,17 @@ int main(int argc, char** argv)
     UnloadTexture(uiMagicBarTexture);
     UnloadTexture(uiMagicGaugeTexture);
     UnloadTexture(uiCountersTexture);
+    UnloadTexture(uiDoorsTexture);
+    UnloadTexture(uiCountersTexture);
     for (int i = 0; i < 16; i++)
     {
         if (characterSheets[i].id != 0) UnloadTexture(characterSheets[i]);
     }
-    for (int i = 0; i < 16; i++)
+    for (int i = 0; i < 32; i++)  // the pool size; loads cap at ENEMY_COUNT
     {
         if (enemySheets[i].id != 0) UnloadTexture(enemySheets[i]);
     }
-    for (int i = 0; i < 16; i++)
+    for (int i = 0; i < 32; i++)  // the pool size; loads cap at OBJECT_COUNT
     {
         if (objectSheets[i].id != 0) UnloadTexture(objectSheets[i]);
     }

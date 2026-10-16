@@ -54,6 +54,13 @@ public:
     // Stun (boomerang, wall crashes): freeze AI for the given seconds.
     void stun(float seconds);
 
+    // Contact-damage recoil: the attacker bounces off the hero too
+    // (LttP's mutual shove) and rides its HURT->PAUSE recovery. Without
+    // it, a same-speed pursuer just strides back in during the hero's
+    // i-frames and the hero dies pinned. Bosses keep their choreography
+    // and frozen enemies stay frozen (they can't chase anyway).
+    void bounce(Vector2 dir);
+
     // Bug net agitation: the swished enemy dashes about, faster and
     // erratic, for the given seconds (no damage — it's a net).
     void agitate(float seconds);

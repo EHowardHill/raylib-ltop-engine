@@ -6,9 +6,11 @@
 // Lazy sfx cache for data cues and LazySound wrappers (name -> loaded
 // Sound). One shared cache: footsteps, engine feedback banks, hero cues,
 // and dialogue letters all decode here on first use and stay for the
-// session. The cap covers a game's whole working set; overflow reuses
-// slot 0 (playing a wrong cue beats crashing).
-static const int MAX_NAMED_SFX = 64;
+// session. The cap covers a game's whole working set (the baked content
+// alone cites ~73 distinct names); overflow reuses slot 0 with a logged
+// warning (playing a wrong cue beats crashing, but it should be heard
+// about too).
+static const int MAX_NAMED_SFX = 128;
 struct NamedSfx
 {
     char name[96];
@@ -35,6 +37,8 @@ static Sound& loadNamedSfx(const char* name)
         return namedSfx[i].sound;
     }
     // Cache full: reuse slot 0 (playing a wrong cue beats crashing).
+    TraceLog(LOG_WARNING, "SFX cache full (%d): '%s' plays slot 0's cue",
+             MAX_NAMED_SFX, name);
     return namedSfx[0].sound;
 }
 

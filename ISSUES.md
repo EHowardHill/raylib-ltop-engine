@@ -1,349 +1,158 @@
-# ISSUES — engine + game polish backlog
+[ ] - Not done
+[X] - Done
+[?] - Needs question answered
+[/] - Partially done
 
-Found by a full source pass (src/, include/, scripts/, resources/code/,
-resources/ content). Each item cites where it lives and what a fix looks
-like. Priorities: **P0** = players will notice, **P1** = polish that
-reads as "unfinished", **P2** = hardening / ergonomics / tuning.
+Issues:
 
-**Status after the second fix pass** — first pass resolved A1-A3, B1-B3,
-B5, B6, C1, C2, C4, C5, D1, D2, F1, F2. Second pass resolved B4, B7, C3,
-D3, D5, D6, E1, E2, E3, E4, F3, F4, F5. Still open: C6 and D4 (both
-"keep it working" notes, no action), E5 (crypt footsteps want a stone
-step cue the audio bank doesn't carry), E6 (the editor's asset audit is
-the ongoing artist worklist by design). Resolved items keep their notes
-below, marked **[FIXED]** with what the fix did.
+[X]
+Right now, moving from one map to another when I go north, south, etc.. is just static. I want there to be some kind of visual transition, perhaps like Link to the Past where it looks sort of like it scrolls.
+Fixed (v2, fade style — replaced the v2 scroll-snapshot pan): the hero keeps striding out of the map while the screen dips to black through the departing room's palette; the room swap + autosave happen under full cover; then the destination fades back in (its own tint) over the hero's walk-on glide from the entry edge. Phase machine in updateRoomTransition, fade drawn in drawTransitionFadeOut, arm in maybeStartRoomTransition (src/main.cpp). Total ~0.7s.
 
----
+[X]
+For some reason, a fullscreen graphic appears in the background whenever the dialogue comes after getting an item. This feels like a glitch. It's the same background as the "Developer" opening logo.
+Fixed: the item-get line left imageScene unset (0 = company logo scene); it is now reset to -1 before the dialogue opens (src/main.cpp updateItemGet).
 
-## A. Dialogue & text (P0)
+[X]
+Every time I get an item, after its dialogue plays, it continues with the sword dialogue every single time. This feels wrong.
+Fixed: itemGetDialogue left nextDialogue unset (0 = aaron.json chain); it is now -1 (src/main.cpp).
 
-### A1. [FIXED] Long lines silently clip — text types out but never draws
-`src/dialogue.cpp:8-11` — the box wraps up to `MAX_ROWS = 8` but only
-`BOX_ROWS = 3` draw (`dialogue.cpp:669-686`). Anything wrapping past three
-rows typewrites invisibly: the player hears the letter ticks, the blinking
-arrow appears, and words are simply missing. The generator never warns
-about overlong lines, so this shipped in 26 places. Verified offenders in
-the current content (all >70 chars, ~24 chars fit per row):
-`intro` lines 1 & 7, `elder` lines 1/3/5/8/9, `aaron` lines 1/4/5/7/9,
-`beat_hollow`, `beat_meadow` (94 chars), `beat_ridge`, `beat_shore`,
-`beat_village`, `keeper` lines 2/4/5, `sign_east` line 1 (90 chars),
-`sign_controls` lines 0/2, `sign_crypt` line 0, `peek_big_door`,
-`sign_village` line 1.
-**Fix applied:** pagination — the box shows three rows of the wrap at a
-time; the typewriter works within the page, a press (or, on timed
-beats, the beat) turns the page, and the arrow prompts the turn. Long
-lines now read completely; the full-line generator warning became moot
-(a choice-prompt warning was still added, see D2).
-1. Engine: paginate instead of clip — when a line wraps past 3 rows, draw
-   rows 1-3, and on action-advance scroll to the remaining rows instead of
-   advancing the line (LttP pages long text). Cheap alternative: cap the
-   typewriter at the 3rd row and treat that as the line's end (content-safe
-   but still needs the generator warning).
-2. Generator: `generate_assets.py` should measure wrapped rows at bake
-   (same wrap width math as the engine, `boxWidth - 2*(patch+TEXT_PAD_X)`,
-   16px font) and `warn()` on any line over 3 rows.
+New issues found in a full-source audit (src/, include/, resources/code/, build scripts). Grouped by severity, ranked within groups.
 
-### A2. [FIXED] Cutscene "wait" beats cannot be skipped — the code says they can
-`src/dialogue.cpp:374-381` — the wait/credits branch `return`s before the
-action-press check at line 439 ever runs, so the comment "the button can
-still hurry a beat along" is false. The 3.4s intro beats and every credits
-line (`CREDITS_BEAT`, 11 lines x ~1.6s+) are unskippable.
-**Fix applied:** wait/credits beats now advance early on an action press
-(first press finishes the page reveal, second skips the hold) — including
-silent beats and credits lines.
+HIGH:
 
-### A3. [FIXED] Choices can overlap the prompt text
-`src/dialogue.cpp:558-594` — options stack in the box's bottom-right
-regardless of how many text rows the prompt used. A 2-row prompt with
-3 choices overlaps the last text row. Current content stays safe (short
-prompts, 2 choices) but it's one long shop line away from breaking.
-**Fix applied:** prompts cap at two drawn rows while options are up, and
-the option stack starts below them (right-aligned as before). A bake
-warning now flags >48-char choice prompts.
+[X]
+Starting a new game inherits the previous session's world state. resetGameState() (src/main.cpp:1655) never clears dungeonDead[] (dead-enemy masks for dungeon rooms) or the settled-object registry (pushed blocks, latched switches, lit torches) — those are only reset in applySave(), the continue/load path. So: play a session, save+quit to title, start a new game, and the crypt rooms spawn pre-solved/pre-cleared. Worse, startNewGame() immediately saveToFile()s, baking the stale settled registry into the brand-new save permanently.
+Fixed: resetGameState() now clears dungeonDead[] and settledCount (src/main.cpp).
 
----
+[X]
+Lit torches don't stay lit. In loadRoom()'s object spawn loop, the settled-registry restore sets a torch's opened=true (src/main.cpp:3943-3947), but the unconditional chest-registry assignment right after (src/main.cpp:3956-3962) forces opened back to false for anything that isn't a chest. Light a torch, walk out, walk back in: the dark room is dark again, linked barriers re-raise, and the next snapshot permanently downgrades the registry.
+Fixed: the chest-registry assignment only applies to actual chests; non-chests keep the settled restore's opened (which is now explicitly initialized to false first) (src/main.cpp loadRoom).
 
-## B. Combat & item feel (P0/P1)
+[X]
+Dark rooms break the new edge-scroll snapshot. captureRoomScroll() wraps drawWorldView() in BeginTextureMode(roomScroll.texture) (src/main.cpp:2983), but drawDarkness() issues its own BeginTextureMode(lightRT) (src/main.cpp:3092) — raylib render targets don't nest, so the inner EndTextureMode rebinds the default framebuffer. The darkness/tint/weather layers end up drawn to the screen mid-update, and the sliding snapshot has no darkness: a pitch-black crypt flashes fully lit for the 0.42s transition. Reachable in-game: the two dark crypt rooms both have edge exits.
+Fixed: drawDarkness() split into renderLightmap() (default framebuffer) + compositeDarkness() (safe inside a texture mode); captureRoomScroll() renders the lightmap first, then bakes layers + composite + tint + weather into the snapshot.
 
-### B1. [FIXED] Boomerang/hookshot stun + sound spam every frame
-`src/main.cpp:5970-5978` and `src/main.cpp:6014-6022` — while the
-boomerang (or hook head) overlaps an enemy it calls
-`enemies[e].stun(1.2f)` + `PlaySound(sndBoomerangHit)` *every frame*.
-The comment claims "once per stun period" but there is no dedupe: the
-sound machine-guns (~60/sec) and the stun timer keeps resetting so the
-enemy stays frozen as long as the tool sits on it.
-**Fix applied:** the boomerang and hookshot passes skip enemies already
-stunned or frozen — one stun, one cue.
+[X]
+Chest and boss rewards can be permanently lost. Opening a chest banks chestOpened=true and saveToFile()s immediately (src/main.cpp:4791-4813), but the grant is only applied when the item-get rise finishes 0.65s later (src/main.cpp:4515-4519) — and pausing isn't blocked during the rise. Open a chest, then save+quit during the rise: the save has the chest open with the item never granted. Same pattern for boss heart containers (src/main.cpp:5783-5809).
+Fixed: the grant is applied at arm time (chest open / boss kill, before the save banks the state); the rise + dialogue still present it.
 
-### B2. [FIXED] Frozen and agitated bosses draw at the wrong size
-`src/enemy.cpp:546-557` (frozen) and `src/enemy.cpp:580-590` (agitated
-flicker) draw a plain 32x32 sprite at `(x, y)` — bosses are 1.5x (see the
-normal path at `enemy.cpp:498-520`, and the hurt-flash branch at 566 which
-gets it right). Freeze the Hollow King or the Ash Knight with the ice rod
-and it visually shrinks by a third.
-**Fix applied:** both branches draw the 1.5x boss rect (the frozen ice
-overlay scales with it).
+[X]
+The hollow king's own intended fight mechanic is dead. All enemy projectiles spawn with hardcoded id = 0 (src/main.cpp:1004), and shield/sword deflection flips p.friendly without assigning a fresh negative swing id (unlike beams/arrows/bombs/pots). tryHit() rejects swingId >= 0 against strikeImmune enemies (src/enemy.cpp:242), so batted volleys pass through the hollow king harmlessly — the fight is designed around batting his magic back (see wizard.cpp's comment and the in-game hint). Also, all deflected rocks share id 0, so the lastSwing dedupe eats repeat hits.
+Fixed: both deflection paths assign a fresh negative id (nextBeamSwingId--), so batted volleys damage strike-immune bosses and repeat hits land.
 
-### B3. [FIXED (engine seam; the ripple-frame art stays as E3)] Submerged zoras hurt on contact and never actually submerge
-`resources/code/zora.cpp` models idle as "under water", but the engine
-(`src/main.cpp` contact-damage pass in `updateEnemies`) applies contact
-damage in every mode, and the sprite always draws its stand frame. So a
-"lurking" zora both stabs the hero on contact while invisible-by-intent
-and shows its full body. LttP zoras are harmless while submerged.
-**Fix applied:** new `Enemy::setHarmless` seam; the zora behavior holds
-contact damage off while submerged (spikes it back on when surfaced).
-The ripple-frame art remains open as E3.
+[X]
+One ice bolt + any sword swing kills anything, including bosses. tryHit()'s frozen branch (src/enemy.cpp:244-252) sets hp = 0 and returns before the attack-box validation/overlap checks at lines 254-259 — only the swing-id dedupe runs. Freeze any enemy (or boss) with the ice rod or Ether, then swing anywhere in the room (even with the hammer's zero-width windup box): every frozen enemy shatters instantly, and boss weak-point design (moldorm, hollow king HP bars) is bypassed entirely.
+Fixed: the frozen branch now runs after the box-validation/overlap checks — a hit must actually land to shatter (src/enemy.cpp tryHit).
 
-### B4. [FIXED] Costs pay and sfx play before the use-action is known to succeed
-`src/main.cpp:2541-2701` — costs are consumed and `item.useSfx` plays at
-line 2701 even when the action was a no-op: pressing the item button while
-the boomerang is airborne (`throwBoomerang` returns silently at
-`src/main.cpp:1050`), a second hookshot press while the chain flies
-(`2612-2627`), or the flute while the picker is already open. Harmless
-with cost-free tools today, but the pattern will charge real magic for
-future items that can no-op.
-**Fix applied:** an `itemUseReady` pre-pass answers "can this press do
-anything?" (boomerang airborne, chain out, picker open, toggle with no
-magic, empty bottle, mirrorless room) — no-op presses rattle the error
-cue and never reach the costs or the use sfx; every real use pays once.
+[X]
+Dialogue can soft-lock the game. In DialogueBox::update(), the wait/credits branch always returns before the choice branch (src/dialogue.cpp:422-441 vs. 443+): a line authored with both "choice" and "wait" (or any choice line in a credits script) can never be answered — the cursor can't move, selection is blocked by the !choiceActive guards, and the world stays frozen while dialogue.isActive() is true. The box hangs forever.
+Fixed: the wait/credits branch is skipped for choice lines (their wait is ignored) — choices always take the interactive path (src/dialogue.cpp update).
 
-### B5. [FIXED] Knockback pushes the hero across water and pit tiles
-The `HERO_HURT` case in `Hero::update` (`src/hero.cpp`, knockback pass)
-never re-runs the tile checks that `HERO_WALK/IDLE` do at
-`src/hero.cpp:1100-1128`, so a hit near deep water or a pit slides the
-hero onto it for the hurt duration (~0.28s) — she stands on the sea, then
-splashes/falls when the flinch ends.
-**Fix applied:** the hurt state re-checks the underfoot tile each frame
-— deep water splashes (or dives with flippers) and pits swallow mid-flinch.
+MEDIUM:
 
-### B6. [FIXED] Enemies hover over pit tiles
-`Enemy::slide` (`src/enemy.cpp:103-136`) treats pits (and water) as
-walkable, so knockback or wandering drops octoroks onto the Mire's pit
-lake where they float. In `13_crypt_pit` this is visible from the bank.
-**Fix applied:** `Enemy::slide` refuses pit and deep-water tiles —
-walkers and knockback turn at the lip (stationary water natives like the
-zora are unaffected).
+[X]
+Arrows and beams inherit stale magic fields from the shared 8-slot projectile pool. spawnArrow (src/main.cpp:2271-2302) never resets element; spawnBeam (src/main.cpp:1016-1045) omits element; spawnElementProjectile (src/main.cpp:2305-2334) omits enemyDamage. Fire a fire-rod bolt, then fire an arrow once the slot frees: it's drawn as a fireball, ignites torches it passes, and never looks like an arrow.
+Fixed: spawnArrow/spawnBeam reset element (and arrow) to none; spawnElementProjectile resets enemyDamage (src/main.cpp).
 
-### B7. [FIXED] Octorok "period" semantics
-`src/enemy.cpp:482` — the shoot cadence is `rng.range(shootPeriod) == 0`
-per idle leg; with the shipped `shoot_period: 2` that's a coin flip each
-leg (~every other leg), and the walk leg *also* lasts `shootPeriod`
-seconds, so the number means two different things.
-**Fix applied:** the idle beat queues its rock unconditionally — the
-number is the cadence (idle pause + `shootPeriod`-second walk leg), not
-a dice roll. No content change needed; `shoot_period: 2` now means a
-spit roughly every 2.2s.
+[X]
+Save+quit from the pause menu silently loses room-local puzzle progress. quitToTitle() (src/main.cpp:1710-1720) saveToFile()s without snapshotRoomState(currentRoom) or a dungeonDead update — those only happen inside loadRoom(). Push a block onto its latch or light a torch, then save+quit: on continue it's back where it was at the last room exit, despite the "saved" promise.
+Fixed: new snapshotDeparture() (dungeon dead-masks + settled registry) shared by loadRoom and quitToTitle (src/main.cpp).
 
----
+[X]
+The roomScroll render texture leaks if you quit during an edge transition. Pausing isn't blocked mid-scroll; save+quit calls quitToTitle() with roomScroll.valid true, and the release only exists in updateRoomTransition's natural completion (src/main.cpp:6948-6949) and the next capture. loadRoom() clears roomTransition.active directly (src/main.cpp:3824, 3858) without releaseRoomScroll(), so a full-screen FBO lingers across the title screen into the next session.
+Fixed: quitToTitle() calls releaseRoomScroll() (src/main.cpp).
 
-## C. Boot / title / rooms (P1)
+[X]
+maybeStartRoomTransition() is missing the itemGet.active freeze guard (src/main.cpp:6818 vs. updateWarps' check at 4296). If a boss seal drops or a chest opens on the same frame the hero crosses an edge, the room transition starts mid item-get; the rise then resumes with stale old-room coordinates.
+Fixed: the guard now includes itemGet.active (src/main.cpp).
 
-### C1. [FIXED] The scroll-in glide plays idle frames, not a walk cycle
-`Hero::place` (`src/hero.cpp:181`) resets the state to `HERO_IDLE`, and
-`placeHeroAtEntry` (`src/main.cpp:3618`) places the hero before the glide
-starts. `advanceWalkCycle` then ticks `animTime`, but `animFrames()`
-(`src/hero.cpp:1140+`) picks the *stand* channel for `HERO_IDLE` — so the
-walk-in glide (fixed for camera snap + clock earlier) still glides with a
-slow breathing frame instead of striding.
-**Fix applied:** `advanceWalkCycle` switches the gliding hero from idle
-into the walk state; the next update settles back to idle on landing.
+[X]
+The SFX lazy cache (64 slots, src/sfx.cpp:11) is smaller than this game's own sound set (~73 distinct names); overflow silently returns namedSfx[0].sound — every cue past the 64th plays the wrong sound for the rest of the session, with no log.
+Fixed: cache raised to 128 slots (covers the baked set plus headroom) and overflow now logs a warning (src/sfx.cpp).
 
-### C2. [FIXED] "Open" doors render as nothing
-`src/main.cpp` `drawDoorways` (~6820-6880) — `if (rule.startsOpen)
-continue;` means the `open` kind draws no archway at all. The village's
-east gate and the grove's west gate declare `"open"` doors that are
-invisible; the player gets a slab for locked/shutter/bombable but bare
-wall for the one door type meant to look welcoming.
-**Fix applied:** removed the `startsOpen` skip — open doors draw the same
-archway as an opened one.
+[X]
+The bug net bottles bees/fairies into phantom slots when the hero owns no bottles. firstEmptyBottle() (include/engine.h:733-738) scans bottleContents[4] without checking bottles > 0, so it returns slot 0 for a bottleless hero; the catch paths (src/main.cpp:5329, 5338-5367) write it anyway and the bee despawns from the world. When the first real bottle is later granted, it shows the phantom contents instead of what was granted.
+Fixed: firstFilledBottle/firstEmptyBottle only scan owned slots (i < bottles), so a bottleless hero fails the catch and the bee stays in the world (include/engine.h).
 
-### C3. [FIXED] Doorways are code-drawn rectangles
-Same function — slabs, keyhole slabs, shutter slats, archways are all
-`DrawRectangle`/`DrawRectangleLinesEx` shapes in an engine whose stated
-rule is "all chrome is sprites". They read as debug gizmos next to the
-pixel-art tileset.
-**Fix applied:** `ui/doors.png` (six kinds x two orientations, 40x48
-cells, columns matching the generator's kind order with the open
-archway at column 0) draws via `drawDoorways`; the generator synthesizes
-the sheet for scaffold games, and the code-drawn shapes remain as the
-missing-art fallback.
+[X]
+The hero can be wedged inside colliders with no recovery. slideWithCollision (src/hero.cpp:278-289) rejects any move whose destination overlaps a solid, so once embedded beyond a walk step (~4.8px) every escape attempt fails and the game is permanently stuck. Three paths can embed him: the settle-shove nudges the hero up to 40px with no solid check when a block lands on him (src/main.cpp:5592-5599), cutscene glides never validate the target/path (src/main.cpp:806-810), and hop landings only validate the landing box at press time (src/hero.cpp:482-483).
+Fixed: the settle-shove is collision-checked (straight back, then sidesteps); cutscene glides validate the hero's destination via the new Hero::canOccupyTile; hop landings re-check collision at land time and step out along the hop axis (src/main.cpp, src/hero.cpp).
 
-### C4. [FIXED] Keeper reveal requires leaving the room
-NPC spawn tables evaluate at room entry only. The shrine sets
-`keeper_awake` mid-visit (`main.cpp` shrine/powder pass), but the keeper
-NPC (`03_grove`, `if: keeper_awake`) won't appear until the player exits
-and re-enters — the powder's payoff is invisible exactly when it happens.
-**Fix applied:** shrines take an optional `"dialogue"` (baked like a
-sign's, played at the awakening moment). The grove shrine now plays a
-short keeper-wakes beat — the stone stirs and says he'll wait by the
-path — and the keeper spawns there (next to the path) on re-entry.
+[X]
+Dialogue text wrapping silently misbehaves on long content. Lines that wrap past 8 rows truncate (src/dialogue.cpp:292) but totalChars still counts the tail (src/dialogue.cpp:281) — the typewriter types invisible characters and the box dead-airs before advancing. A single word ≥ 255 chars (src/dialogue.cpp:312) makes the line render as an empty box that still takes full reveal time.
+Fixed: a word wider than the row buffer hard-breaks instead of stalling, and the typewriter's totalChars is capped at the truncation point — no more dead-air typing (src/dialogue.cpp wrapLine).
 
-### C5. [FIXED] The title logo skip cuts before its fade-out
-`src/main.cpp` `updateLogo` — skipping with the action jumps straight to
-`enterTitleScreen(0)`, so the logo's fade-out never renders; only the
-title card's fade-in covers the cut. Feels abrupt on repeated boots.
-**Fix applied:** a press clamps the logo clock to the fade-out start, so
-the cut to the title card is always a fade.
+[X]
+The Pegasus dash ignores tile hazards. Deep water/pits are only sampled in the IDLE/WALK case (src/hero.cpp:1140-1155); HERO_DASH (src/hero.cpp:685-703) only slides with collision, so a ~3.6-tile dash crosses pits and deep water with no consequence — unless the dash happens to end over one, where the result is arbitrary.
+Fixed: HERO_DASH samples deep water/pits each frame and hands over exactly like a walk (splash, or dive with flippers) (src/hero.cpp).
 
-### C6. `--room` test sessions and the boot cards
-`main.cpp` boot (`if (GAME_LOGO_SCENE >= 0 ...)`) runs before the
-`--room` parsing, harmless — but worth keeping the test session immune to
-future boot-flow work (e.g. a skip-all flag for CI runs).
+LOW:
 
----
+[X]
+Spike tiles qualify as "safe" respawn tiles (the safe-tile record and the damage-tile check share a branch, src/hero.cpp:1156-1163), and place() zeroes invulnTime (src/hero.cpp:197) — so falling into a pit near spikes respawns the hero onto the spikes and he's instantly re-hurt.
+Fixed: damage tiles are never recorded as safe respawn tiles (src/hero.cpp).
 
-## D. Generator / validation / editor gaps (P2)
+[X]
+startLine() reads gWorldFlags[line.ifFlag/unlessFlag] with only a >= 0 check, no upper bound (src/dialogue.cpp:173-174) — every other flag access in the codebase is bounds-checked. An out-of-range index from a game file is an out-of-bounds read deciding script flow.
+Fixed: both condition reads are bounds-checked against WORLD_FLAG_COUNT (fail open) (src/dialogue.cpp).
 
-### D1. [FIXED] Dialogue references don't accept stems
-`scripts/generate_assets.py:4144` — `dialogue_index` keys by file name
-only (`"sign_x.json"`); rooms/scenes accept file-or-stem
-(`room_index`, `scene_lookup` do both). Rooms referencing `"sign_x"`
-silently warn-then-bake as unknown. Inconsistent reference rules.
-**Fix applied:** dialogue references accept the file name or the stem,
-matching rooms and scenes.
+[X]
+The spin-charge "hold through the swing" is dead code: swordHeldTime only accumulates in the IDLE/WALK case (src/hero.cpp:995-1003), so the check in HERO_ATTACK (src/hero.cpp:673-677) never fires — charged-spin timing is ~0.3s longer than the comment describes.
+Fixed: swordHeldTime also accumulates during HERO_ATTACK while the button is held, so a held swing charges the spin as documented (src/hero.cpp).
 
-### D2. [FIXED (superseded)] No bake-time check for dialogue lines that clip
-See A1 — the generator should warn on >3-row wraps so content can't ship
-clipped again.
+[X]
+gotoLine jumps (line goto at src/dialogue.cpp:348, choice goto at 491) are never bounds-checked against lineCount — an off-by-one goto silently skips the rest of the script (or chains into nextDialogue) with no warning.
+Fixed: both goto sites bounds-check against lineCount; an out-of-range goto falls through as a normal advance (src/dialogue.cpp).
 
-### D3. [FIXED] Editor asset rename doesn't know about the boot cards
-`editor/src-tauri` rename-in-place rewrites JSON references across
-rooms/dialogue — verify (and extend it to) `game.json`'s
-`logo.image` / `title_card.image` / `logo.sfx` / `title_card.music`, or
-renaming `company_logo.png` orphans the splash.
-**Fix applied:** the exact file-name form was already covered by the
-generic reference pass; a new `patch_game_card_stems` also rewrites
-stem-form `logo.image` / `title_card.image` on scene renames (sfx and
-music fields are plain file names — exact pass covers them).
+[X]
+Choice prompts are clamped to 2 visible rows (src/dialogue.cpp:736) but the reveal/pick still requires the full multi-row text (src/dialogue.cpp:370-373) — a 3+ row prompt shows an incomplete question under the option list.
+Fixed: the reveal/pick now gates on exactly the two visible rows (pageEnd caps at row 2 for choice lines) — the box's two-row-plus-options layout is the design constraint, but nothing invisible is typed or waited on anymore (src/dialogue.cpp update).
 
-### D4. `game.json` logo with text but no image
-A text-only logo (`"logo": {"text": ...}`) does play (boot checks
-`GAME_LOGO_TEXT`), but `enterLogoScreen` calls
-`applySceneImageRequest(-1)` which *clears* the scene — correct, just
-confirm the black-card + studio-line path stays intended (it currently
-renders fine; this is a "keep it working" note for future card work).
+[X]
+Toggle items (Byrna/Cape) pay their magic cost before the toggle-off branch runs (src/main.cpp:2590-2612 vs. 2688-2715): turning the aura off costs magic. Latent today (those items carry no magicCost in the data) but any priced toggle item triggers it.
+Fixed: a toggle-off use skips all use-costs (src/main.cpp useEquippedItem).
 
-### D5. [FIXED] `tileMetaAt` ORs both layers' flags
-`src/room.cpp:75-109` — decor + collider metadata merge. A solid tile
-drawn over a hazard decor tile (e.g. a rock collider over a spike decor)
-would both block *and* damage. No shipped room does this; either assert
-against it at bake or document the layering semantics.
-**Fix applied:** the bake now warns when a colliders-layer tile's metadata
-marks it a pit, cuttable, or deep water — solids can't cut, fall, or
-swim.
+[X]
+Shutdown leaks textures: objectSheets are loaded for all 20 object types but the unload loop caps at 16 (src/main.cpp:7833-7845), and uiDoorsTexture (loaded via the uiSheets table) is missing from the unload list (src/main.cpp:7816-7828). Process-exit leaks, but they matter more on the web/Dreamcast targets.
+Fixed: the unload loop covers the whole 32-slot pool, and uiCountersTexture/uiDoorsTexture join the unload list (src/main.cpp).
 
-### D6. [FIXED] `cutTileAt` only rewrites the decor layer
-`src/room.cpp:111-121` — a cuttable tile living in the colliders layer
-would cut visually (decor) but stay solid. Not reachable with the shipped
-tileset (grass tuft is decor-only); guard at bake instead (warn when a
-cuttable tile is also a collider).
-**Fix applied:** the same layer-conflict guard warns when cuttable decor
-sits under a collider — the cut would leave the wall standing.
+[X]
+The music loaders strcpy a 600-byte path into 512-byte globals (musicFile at src/main.cpp:28/2841, dangerFile at 35/2885) — every sibling function uses bounded copies; a long filename overflows the static buffer.
+Fixed: musicFile/dangerFile are sized 600 like the path buffers they copy (src/main.cpp).
 
----
+[X]
+Toasts age inside the draw pass (src/main.cpp:3396-3421): a "SAVED" banner keeps expiring while the game is paused/frozen instead of lasting its 2s of gameplay.
+Fixed: toasts age in the update path on the game's clock (frozen worlds hold the banner); the draw pass only renders (src/main.cpp).
 
-## E. Art / presentation (P1 — the "all chrome is sprites" debt)
+[X]
+The dialogue give drain reads ITEMS[giveItem].label without a bounds check (src/main.cpp:7192-7199); applyChestGrant validates the identical lookup. Only reachable with hand-edited baked data, but the guards should match.
+Fixed: the label lookup is bounds-checked like applyChestGrant (src/main.cpp).
 
-- **E1. [FIXED] Code-drawn hero tools** — the hammer mallet
-  (`src/hero.cpp:1406-1456`), shovel (`1458-1501`), bug net
-  (`1503-1530`), and raised shield plate (`1585-1603`) are rectangles
-  and lines over the sprite. They work but read as placeholders next to
-  the item icons. Add small sprite sheets (like `link_sword.png`) for
-  hammer/shovel/net/shield and draw from those.
-  **Fix applied:** `effects/tools.png` (hammer/shovel/net/shield), drawn
-  by rotation around the handle-base pivot so one frame per tool serves
-  every facing; the code-drawn shapes remain as the missing-art fallback.
+[X]
+markDoorOpened() indexes ROOMS[roomIndex] before validating roomIndex (src/main.cpp:1316); its sibling doorKind() validates. Latent (all callers pass currentRoom) but it's an unvalidated-index pattern the rest of the door code avoids.
+Fixed: markDoorOpened validates roomIndex up front like its sibling doorKind (src/main.cpp).
 
-- **E2. [FIXED] Moldorm trail is brown circles** — `src/enemy.cpp:526-536`; the
-  worm body is placeholder `DrawCircle` segments. Ship tail-segment
-  sprites (the trail API exposes per-segment positions).
-  **Fix applied:** the trail draws the worm's own sprite frames, shrinking
-  down the chain — no new assets, and the body and tail read as one
-  creature.
+[X]
+Boss-defeat persistence silently fails for room indices >= 32: bossDefeated slots are keyed room*16+i against MAX_BOSS_SLOTS=512 (src/main.cpp:5793-5795, 3882-3885) while the engine supports 128 rooms — the bounds guard masks the dropped flag, so bosses past room 32 respawn despite the fanfare/save. Current game (17 rooms) unaffected.
+Fixed: MAX_BOSS_SLOTS is sized MAX_ROOM_MARKS * 16 so every room registers; save version bumped to 10 (older saves are rejected as usual on version change) (src/main.cpp).
 
-- **E3. [FIXED] Zora has no submerged frame** — see B3; its idle channel should
-  be a ripple, its move channel the surfaced body (the behavior's
-  comment says the channels were designed for exactly this — the sheet
-  just doesn't carry it).
-  **Fix applied:** the zora sheet's stand row is regenerated as water
-  ripple rings (the move row keeps the surfaced body), and the json's
-  move channels now point at the body frames only — surfacing never
-  flickers back to the ripple.
-  **Fix applied:** the zora sheet's stand row is regenerated as water
-  ripple rings (the move row keeps the surfaced body), and the json's move
-  channels point at the body frames only — surfacing never flickers back
-  to the ripple.
+[X]
+enemySheets[16] is indexed by spawn paths that only validate against ENEMY_COUNT (src/main.cpp:3886, 4869-4870) — a game with 17+ enemy types reads past the pool (the generator only warns). Current game (10 types) unaffected.
+Fixed: the sheet pool is 32 (like the object pool), with the load/unload loops and every spawn path (room, ambush, test sandbox) clamped to it (src/main.cpp).
 
-- **E4. [FIXED] The house door is a warp pad** — village Rowan's door is a
-  `wall_house` gap with the generic swirl pad sprite. A small door-frame
-  sprite (or a dedicated `door` object type drawing over the gap) would
-  sell "this is a house" much better.
-  **Fix applied:** new `door_warp` object type (composes the same floor +
-  warp interactions) with a generated front-door sprite; the village and
-  elder-house entrances use it, and the cave mouths keep the swirl.
+[X]
+Pot-ambush enemies silently vanish when the enemy pool is full: the "hides" spawn is gated by enemyCount < 16 (src/main.cpp:4866-4876), and the generator permits 16 baked enemies per room, so a full room plays the ambush cue and poof with no enemy.
+Fixed: rooms with a "hides" pot reserve one enemy slot (baked spawns cap at 15), so the ambush always has somewhere to spawn; the reserved slot isn't a baked spawn, so the dungeon dead-mask identity holds (src/main.cpp loadRoom).
 
-- **E5. Crypt footsteps say grass** — every room, stone crypts included,
-  cues `walk_grass.wav` (room `walk_sfx` in `scripts/game_rooms.py`).
-  No stone-step variant exists in `resources/audio/`; either source one
-  or accept the swap as a known compromise and note it.
-- **E6. Placeholder object/scene art audit** — `resources/objects/*.png`
-  and the storybook cards are the generator's shaded-shape placeholders
-  plus the new generated scenes; fine at distance but the art audit in
-  the editor (`Music & Files` tab) should be run as the artist worklist
-  it was built to be.
+[X]
+The wizard behavior breaks engine contracts: it teleports immediately on hit-recovery pause (bypassing the 0.4s stun, resources/code/wizard.cpp:83-90), permanently idles on maps smaller than 4x4 tiles (wizard.cpp:42, wedging any clear-the-room door), and teleports to solidity-unchecked anchors that can bury its boss box in a wall.
+Fixed: the PAUSE hop waits out the engine's 0.4s hold (hit stuns stay visible), anchors are clamped to the map instead of wedging small arenas, and hops solidity-check each anchor — boxed in, the wizard holds position and keeps firing (resources/code/wizard.cpp).
 
----
+[X]
+build-mac.sh isn't cwd-safe and doesn't fail fast: no cd "$(dirname "$0")" and no set -e (unlike build-web.sh and build-dreamcast.sh), so running it from another directory resolves paths against the wrong cwd, and a generator failure still compiles stale baked data.
+Fixed: set -e + cd to the script directory, matching the other build scripts (build-mac.sh).
 
-## F. Content bugs in the shipped game (P0/P1)
-
-- **F1. [FIXED] Mara's stall blocks the north path column** —
-  `scripts/game_rooms.py` `village()`: the stall paints `F.F` at
-  y2 x11-13, putting a fence post at (13,2) in the middle of the x13
-  gate path. Walking straight south from the gate at x13 bumps the
-  post. Move the stall west one tile or narrow the gate path usage.
-- **F2. [FIXED by pagination] 26 dialogue lines at clipping risk** — the full list is in A1;
-  even with the engine fix, splitting the longest (90+ chars) reads
-  better as two beats.
-- **F3. [FIXED] Buried treasure requires the shovel but the soil reads as
-  decoration** — the `dd` soil patches in meadow/grove/shore/ridge are
-  two bare dirt tiles; without a sign or visual cue players will walk
-  past them. Consider a sparkly "dig here" hint (a dithered soil border
-  variant) once the shovel is owned, or a sign in the meadow teaching it.
-  **Fix applied:** a meadow signpost beside the first soil patch teaches
-  the dig ("SOFT SOIL. The field keeps its promises buried.").
-
-- **F4. [FIXED] The crypt's `peek_big_door` encounter sits at (10,2)** — one
-  tile left of the north gate column (x10-11). Triggering it requires
-  facing-into the gap; confirm it doesn't overlap the big-door open
-  flow awkwardly (it repeats, so it re-rattles after the door opens —
-  consider `unless: boss_defeated_10_crypt_hall`-style gating or moving
-  it off the approach).
-  **Fix applied:** the tease is one-shot now — an opened door never
-  re-rattles.
-- **F5. [FIXED] Hollow-grove arrival beat may miss** — the mirror lands at the
-  hero's paired tile, spiraled to free ground; `beat_hollow` only sits at
-  (13,6). Most arrivals (shrine-adjacent mirroring) hit it, but a
-  player mirroring from the pond edge lands elsewhere and misses the
-  "the air is wrong here" beat. Add 2-3 one-shot instant triggers
-  around the likely landing zone, or fire the beat from the keeper's
-  dialogue on first Hollow entry instead.
-  **Fix applied:** three likely landing tiles share the beat, each gated
-  by a new `hollow_seen` flag that the beat itself sets — it plays once,
-  wherever the mirror lands the hero.
-
----
-
-## G. Verified-fine (checked, not bugs)
-
-- Camera clamp through room transitions (fixed earlier — stable band,
-  seamless handoff).
-- Chest key costs / item-get banking / opened-lid persistence.
-- Door open reciprocity and save persistence (`markDoorOpened`).
-- Dark-room lightmap resize handling (`drawDarkness` re-creates the RT).
-- Boss defeat flag banking + autosave on the kill.
-- Wizard reflect fight: volley is a plain projectile, sword-batting sets
-  `friendly`, and friendly non-magic rocks strike enemies — the fight
-  works (and arrows/silver arrows work).
-- Somaria conjure blocks on the hero or inside walls (`solidBox` probe).
-- The soak round-trip and bake determinism (as far as this environment
-  can run them; the GL window needs a GUI session).
+[X]
+An enemy sitting on top of the hero keeps dealing damage until death: contact damage only recoils the hero (knockback + i-frames), while a same-speed pursuer strides right back in during the i-frames and re-overlaps at every expiry — the hero can never gain separation, especially pinned against a wall.
+Fixed: the shove is mutual, LttP-style — when contact damage lands, the attacker bounces too (new Enemy::bounce: HURT knockback away from the hero + the 0.4s PAUSE recovery), so every hit cycle buys the hero real escape distance. Hero::hurt now returns whether the damage landed, so the bounce couples to actual hits only (i-frames, auras, dashing plows-through don't bounce). Bosses keep their choreography and frozen enemies stay frozen (src/main.cpp contact branch, src/enemy.cpp, src/hero.cpp, include/hero.h, include/enemy.h).

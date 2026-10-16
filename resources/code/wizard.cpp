@@ -35,14 +35,18 @@ static void wizardBehavior(Enemy& self, const Room& room, Vector2 heroCenter,
     float aim = hurried ? WIZARD_HURRIED_AIM : WIZARD_AIM;
     float interval = hurried ? WIZARD_HURRIED_INTERVAL : WIZARD_SHOT_INTERVAL;
 
-    // Anchors: quarter points of the arena (tiles); one picked per hop
-    // with the engine Rng (deterministic).
+    // Anchors: quarter points of the arena (tiles), clamped on the map —
+    // small arenas still fight (firing needs no anchors; hopping just
+    // clumps up). One picked per hop with the engine Rng (deterministic).
     int w = cfg.mapWidth;
     int h = cfg.mapHeight;
-    if (w < 4 || h < 4) return;
+    if (w < 1 || h < 1) return;  // degenerate room data only
     const int anchors[5][2] = {
-        { w / 4, h / 4 }, { w - w / 4, h / 4 }, { w / 2, h / 2 },
-        { w / 4, h - h / 4 }, { w - w / 4, h - h / 4 },
+        { w / 4, h / 4 },
+        { w - 1 - w / 4, h / 4 },
+        { w / 2, h / 2 },
+        { w / 4, h - 1 - h / 4 },
+        { w - 1 - w / 4, h - 1 - h / 4 },
     };
 
     // Hover beat: keep facing the hero between shots.
@@ -80,11 +84,26 @@ static void wizardBehavior(Enemy& self, const Room& room, Vector2 heroCenter,
         }
         break;
 
-    case Enemy::ENEMY_PAUSE:  // volley spent: teleport to the next anchor
-    {
-        int next = rng.range(5);
-        self.setPosition((float)(anchors[next][0] * TILE_SIZE),
-                         (float)(anchors[next][1] * TILE_SIZE));
+    case Enemy::ENEMY_PAUSE:  // volley spent (or a hit's stun): teleport
+    {                          // once the hold elapses — never mid-flinch
+        // The engine routes hit recovery through PAUSE with a 0.4s
+        // timer; honoring it here is what keeps the stun visible.
+        if (t < 0.4f) break;
+        // Hop to the first free anchor from a random start (checked
+        // against the room's solids — a buried boss box would wall the
+        // fight in); boxed in on every anchor, hold position instead.
+        Rectangle b = self.box();
+        int start = rng.range(5);
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            int next = (start + attempt) % 5;
+            float px = (float)(anchors[next][0] * TILE_SIZE);
+            float py = (float)(anchors[next][1] * TILE_SIZE);
+            Rectangle cand = { px, py, b.width, b.height };
+            if (room.solidBox(cand)) continue;
+            self.setPosition(px, py);
+            break;
+        }
         self.setMode(Enemy::ENEMY_IDLE);
         break;
     }

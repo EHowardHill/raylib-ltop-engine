@@ -197,6 +197,13 @@ void Hero::place(int tileX, int tileY)
     invulnTime = 0.0f;
 }
 
+bool Hero::canOccupyTile(int tileX, int tileY, const Room& room) const
+{
+    Rectangle at = { (float)(tileX * TILE_SIZE) + BOX_X,
+                     (float)(tileY * TILE_SIZE) + BOX_Y, BOX_W, BOX_H };
+    return !room.solidBox(at);
+}
+
 void Hero::setFallRedirect(int room, int tileX, int tileY)
 {
     fallRedirectRoom = room;
@@ -565,10 +572,10 @@ void Hero::setHealth(int halfHearts, int maxHalfHearts)
     if (health_ > maxHealth_) health_ = maxHealth_;
 }
 
-void Hero::hurt(int halfHearts, Vector2 knockDir)
+bool Hero::hurt(int halfHearts, Vector2 knockDir)
 {
     if (invulnTime > 0.0f || state_ == HERO_FALL || state_ == HERO_SPLASH
-        || state_ == HERO_HOP || state_ == HERO_DEAD || protected_) return;
+        || state_ == HERO_HOP || state_ == HERO_DEAD || protected_) return false;
 
     health_ -= halfHearts;
     if (health_ < 0) health_ = 0;
@@ -589,6 +596,7 @@ void Hero::hurt(int halfHearts, Vector2 knockDir)
     setState(HERO_HURT);
     moving = false;
     if (sfxLoaded) PlaySound(hurtSfx);
+    return true;
 }
 
 Rectangle Hero::attackBox() const
@@ -669,7 +677,17 @@ void Hero::update(const Room& room, float dt)
     {
     case HERO_ATTACK:
         // Locked in the swing; walking is canceled for its duration.
-        // Holding through the swing charges a spin (released after).
+        // Holding through the swing keeps the windup charging (a press
+        // mid-stride starts it at zero here) — released after, it spins.
+        if (swordEnabled_ && bindingHeld(BINDING_SWORD))
+        {
+            swordHeldTime += dt;
+            if (swordHeldTime >= SPIN_CHARGE && !chargeCuePlayed)
+            {
+                chargeCuePlayed = true;
+                if (sfxLoaded) PlaySound(spinChargeSfx);
+            }
+        }
         if (stateTime >= ATTACK_DURATION)
         {
             if (swordHeldTime >= SPIN_CHARGE) startSpin();
@@ -689,6 +707,25 @@ void Hero::update(const Room& room, float dt)
         float dist = DASH_SPEED * dt;
         bool full = slideWithCollision(room, dashX * dist, dashY * dist);
         updateFootsteps(room, full ? dist : dist * 0.5f);
+        // The burst doesn't fly: a dash over deep water or a pit drops
+        // in exactly like a walk would (splash, or dive with flippers).
+        {
+            int tileX = 0;
+            int tileY = 0;
+            tileUnder(tileX, tileY);
+            TileMeta meta = room.tileMetaAt(tileX, tileY);
+            if (meta.flags & TILE_FLAG_WATER_DEEP)
+            {
+                if (canSwim_) startSwim();
+                else startSplash();
+                break;
+            }
+            if (meta.flags & TILE_FLAG_PIT)
+            {
+                startFall();
+                break;
+            }
+        }
         if (!full)
         {
             setState(HERO_CRASH);
@@ -805,6 +842,38 @@ void Hero::update(const Room& room, float dt)
             hopLanded = true;
             x = hopTargetX;
             y = hopTargetY;
+            // A block may have slid onto the landing tile mid-arc (the
+            // press-time check can't see it): land collision-checked —
+            // step out along the hop axis first, then sidesteps, before
+            // the landing sets the hero on solid ground.
+            float hx = hopTargetX - hopStartX;
+            float hy = hopTargetY - hopStartY;
+            float hlen = sqrtf(hx * hx + hy * hy);
+            if (hlen > 0.0001f) { hx /= hlen; hy /= hlen; }
+            int guard = 0;
+            while (room.solidBox(box()) && guard < 8)
+            {
+                const Vector2 cands[4] = {
+                    { hx * 4.0f, hy * 4.0f },
+                    { -hy * 4.0f, hx * 4.0f },
+                    { hy * 4.0f, -hx * 4.0f },
+                    { -hx * 4.0f, -hy * 4.0f },
+                };
+                bool freed = false;
+                for (int c = 0; c < 4; c++)
+                {
+                    Rectangle cand = box();
+                    cand.x += cands[c].x;
+                    cand.y += cands[c].y;
+                    if (room.solidBox(cand)) continue;
+                    x += cands[c].x;
+                    y += cands[c].y;
+                    freed = true;
+                    break;
+                }
+                if (!freed) break;
+                guard++;
+            }
             moving = false;
             if (sfxLoaded) PlaySound(landSfx);
         }
@@ -1155,8 +1224,13 @@ void Hero::update(const Room& room, float dt)
         }
         else
         {
-            safeTileX = tileX;
-            safeTileY = tileY;
+            // A damage tile never counts as "safe": falling into a pit
+            // next to spikes must not hand the hero back onto them.
+            if (!(meta.flags & TILE_FLAG_DAMAGE))
+            {
+                safeTileX = tileX;
+                safeTileY = tileY;
+            }
             if ((meta.flags & TILE_FLAG_DAMAGE) && meta.damage > 0)
             {
                 hurt(meta.damage, Vector2{ -dx, -dy });

@@ -230,6 +230,19 @@ void Enemy::freeze(float seconds)
     knockY = 0.0f;
 }
 
+void Enemy::bounce(Vector2 dir)
+{
+    if (!cfg || !alive()) return;
+    // Bosses keep their patterns; frozen enemies hold their freeze
+    // (they don't chase, so the pin scenario doesn't apply).
+    if (isBoss() || mode == ENEMY_FROZEN) return;
+    float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
+    if (len <= 0.0001f) return;
+    knockX = dir.x / len;
+    knockY = dir.y / len;
+    setMode(ENEMY_HURT);
+}
+
 bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir,
                     int damage)
 {
@@ -241,7 +254,16 @@ bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir,
     // land.
     if (cfg->strikeImmune && swingId >= 0) return false;
 
-    // Frozen: any hit shatters the ice (and the enemy) instantly.
+    Rectangle enemyBox = box();
+    if (attackBox.width <= 0.0f || attackBox.height <= 0.0f) return false;
+    if (attackBox.x > enemyBox.x + enemyBox.width) return false;
+    if (attackBox.x + attackBox.width < enemyBox.x) return false;
+    if (attackBox.y > enemyBox.y + enemyBox.height) return false;
+    if (attackBox.y + attackBox.height < enemyBox.y) return false;
+
+    // Frozen: any hit that actually lands shatters the ice (and the
+    // enemy) instantly — overlap verified above, so a fresh swing can't
+    // freeze-shatter the whole room from across the map.
     if (mode == ENEMY_FROZEN)
     {
         if (swingId == lastSwing) return false;
@@ -250,13 +272,6 @@ bool Enemy::tryHit(Rectangle attackBox, int swingId, Vector2 knockDir,
         hp = 0;
         return true;
     }
-
-    Rectangle enemyBox = box();
-    if (attackBox.width <= 0.0f || attackBox.height <= 0.0f) return false;
-    if (attackBox.x > enemyBox.x + enemyBox.width) return false;
-    if (attackBox.x + attackBox.width < enemyBox.x) return false;
-    if (attackBox.y > enemyBox.y + enemyBox.height) return false;
-    if (attackBox.y + attackBox.height < enemyBox.y) return false;
 
     // Weak point (a behavior-armed tail): strikes landing outside the
     // sub-box bounce off harmlessly — one bounce per swing id, no

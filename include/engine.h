@@ -714,11 +714,12 @@ struct Inventory
         }
         return true;
     }
-    // First slot carrying something (contents out through the ref), -1 if
-    // every bottle is empty.
+    // First owned slot carrying something (contents out through the ref),
+    // -1 if every bottle is empty. Only owned slots count (i < bottles):
+    // an unowned hero owns no catches, no matter what the pool holds.
     int firstFilledBottle(int& contents) const
     {
-        for (int i = 0; i < BOTTLE_MAX; i++)
+        for (int i = 0; i < bottles && i < BOTTLE_MAX; i++)
         {
             if (bottleContents[i] != BOTTLE_EMPTY)
             {
@@ -729,10 +730,10 @@ struct Inventory
         contents = BOTTLE_EMPTY;
         return -1;
     }
-    // First empty slot (-1 when all full) — filling water/catches.
+    // First owned empty slot (-1 when all full) — filling water/catches.
     int firstEmptyBottle() const
     {
-        for (int i = 0; i < BOTTLE_MAX; i++)
+        for (int i = 0; i < bottles && i < BOTTLE_MAX; i++)
             if (bottleContents[i] == BOTTLE_EMPTY) return i;
         return -1;
     }

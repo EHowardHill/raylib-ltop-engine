@@ -170,8 +170,13 @@ void DialogueBox::startLine()
     while (lineIndex >= 0 && lineIndex < current->lineCount)
     {
         const DialogueLine& line = current->lines[lineIndex];
-        if (line.ifFlag >= 0 && !gWorldFlags[line.ifFlag]) { lineIndex++; continue; }
-        if (line.unlessFlag >= 0 && gWorldFlags[line.unlessFlag]) { lineIndex++; continue; }
+        // Bounds-checked like every other flag access; an out-of-range
+        // index reads adjacent memory otherwise (it fails open — the
+        // line shows).
+        if (line.ifFlag >= 0 && line.ifFlag < WORLD_FLAG_COUNT
+            && !gWorldFlags[line.ifFlag]) { lineIndex++; continue; }
+        if (line.unlessFlag >= 0 && line.unlessFlag < WORLD_FLAG_COUNT
+            && gWorldFlags[line.unlessFlag]) { lineIndex++; continue; }
         if (line.ifItem >= 0 && !(gDialogueItemOwned && gDialogueItemOwned(line.ifItem)))
         {
             lineIndex++;
@@ -309,7 +314,19 @@ void DialogueBox::wrapLine(const char* text, float maxWidth)
                 memcpy(candidate, row.text, (size_t)len);
                 candidate[candLen++] = ' ';
             }
-            if (candLen + wordLen >= 255) break;
+            if (candLen + wordLen >= 255)
+            {
+                if (len > 0) break;  // wrap; the word retries on a fresh row
+                // A single word wider than the whole row buffer: hard-
+                // break it where the buffer ends, or the row rebuilds
+                // empty forever and the line stalls.
+                int take = 254;
+                memcpy(row.text, text + wordStart, (size_t)take);
+                len = take;
+                row.text[len] = '\0';
+                i = wordStart + take;
+                continue;
+            }
             memcpy(candidate + candLen, text + wordStart, (size_t)wordLen);
             candLen += wordLen;
             candidate[candLen] = '\0';
@@ -327,6 +344,11 @@ void DialogueBox::wrapLine(const char* text, float maxWidth)
 
         rowCount++;
     }
+
+    // Rows capped at MAX_ROWS: whatever past the last row is never drawn,
+    // so the typewriter must not count it (invisible characters typed
+    // out as dead air before the line can advance).
+    if (text[i] && rowCount >= MAX_ROWS) totalChars = i;
 }
 
 void DialogueBox::advanceLine(bool useGoto)
@@ -345,7 +367,10 @@ void DialogueBox::advanceLine(bool useGoto)
         return;
     }
 
-    if (useGoto && line.gotoLine >= 0) lineIndex = line.gotoLine;
+    // Bounds-checked: an off-by-one goto falls through as a normal
+    // advance instead of silently dropping the rest of the script.
+    if (useGoto && line.gotoLine >= 0 && line.gotoLine < current->lineCount)
+        lineIndex = line.gotoLine;
     else lineIndex++;
     startLine();
 }
@@ -371,6 +396,10 @@ void DialogueBox::update()
     int pageEnd = totalChars;
     if (!choiceLine && rowOffset + BOX_ROWS < rowCount)
         pageEnd = rows[rowOffset + BOX_ROWS].offset;
+    // A choice prompt only ever shows two rows (the options own the rest
+    // of the box), so the reveal/pick gates on exactly what's visible —
+    // never on invisible rows the player can't read.
+    else if (choiceLine && rowCount > 2) pageEnd = rows[2].offset;
 
     if (reveal < (float)pageEnd)
     {
@@ -418,8 +447,10 @@ void DialogueBox::update()
 
     // The last page: cutscene beats and credits lines advance on their
     // own — and the button can always hurry a beat along (a press first
-    // finishes the reveal, then skips the hold).
-    if (line.waitSeconds > 0.0f || current->credits)
+    // finishes the reveal, then skips the hold). A choice line is always
+    // interactive: its wait is ignored, or the early return below would
+    // strand the cursor and the pick could never land.
+    if ((line.waitSeconds > 0.0f || current->credits) && line.choiceCount <= 0)
     {
         if (reveal >= (float)pageEnd) waitTimer += frameDt();
         if (actionPressed())
@@ -487,8 +518,11 @@ void DialogueBox::update()
             choiceActive = false;
 
             // The chosen option decides where the dialogue goes (the line's
-            // own goto is skipped while branching).
-            if (choice.gotoLine >= 0) lineIndex = choice.gotoLine;
+            // own goto is skipped while branching). Bounds-checked like
+            // the line goto: an off-by-one falls through as a normal
+            // advance.
+            if (choice.gotoLine >= 0 && choice.gotoLine < current->lineCount)
+                lineIndex = choice.gotoLine;
             else lineIndex++;
             startLine();
         }
