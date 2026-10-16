@@ -1,0 +1,16 @@
+{
+    "lines": [
+        {
+            "text": "The sleeping stone yawns. Dust of green dreams settles into its cracks.",
+            "sfx": "prayer 2.wav",
+            "wait": 1.8
+        },
+        {
+            "text": "Something under the moss stretches... sits up... and looks around for you."
+        },
+        {
+            "text": "He will wait by the path south of the shrine. Go and meet him.",
+            "sfx": "message_finish.wav"
+        }
+    ]
+}

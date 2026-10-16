@@ -1,0 +1,8 @@
+{
+    "lines": [
+        {
+            "text": "The throne room floods with pale light. The dais waits.",
+            "unless": "boss_defeated_18_crypt_throne"
+        }
+    ]
+}

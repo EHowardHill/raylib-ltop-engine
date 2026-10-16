@@ -69,6 +69,12 @@ public:
     void freeze(float seconds);
     bool frozen() const { return mode == ENEMY_FROZEN; }
 
+    // Harmless (behavior-set): the enemy carries no contact damage
+    // while set — a submerged zora is part of the scenery until it
+    // surfaces. Projectiles and sword hits still land like normal.
+    void setHarmless(bool isHarmless) { harmless = isHarmless; }
+    bool isHarmless() const { return harmless; }
+
     // Sword resolution: applies `damage` hits per swing (single hit per
     // swing id), knockback along knockDir, hitstun; returns true if this
     // call is the one that killed it.
@@ -156,6 +162,8 @@ private:
     float weakY;
     float weakW;
     float weakH;
+    // Contact-damage off switch (see setHarmless).
+    bool harmless;
     // Layer-4 scratch (see scratch()).
     float scratch_[4];
     CustomBehaviorFn customFn;

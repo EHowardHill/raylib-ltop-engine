@@ -97,6 +97,14 @@ static const float DASH_DURATION = 0.42f;
 static const float CRASH_DURATION = 0.65f;
 
 static const char* SWORD_SHEET = "assets/characters/link_sword.png";
+// Hero tool sprites (hammer/shovel/net/shield): 32x32 frames pointing
+// up, drawn rotated around the handle-base pivot so one frame per tool
+// serves every facing. Missing art falls back to the code-drawn tools.
+static const char* TOOL_SHEET = "assets/effects/tools.png";
+static const int TOOL_FRAME_HAMMER = 0;
+static const int TOOL_FRAME_SHOVEL = 1;
+static const int TOOL_FRAME_NET = 2;
+static const int TOOL_FRAME_SHIELD = 3;
 // Sfx names (assets/audio/): the hero's cue set decodes lazily through
 // the shared cache — no per-room re-decode, nothing loads until heard.
 static const char* SWORD_SFX = "fighter sword 1.wav";
@@ -137,7 +145,8 @@ Hero::Hero()
       pullActive(false), pullT(0.0f),
       pullFromX(0.0f), pullFromY(0.0f), pullToX(0.0f), pullToY(0.0f),
       hookPullActive(false), hookPullT(0.0f), hookPullDuration(0.0f),
-      hookFromX(0.0f), hookFromY(0.0f), hookToX(0.0f), hookToY(0.0f)
+      hookFromX(0.0f), hookFromY(0.0f), hookToX(0.0f), hookToY(0.0f),
+      swordEnabled_(true)
 {
 }
 
@@ -151,6 +160,9 @@ void Hero::load(const CharacterConfig& config)
     swordSheet = LoadTexture(SWORD_SHEET);
     SetTextureFilter(swordSheet, TEXTURE_FILTER_POINT);
 
+    toolSheet = LoadTexture(TOOL_SHEET);
+    SetTextureFilter(toolSheet, TEXTURE_FILTER_POINT);
+
     // Sfx stay lazily cached (see the cue set above) — a room switch
     // never re-decodes them.
     sfxLoaded = true;
@@ -160,9 +172,11 @@ void Hero::unload()
 {
     if (cfg && sheet.id != 0) UnloadTexture(sheet);
     if (swordSheet.id != 0) UnloadTexture(swordSheet);
+    if (toolSheet.id != 0) UnloadTexture(toolSheet);
     sfxLoaded = false;
     sheet = Texture2D();
     swordSheet = Texture2D();
+    toolSheet = Texture2D();
     cfg = 0;
 }
 
@@ -632,6 +646,17 @@ Rectangle Hero::box() const
     return Rectangle{ x + BOX_X, y + BOX_Y, BOX_W, BOX_H };
 }
 
+void Hero::advanceWalkCycle(const Room& room, float dt, float movedDist)
+{
+    // The glide drives the hero forward: stride in (walk frames), not
+    // idle-glide — the next update() settles back to idle on landing.
+    // Anything but the walking look keeps its own state animation.
+    if (movedDist > 0.0f && state_ == HERO_IDLE) setState(HERO_WALK);
+    if (state_ != HERO_WALK && state_ != HERO_IDLE) return;
+    animTime += dt;
+    updateFootsteps(room, movedDist);
+}
+
 void Hero::update(const Room& room, float dt)
 {
     stateTime += dt;
@@ -700,6 +725,27 @@ void Hero::update(const Room& room, float dt)
         {
             float move = KNOCK_SPEED * decay * dt;
             slideWithCollision(room, knockX * move, knockY * move);
+        }
+        // Knocked onto a hazard mid-flinch: hand over immediately —
+        // splash (or dive, with flippers) at the bank, fall into the
+        // hole — instead of standing on water for the rest of the
+        // knockback.
+        {
+            int tileX = 0;
+            int tileY = 0;
+            tileUnder(tileX, tileY);
+            TileMeta meta = room.tileMetaAt(tileX, tileY);
+            if (meta.flags & TILE_FLAG_WATER_DEEP)
+            {
+                if (canSwim_) startSwim();
+                else startSplash();
+                break;
+            }
+            if (meta.flags & TILE_FLAG_PIT)
+            {
+                startFall();
+                break;
+            }
         }
         if (stateTime >= HURT_DURATION)
         {
@@ -944,8 +990,9 @@ void Hero::update(const Room& room, float dt)
         else
         {
             // Spin charge: holding the sword button winds up (cue + weapon
-            // shake); releasing it after the threshold spins.
-            if (bindingHeld(BINDING_SWORD))
+            // shake); releasing it after the threshold spins. Bladeless
+            // heroes (the sword is item-gated, as data) never wind up.
+            if (swordEnabled_ && bindingHeld(BINDING_SWORD))
             {
                 swordHeldTime += dt;
                 if (swordHeldTime >= SPIN_CHARGE && !chargeCuePlayed)
@@ -972,8 +1019,8 @@ void Hero::update(const Room& room, float dt)
                 break;
             }
 
-            // Sword swings cancel walking entirely.
-            if (swordPressed())
+            // Sword swings cancel walking entirely (and need the blade).
+            if (swordEnabled_ && swordPressed())
             {
                 setState(HERO_ATTACK);
                 swing_++;
@@ -1206,6 +1253,31 @@ void Hero::drawReflection() const
     DrawTexturePro(sheet, src, dest, origin, 0.0f, Color{ 175, 200, 240, 100 });
 }
 
+// Tool sprites rotate around the handle base (the hands); facing maps
+// to the base angle of an up-pointing tool.
+static float toolFacingAngle(Direction facing)
+{
+    switch (facing)
+    {
+    case DIR_UP: return 0.0f;
+    case DIR_RIGHT: return 90.0f;
+    case DIR_DOWN: return 180.0f;
+    default: return 270.0f;
+    }
+}
+
+void Hero::drawTool(int frame, float px, float py, float angle,
+                    bool centered) const
+{
+    if (toolSheet.id == 0) return;
+    Rectangle src = { (float)(frame * TILE_SIZE), 0.0f,
+                     (float)TILE_SIZE, (float)TILE_SIZE };
+    Rectangle dest = { px, py, (float)TILE_SIZE, (float)TILE_SIZE };
+    Vector2 origin = centered ? Vector2{ TILE_SIZE * 0.5f, TILE_SIZE * 0.5f }
+                              : Vector2{ 16.0f, 28.0f };
+    DrawTexturePro(toolSheet, src, dest, origin, angle, WHITE);
+}
+
 void Hero::drawFrame(int frame, float scaleX, float scaleY, float yOff) const
 {
     if (!cfg) return;
@@ -1394,9 +1466,9 @@ void Hero::draw() const
 
     if (state_ == HERO_HAMMER)
     {
-        // Mallet placeholder (code-drawn, like the shield plate): raised
-        // overhead through the windup, slammed in front at the pound,
-        // with an expanding quake ring at the impact point.
+        // Mallet: raised through the windup, slammed at the pound (the
+        // quake ring stays code-drawn — it's FX, not chrome). The sprite
+        // swings by rotation; without art the code-drawn mallet stands in.
         float cx = x + TILE_SIZE * 0.5f;
         float cy = y + TILE_SIZE * 0.5f;
         float fdx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
@@ -1404,7 +1476,23 @@ void Hero::draw() const
         float impactX = cx + fdx * 22.0f;
         float impactY = cy + fdy * 22.0f;
 
-        if (stateTime < HAMMER_WINDUP)
+        if (toolSheet.id != 0)
+        {
+            float base = toolFacingAngle(facing);
+            if (stateTime < HAMMER_WINDUP)
+                drawTool(TOOL_FRAME_HAMMER, cx, cy, base - 65.0f);
+            else
+            {
+                drawTool(TOOL_FRAME_HAMMER, cx, cy, base);
+                float rt = (stateTime - HAMMER_WINDUP) / (HAMMER_DURATION - HAMMER_WINDUP);
+                if (rt > 1.0f) rt = 1.0f;
+                float radius = 4.0f + rt * 24.0f;
+                unsigned char alpha = (unsigned char)((1.0f - rt) * 170.0f);
+                DrawCircleLines((int)impactX, (int)impactY, radius,
+                                Color{ 205, 205, 215, alpha });
+            }
+        }
+        else if (stateTime < HAMMER_WINDUP)
         {
             // Raised: handle up from the hands, head above the hero.
             float raise = stateTime / HAMMER_WINDUP;
@@ -1446,8 +1534,8 @@ void Hero::draw() const
 
     if (state_ == HERO_DIG)
     {
-        // Shovel placeholder (code-drawn, like the mallet): held up over
-        // the windup, then stabbed into the ground ahead with a dirt burst.
+        // Shovel: held up over the windup, then stabbed into the tile
+        // ahead (rotation drives the sprite; the dirt burst is FX).
         float cx = x + TILE_SIZE * 0.5f;
         float cy = y + TILE_SIZE * 0.5f;
         float fdx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
@@ -1455,7 +1543,15 @@ void Hero::draw() const
         float tipX = cx + fdx * 20.0f;
         float tipY = cy + fdy * 20.0f;
 
-        if (stateTime < DIG_WINDUP)
+        if (toolSheet.id != 0)
+        {
+            float base = toolFacingAngle(facing);
+            if (stateTime < DIG_WINDUP)
+                drawTool(TOOL_FRAME_SHOVEL, cx, cy, base - 55.0f);
+            else
+                drawTool(TOOL_FRAME_SHOVEL, cx, cy, base + 12.0f);
+        }
+        else if (stateTime < DIG_WINDUP)
         {
             // Held up: handle over the shoulder, blade above the hero.
             float raise = stateTime / DIG_WINDUP;
@@ -1491,30 +1587,40 @@ void Hero::draw() const
 
     if (state_ == HERO_NET)
     {
-        // Bug net placeholder (code-drawn, like the mallet): swept in an
-        // arc through the facing during the action — a hoop with a mesh.
+        // Bug net: one sprite swept in an arc through the facing — the
+        // rotation carries the swish (the code-drawn hoop stands in
+        // without art).
         float cx = x + TILE_SIZE * 0.5f;
         float cy = y + TILE_SIZE * 0.5f;
         float fdx = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
         float fdy = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
         // The swing sweeps from rest to full reach and back.
         float t = stateTime / NET_DURATION;
-        float reach = 12.0f + 14.0f * sinf(PI * clampf(t, 0.0f, 1.0f));
-        float netX = cx + fdx * (reach + 6.0f) - fdy * 2.0f;
-        float netY = cy + fdy * (reach + 6.0f) - fdx * 2.0f;
-
-        // Handle from the hands to the hoop.
-        DrawLine((int)cx, (int)cy, (int)netX, (int)netY, Color{ 120, 84, 52, 255 });
-        // Hoop + crosshatch mesh.
-        DrawCircleLines((int)netX, (int)netY, 8, Color{ 196, 176, 120, 255 });
-        for (int i = -1; i <= 1; i++)
+        if (toolSheet.id != 0)
         {
-            DrawLine((int)(netX - 6.0f), (int)(netY + i * 4.0f),
-                     (int)(netX + 6.0f), (int)(netY + i * 4.0f),
-                     Color{ 226, 214, 170, 160 });
-            DrawLine((int)(netX + i * 4.0f), (int)(netY - 6.0f),
-                     (int)(netX + i * 4.0f), (int)(netY + 6.0f),
-                     Color{ 226, 214, 170, 160 });
+            float base = toolFacingAngle(facing);
+            float sweep = clampf(t, 0.0f, 1.0f);
+            drawTool(TOOL_FRAME_NET, cx, cy, base - 55.0f + sweep * 110.0f);
+        }
+        else
+        {
+            float reach = 12.0f + 14.0f * sinf(PI * clampf(t, 0.0f, 1.0f));
+            float netX = cx + fdx * (reach + 6.0f) - fdy * 2.0f;
+            float netY = cy + fdy * (reach + 6.0f) - fdx * 2.0f;
+
+            // Handle from the hands to the hoop.
+            DrawLine((int)cx, (int)cy, (int)netX, (int)netY, Color{ 120, 84, 52, 255 });
+            // Hoop + crosshatch mesh.
+            DrawCircleLines((int)netX, (int)netY, 8, Color{ 196, 176, 120, 255 });
+            for (int i = -1; i <= 1; i++)
+            {
+                DrawLine((int)(netX - 6.0f), (int)(netY + i * 4.0f),
+                         (int)(netX + 6.0f), (int)(netY + i * 4.0f),
+                         Color{ 226, 214, 170, 160 });
+                DrawLine((int)(netX + i * 4.0f), (int)(netY - 6.0f),
+                         (int)(netX + i * 4.0f), (int)(netY + 6.0f),
+                         Color{ 226, 214, 170, 160 });
+            }
         }
     }
 
@@ -1569,8 +1675,8 @@ void Hero::draw() const
 
     drawFrame(index, 1.0f, 1.0f);
 
-    // Raised shield pose: a plate held toward the facing edge (code-drawn
-    // placeholder; a game's hero art can carry a real shield frame later).
+    // Raised shield pose: the carried shield sprite held toward the
+    // facing edge (the code-drawn plate stands in without art).
     if (guarding_)
     {
         float cx;
@@ -1583,11 +1689,18 @@ void Hero::draw() const
         case DIR_RIGHT: cx = x + 26.0f; cy = y + 16.0f; vertical = false; break;
         default:       cx = x + 6.0f;  cy = y + 16.0f; vertical = false; break;
         }
-        float rx = vertical ? 5.0f : 7.0f;
-        float ry = vertical ? 7.0f : 5.0f;
-        DrawEllipse((int)cx, (int)cy, rx + 1.0f, ry + 1.0f, Color{ 70, 74, 96, 255 });
-        DrawEllipse((int)cx, (int)cy, rx, ry, Color{ 168, 176, 200, 255 });
-        DrawEllipse((int)(cx - 1.0f), (int)(cy - 1.0f), rx * 0.45f, ry * 0.45f,
-                    Color{ 214, 222, 240, 255 });
+        if (toolSheet.id != 0)
+        {
+            drawTool(TOOL_FRAME_SHIELD, cx, cy, 0.0f, true);
+        }
+        else
+        {
+            float rx = vertical ? 5.0f : 7.0f;
+            float ry = vertical ? 7.0f : 5.0f;
+            DrawEllipse((int)cx, (int)cy, rx + 1.0f, ry + 1.0f, Color{ 70, 74, 96, 255 });
+            DrawEllipse((int)cx, (int)cy, rx, ry, Color{ 168, 176, 200, 255 });
+            DrawEllipse((int)(cx - 1.0f), (int)(cy - 1.0f), rx * 0.45f, ry * 0.45f,
+                        Color{ 214, 222, 240, 255 });
+        }
     }
 }

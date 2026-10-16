@@ -1,0 +1,21 @@
+{
+    "lines": [
+        {
+            "text": "The shrine of the grove. Below, the legend of the valley...",
+            "sfx": "secret.wav"
+        },
+        {
+            "text": "THE LEGEND OF THE VALLEY",
+            "image": "legend.png",
+            "letterbox": true,
+            "sfx": "prayer 2.wav",
+            "wait": 2.8
+        },
+        {
+            "text": "When the Heartstone sleeps at home, the valley keeps the sun.",
+            "image": "",
+            "letterbox": false,
+            "sfx": "message_finish.wav"
+        }
+    ]
+}

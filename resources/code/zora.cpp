@@ -20,6 +20,10 @@ static void zoraBehavior(Enemy& self, const Room& room, Vector2 heroCenter,
     Vector2 c = self.center();
     float t = self.modeElapsed();
 
+    // Submerged (the lurk) carries no contact damage: the ripple is
+    // scenery until the zora surfaces to spit. Hits still land.
+    self.setHarmless(self.modeState() == Enemy::ENEMY_IDLE);
+
     switch (self.modeState())
     {
     case Enemy::ENEMY_IDLE:  // submerged: ripple, waiting to surface

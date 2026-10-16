@@ -49,7 +49,7 @@ DialogueBox::DialogueBox()
     : font(), fontOwned(false), border(), cursor(), letterSfx(), finishSfx(),
       errorSfx(),
       current(0), lineIndex(0), totalChars(0), reveal(0.0f), rowCount(0),
-      choiceActive(false), choiceCursor(0),
+      rowOffset(0), choiceActive(false), choiceCursor(0),
       musicRequest(), musicPending(false),
       giveItem(-1), givePending(false),
       warpRoom(-1), warpTileX(0), warpTileY(0), warpPending(false),
@@ -59,6 +59,7 @@ DialogueBox::DialogueBox()
       moveSeconds(0.0f), facePending(false), faceActor(-1), faceDir(0),
       showPending(false), showActor(-1), hidePending(false), hideActor(-1),
       fadePending(false), fadeTo(0), fadeSeconds(0.0f),
+      imagePending(false), imageScene(-1), sceneBackdrop(false),
       nextDialogue(-1), nextPending(false),
       waitTimer(0.0f)
 {
@@ -151,6 +152,7 @@ void DialogueBox::open(const Dialogue& dialogue)
     showPending = false;
     hidePending = false;
     fadePending = false;
+    imagePending = false;
     nextPending = false;
     startLine();
 }
@@ -159,6 +161,7 @@ void DialogueBox::startLine()
 {
     reveal = 0.0f;
     rowCount = 0;
+    rowOffset = 0;
     totalChars = 0;
     waitTimer = 0.0f;
     if (!current) return;
@@ -236,6 +239,11 @@ void DialogueBox::startLine()
             fadeTo = line.fadeTo;
             fadeSeconds = line.fadeSeconds;
             fadePending = true;
+        }
+        if (line.imageScene != -1)
+        {
+            imageScene = line.imageScene;
+            imagePending = true;
         }
 
         choiceActive = false;
@@ -354,23 +362,81 @@ void DialogueBox::update()
     const DialogueLine& line = current->lines[lineIndex];
     const char* text = line.text ? line.text : "";
 
-    if (reveal < (float)totalChars)
+    // The visible page: BOX_ROWS of the wrapped rows at a time. Long
+    // lines paginate instead of clipping — the typewriter works within
+    // the page, and a full page turns (action, or the beat on its own
+    // so unattended cutscenes never stall mid-sentence). Lines with
+    // options keep the whole prompt: the option list owns the space.
+    bool choiceLine = line.choiceCount > 0 && line.choices;
+    int pageEnd = totalChars;
+    if (!choiceLine && rowOffset + BOX_ROWS < rowCount)
+        pageEnd = rows[rowOffset + BOX_ROWS].offset;
+
+    if (reveal < (float)pageEnd)
     {
         int previous = (int)reveal;
         reveal += CHARS_PER_SECOND * frameDt();
-        if (reveal > (float)totalChars) reveal = (float)totalChars;
+        if (reveal > (float)pageEnd) reveal = (float)pageEnd;
 
         int now = (int)reveal;
         if (now > previous && text[now - 1] != ' ') PlaySound(letterSfx);
-        if (reveal >= (float)totalChars) PlaySound(finishSfx);
+        if (reveal >= (float)pageEnd) PlaySound(finishSfx);
     }
-    else if (line.waitSeconds > 0.0f || current->credits)
+
+    if (!choiceLine && rowOffset + BOX_ROWS < rowCount)
     {
-        // Cutscene beats and credits rolls advance on their own once the
-        // line is fully revealed; the button can still hurry a beat along.
-        float beat = line.waitSeconds > 0.0f ? line.waitSeconds : CREDITS_BEAT;
-        waitTimer += frameDt();
-        if (waitTimer >= beat && !choiceActive) advanceLine(true);
+        // More rows wait off-page: turn before the line can advance. A
+        // press hurries the page (finish its reveal first, then turn);
+        // unattended beats turn on their own.
+        if (actionPressed())
+        {
+            if (reveal < (float)pageEnd)
+            {
+                reveal = (float)pageEnd;
+                PlaySound(finishSfx);
+            }
+            else
+            {
+                rowOffset += BOX_ROWS;
+                waitTimer = 0.0f;
+                PlaySound(finishSfx);
+            }
+        }
+        else if (line.waitSeconds > 0.0f || current->credits)
+        {
+            if (reveal >= (float)pageEnd) waitTimer += frameDt();
+            float hold = line.waitSeconds > 0.0f ? line.waitSeconds : CREDITS_BEAT;
+            if (waitTimer >= hold)
+            {
+                rowOffset += BOX_ROWS;
+                waitTimer = 0.0f;
+                PlaySound(finishSfx);
+            }
+        }
+        return;
+    }
+
+    // The last page: cutscene beats and credits lines advance on their
+    // own — and the button can always hurry a beat along (a press first
+    // finishes the reveal, then skips the hold).
+    if (line.waitSeconds > 0.0f || current->credits)
+    {
+        if (reveal >= (float)pageEnd) waitTimer += frameDt();
+        if (actionPressed())
+        {
+            if (reveal < (float)pageEnd)
+            {
+                reveal = (float)pageEnd;
+                PlaySound(finishSfx);
+            }
+            else if (!choiceActive)
+            {
+                advanceLine(true);
+            }
+            return;
+        }
+        float hold = line.waitSeconds > 0.0f ? line.waitSeconds : CREDITS_BEAT;
+        if (waitTimer >= hold && !choiceActive) advanceLine(true);
         return;
     }
 
@@ -391,9 +457,9 @@ void DialogueBox::update()
 
         if (actionPressed() && line.choices)
         {
-            if (reveal < (float)totalChars)
+            if (reveal < (float)pageEnd)
             {
-                reveal = (float)totalChars;
+                reveal = (float)pageEnd;
                 PlaySound(finishSfx);
                 return;
             }
@@ -431,9 +497,9 @@ void DialogueBox::update()
 
     if (actionPressed())
     {
-        if (reveal < (float)totalChars)
+        if (reveal < (float)pageEnd)
         {
-            reveal = (float)totalChars;
+            reveal = (float)pageEnd;
             PlaySound(finishSfx);
         }
         else
@@ -532,6 +598,14 @@ bool DialogueBox::takeFadeRequest(int& to, float& seconds)
     return true;
 }
 
+bool DialogueBox::takeImageRequest(int& scene)
+{
+    if (!imagePending) return false;
+    imagePending = false;
+    scene = imageScene;
+    return true;
+}
+
 bool DialogueBox::takeNextRequest(int& dialogue)
 {
     if (!nextPending) return false;
@@ -553,10 +627,12 @@ void DialogueBox::drawChoices(Rectangle box) const
     if (patch < 1) patch = 1;
 
     // Options stack in the bottom-right corner of the box (LttP style),
-    // right-aligned; the cursor points at the selected option from the
-    // left, never over the text.
-    float top = (box.y + box.height - (float)patch - TEXT_PAD_Y
-                 - (float)(line.choiceCount * LINE_HEIGHT)) * sc;
+    // right-aligned — starting below the prompt's drawn rows so they
+    // never cover the text. The cursor points at the selected option
+    // from the left, never over the text.
+    int promptRows = rowCount < 2 ? rowCount : 2;
+    float top = (box.y + (float)patch + TEXT_PAD_Y
+                 + (float)promptRows * LINE_HEIGHT + 2.0f) * sc;
     float right = (box.x + box.width - (float)patch - TEXT_PAD_X) * sc;
 
     for (int i = 0; i < line.choiceCount; i++)
@@ -589,8 +665,11 @@ void DialogueBox::draw() const
     if (current->credits)
     {
         // Endgame roll: the world vanishes behind a black screen and the
-        // lines center themselves, one beat at a time.
-        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), BLACK);
+        // lines center themselves, one beat at a time — unless a scene
+        // picture is already the backdrop (the "image" cue composes into
+        // a storybook roll).
+        if (!sceneBackdrop)
+            DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), BLACK);
         float viewWidth = (float)GetScreenWidth() / sc;
         int revealed = (int)reveal;
         for (int j = 0; j < rowCount; j++)
@@ -648,30 +727,38 @@ void DialogueBox::draw() const
     float left = (box.x + (float)patch + TEXT_PAD_X) * sc;
     float top = (box.y + (float)patch + TEXT_PAD_Y) * sc;
 
-    // Rows beyond the third would spill past the box border; the wrap
-    // keeps them buffered, only the ones that fit draw.
-    int drawnRows = rowCount < BOX_ROWS ? rowCount : BOX_ROWS;
+    // Rows beyond the page stay buffered, only the visible ones draw
+    // (long lines paginate: the box shows three rows, then turns).
+    int rowsLeft = rowCount - rowOffset;
+    int drawnRows = rowsLeft < BOX_ROWS ? rowsLeft : BOX_ROWS;
+    // A choice list caps the prompt to two rows: the options own the
+    // rest of the box and never overlap the text.
+    if (choiceActive && drawnRows > 2) drawnRows = 2;
     int revealed = (int)reveal;
     for (int j = 0; j < drawnRows; j++)
     {
-        int rowLen = (int)strlen(rows[j].text);
-        int count = revealed - rows[j].offset;
+        const Row& row = rows[rowOffset + j];
+        int rowLen = (int)strlen(row.text);
+        int count = revealed - row.offset;
         if (count <= 0) break;
         if (count > rowLen) count = rowLen;
 
         char tmp[256];
-        memcpy(tmp, rows[j].text, (size_t)count);
+        memcpy(tmp, row.text, (size_t)count);
         tmp[count] = '\0';
 
         Vector2 pos = { left, top + (float)(j * LINE_HEIGHT) * sc };
         DrawTextEx(font, tmp, pos, textSize, spacing, RAYWHITE);
     }
 
-    // Waiting-state prompt: a blinking arrow once the line is fully typed
+    // Waiting-state prompt: a blinking arrow once the page is fully typed
     // (skipped when the choice list takes over the box). It sits on its
     // own row below the last text line, right-aligned — never on top of
-    // the text itself.
-    if (reveal >= (float)totalChars && !choiceActive
+    // the text itself — whether the wait is for a page turn or the next
+    // line.
+    int pageEnd = totalChars;
+    if (rowOffset + BOX_ROWS < rowCount) pageEnd = rows[rowOffset + BOX_ROWS].offset;
+    if (reveal >= (float)pageEnd && !choiceActive
         && lineIndex >= 0 && lineIndex < current->lineCount
         && current->lines[lineIndex].choiceCount <= 0
         && ((int)(GetTime() * 3.0f) % 2 == 0))

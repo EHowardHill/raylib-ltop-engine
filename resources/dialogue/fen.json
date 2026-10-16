@@ -1,0 +1,22 @@
+{
+    "lines": [
+        {
+            "text": "Enoki! The bees in the grove took my whistle! Fact!",
+            "unless": "game_complete"
+        },
+        {
+            "text": "Grampa says the shrine in the grove's got a sleepy statue in it. Fact!",
+            "unless": "game_complete"
+        },
+        {
+            "text": "You caught a bee?! Bottle it! FACT!",
+            "if_item": "net",
+            "unless": "game_complete"
+        },
+        {
+            "text": "The rain stopped 'cause of YOU? Okay. OKAY! FINE! Fact.",
+            "sfx": "heart.wav",
+            "if": "game_complete"
+        }
+    ]
+}

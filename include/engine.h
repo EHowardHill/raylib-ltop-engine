@@ -114,6 +114,11 @@ struct DialogueLine
     // punctuation (full-screen fades are the sanctioned non-sprite chrome).
     int fadeTo;             // 0 = none, 1 = to black, 2 = back to the world
     float fadeSeconds;      // fade duration
+    // Image scene cue: draw a baked scene picture full-bleed over the
+    // virtual viewport with the world hidden, letterbox optional on top,
+    // typewriter text over it. -1 = no cue (leave the current picture),
+    // -2 = clear it ("" in the json), else an index into SCENES.
+    int imageScene;
 };
 
 struct Dialogue
@@ -409,6 +414,16 @@ struct TilesetConfig
     int tileHeight;
 };
 
+// Full-screen scene pictures (resources/scenes/*.png), baked by the
+// generator: the "image" dialogue cue draws one over the virtual viewport
+// with the world hidden — LttP's storybook intro/legend beats.
+struct SceneConfig
+{
+    const char* path;
+    int width;
+    int height;
+};
+
 // Per-tile behavior metadata, baked from resources/tiles/tiles.json by the
 // generator. Indexed by tile id - 1, matching the ids stored in room layers.
 struct TileMeta
@@ -634,6 +649,9 @@ struct ItemConfig
     // Spawned object (Somaria-style block use-actions): the object type
     // the use-action conjures/removes, -1 = none.
     int spawnObject;
+    bool hasSword;       // passive: owning one unlocks the sword button
+                         // (a game with no sword-carrying item keeps the
+                         // native blade; see swordUnlocked in main)
 };
 
 // Inventory: quantities + owned items + the equipped item (the item

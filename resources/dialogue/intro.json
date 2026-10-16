@@ -1,0 +1,63 @@
+{
+    "lines": [
+        {
+            "letterbox": true,
+            "hide": "hero",
+            "camera": {
+                "pan": [
+                    12,
+                    6
+                ],
+                "time": 2.4
+            },
+            "wait": 2.6
+        },
+        {
+            "text": "The night the storm came to Willowdown, something crept out of the Sunken Crypt...",
+            "sfx": "thunder.wav",
+            "wait": 3.4
+        },
+        {
+            "fade": {
+                "to": "black",
+                "time": 0.8
+            },
+            "wait": 1.0
+        },
+        {
+            "text": "It took the HEARTSTONE, and the sky has not stopped screaming since.",
+            "image": "intro_card.png",
+            "letterbox": true,
+            "sfx": "rain.wav",
+            "wait": 3.6
+        },
+        {
+            "image": "",
+            "fade": {
+                "to": "world",
+                "time": 0.8
+            },
+            "camera": "hero",
+            "wait": 0.9
+        },
+        {
+            "text": "...enoki... ENOKI! Wake up, the Elder is asking for you!",
+            "show": "hero",
+            "face": {
+                "actor": "hero",
+                "dir": "down"
+            },
+            "sfx": "message.wav",
+            "wait": 2.4
+        },
+        {
+            "letterbox": false,
+            "camera": "hero",
+            "wait": 0.4
+        },
+        {
+            "text": "Rain in the night, rain in the morning. Go and see Aaron first - he's worried sick.",
+            "sfx": "message_finish.wav"
+        }
+    ]
+}

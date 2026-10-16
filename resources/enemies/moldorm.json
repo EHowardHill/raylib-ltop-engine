@@ -1,0 +1,50 @@
+{
+    "width": 4,
+    "color": [
+        168,
+        132,
+        96
+    ],
+    "stand": {
+        "down": [
+            0
+        ],
+        "right": [
+            1
+        ],
+        "left": [
+            2
+        ],
+        "up": [
+            3
+        ]
+    },
+    "move": {
+        "down": [
+            0,
+            4
+        ],
+        "right": [
+            1,
+            5
+        ],
+        "left": [
+            2,
+            6
+        ],
+        "up": [
+            3,
+            7
+        ]
+    },
+    "stats": {
+        "hp": 6,
+        "speed": 80,
+        "damage": 2,
+        "behavior": "custom:moldorm",
+        "components": {
+            "boss": true
+        },
+        "drops": {}
+    }
+}

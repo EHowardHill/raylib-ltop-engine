@@ -104,6 +104,9 @@ def load_dialogues(flags):
        "show": "hero"|<npc index>                # mid-scene entrance (respawn
        "hide": "hero"|<npc index>               # ...or exit: actor off-stage
        "fade": {"to": "black"|"world", "time": <s>}   # scripted screen fade
+       "image": "<scenes file>"|""              # image-scene cue: full-screen
+                                                # picture over the hidden world
+                                                # ("" clears it back to the world)
        "choice": [{"text": ..., "set": [...], "clear": [...], "sfx": ...,
                    "give": <item>, "cost": <rupees>, "goto": ...}, ...]}
     Dialogue-level keys: "credits": true (endgame roll: centered lines over
@@ -241,6 +244,14 @@ def load_dialogues(flags):
             elif fade is not None:
                 warn("dialogue '%s' fade must be {to, time}" % filename)
 
+            # Image-scene cue: "" clears the picture; a scenes/ file name
+            # (or stem) draws it. Resolved to a baked index below, once the
+            # scene table (and any placeholder art) exists.
+            image_name = entry.get("image")
+            if image_name is not None and not isinstance(image_name, str):
+                warn("dialogue '%s' image must be a scenes/ file name" % filename)
+                image_name = None
+
             choices = []
             for opt in entry.get("choice") or []:
                 if not isinstance(opt, dict):
@@ -260,6 +271,15 @@ def load_dialogues(flags):
                     "cost": cost,
                     "goto": opt.get("goto"),
                 })
+            if choices:
+                # The box draws two prompt rows above the option list (the
+                # options own the rest) — a longer prompt would run under
+                # them, so keep choice prompts short.
+                prompt = str(entry.get("text") or "")
+                if len(prompt) > 48:
+                    warn("dialogue '%s' choice prompt is %d chars — the "
+                         "box only shows two rows above the options; "
+                         "shorten it" % (filename, len(prompt)))
 
             lines.append({
                 "text": str(entry.get("text") or ""),
@@ -292,6 +312,7 @@ def load_dialogues(flags):
                 "hideActor": hide_actor,
                 "fadeTo": fade_to,
                 "fadeSeconds": fade_seconds,
+                "imageName": image_name,
                 "choices": choices,
             })
 
@@ -401,18 +422,28 @@ def load_characters():
 
 def load_game():
     """resources/game.json (optional): {"title": ..., "slug": ...,
-    "font": ..., "intro": <dialogue>}.
-    The title is engine chrome (title screen subtitle); the slug identifies
-    the game in save files so a save from one game is never loaded by
+    "font": ..., "intro": <dialogue>, "logo": {...}, "title_card": {...}}.
+    The title is engine chrome (title screen); the slug identifies the
+    game in save files so a save from one game is never loaded by
     another (filesystem-safe, <= 15 chars). "font" is a file under
     resources/ (e.g. "fonts/dialogue.otf") rendered for every piece of
     engine text — absent means the raylib default bitmap font. "intro"
     names a dialogue script a fresh game plays over the first room drop
-    (the boot intro; continue never replays it)."""
+    (the boot intro; continue never replays it).
+    The boot sequence is data too: "logo" is the company/developer card
+    ({"image": <scene picture>, "text": <name line>, "sfx": <sting>,
+    "seconds": <hold>}) and "title_card" the title screen's backdrop
+    ({"image": <scene picture>, "music": <track>, "seconds": <the card
+    plays alone before the save menu joins it>}); images are scene
+    pictures under resources/scenes/, missing art gets the usual
+    placeholder test card, and every field is optional — the flow
+    degrades gracefully (no logo -> straight to the title)."""
     title = "UNTITLED GAME"
     slug = "game"
     font = ""
     intro = ""
+    logo = {}
+    title_card = {}
     path = res("game.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
@@ -424,13 +455,35 @@ def load_game():
             warn("game font '%s' does not exist under resources/ (ignoring)" % font)
             font = ""
         intro = str(data.get("intro") or "")
+        if isinstance(data.get("logo"), dict):
+            logo = data["logo"]
+        if isinstance(data.get("title_card"), dict):
+            title_card = data["title_card"]
     clean = re.sub(r"[^a-z0-9-]", "", str(slug).lower()) or "game"
     if clean != str(slug).lower():
         warn("game slug '%s' is not filesystem-safe; using '%s'" % (slug, clean))
     if len(clean) > 15:
         warn("game slug '%s' is longer than 15 chars; truncating" % slug)
         clean = clean[:15]
-    return {"title": title, "slug": clean, "font": font, "intro": intro}
+
+    def seconds_of(spec, default):
+        try:
+            return max(0.2, float(spec.get("seconds") or default))
+        except (TypeError, ValueError):
+            warn("game.json seconds %r is not a number (using %.1f)"
+                 % (spec.get("seconds"), default))
+            return default
+
+    return {
+        "title": title, "slug": clean, "font": font, "intro": intro,
+        "logoImage": str(logo.get("image") or ""),
+        "logoText": str(logo.get("text") or ""),
+        "logoSfx": str(logo.get("sfx") or ""),
+        "logoSeconds": seconds_of(logo, 2.5),
+        "titleCardImage": str(title_card.get("image") or ""),
+        "titleCardMusic": str(title_card.get("music") or ""),
+        "titleCardSeconds": seconds_of(title_card, 2.5),
+    }
 
 
 # --- Items (resources/items/<name>.json) -------------------------------------
@@ -453,8 +506,9 @@ def load_items():
              "cost": {"magic": N} or {"ammo": "arrow"|"bomb", "amount": N,
                                        "rupee_fallback": bool},
              "sfx": <audio file>},
-     "passive": {"light": <radius px>, "swim": <bool flippers>,
-                "lift": <bool gloves>, "compass": <bool dungeon compass>},
+      "passive": {"light": <radius px>, "swim": <bool flippers>,
+                 "lift": <bool gloves>, "compass": <bool dungeon compass>,
+                 "sword": <bool unlocks the sword button>},
      "upgrade": {"flag": <world flag>, "speed": N, "damage": N},
      "spawn": <object type name (somaria-style block use-actions)>}
     Ids are assigned in sorted-filename order and emitted as ITEM_<NAME>
@@ -517,6 +571,7 @@ def load_items():
         swim = bool(passive.get("swim", False))
         lift = bool(passive.get("lift", False))
         compass = bool(passive.get("compass", False))
+        sword = bool(passive.get("sword", False))
 
         # World-flag upgrade (silver arrows, magical boomerang): while the
         # flag is set, the use-action runs with the upgraded stats. The
@@ -551,6 +606,7 @@ def load_items():
             "swim": swim,
             "lift": lift,
             "compass": compass,
+            "sword": sword,
             "upgradeFlagName": upgrade_flag,
             "upgradeSpeed": upgrade_speed,
             "upgradeDamage": upgrade_damage,
@@ -716,7 +772,7 @@ GRANT_KIND_DEFS = [
     {"name": "bombs", "effect": 3, "pickup": 5,
      "text": "You got %d bombs!"},
     {"name": "magic", "effect": 4, "pickup": 6,
-     "text": "Your magic power was restored!"},
+     "text": "You got the magic meter! A strange power awakens!"},
     {"name": "heart_container", "effect": 5, "pickup": 7,
      "text": "You got a heart container! Your life force grew!"},
     {"name": "flag", "effect": 8, "pickup": -1,
@@ -1006,6 +1062,42 @@ def load_tilesets():
     if "texture.png" in names:
         default_index = names.index("texture.png")
     return tilesets, default_index
+
+
+def load_scenes():
+    """Scene pictures (resources/scenes/*.png): full-screen images the
+    dialogue "image" cue draws over the hidden world — LttP's storybook
+    intro/legend beats. References resolve by file name or stem; missing
+    referenced art gets a placeholder test card (created in generate(),
+    which knows the references)."""
+    directory = res("scenes")
+    scenes = []
+    if not os.path.isdir(directory):
+        return scenes
+    for filename in sorted(os.listdir(directory)):
+        if not filename.endswith(".png"):
+            continue
+        path = os.path.join(directory, filename)
+        width, height = png_size(path)
+        scenes.append({
+            "file": filename,
+            "path": "assets/scenes/" + filename,
+            "width": width,
+            "height": height,
+        })
+    return scenes
+
+
+def scene_lookup(scenes):
+    """name -> index, accepting the file name ("legend.png") or the stem
+    ("legend"), like room references."""
+    index = {}
+    for i, scene in enumerate(scenes):
+        index[scene["file"]] = i
+        stem = scene["file"][:-4]
+        if stem not in index:
+            index[stem] = i
+    return index
 
 
 def tileset_meta_file(tileset, default_tileset=False):
@@ -1341,6 +1433,13 @@ def load_rooms(dialogue_index, character_index, enemy_index, enemy_defs=None,
                     aux2 = flags.index(flag_name)
                 else:
                     aux2 = -1
+                # Optional "dialogue": a reaction script played at the
+                # awakening moment (aux1, resolved like a sign's).
+                if entry.get("dialogue"):
+                    aux1 = dialogue_index.get(str(entry["dialogue"]), -1)
+                    if aux1 < 0:
+                        warn("room '%s' shrine references unknown dialogue '%s'"
+                             % (stem, entry["dialogue"]))
             if mask & OBJINT_NAMES["lever"]:
                 try:
                     aux2 = int(entry.get("link") or 0)
@@ -1714,7 +1813,7 @@ def emit_dialogues(c, dialogues):
 
             line_refs.append(
                 "    { %s, %d, %d, %d, %s, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %s, "
-                "%s, %d, %d, %d, %s, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d, %s },"
+                "%s, %d, %d, %d, %s, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d, %s, %d },"
                 % (cstr(line["text"]), line["gotoLine"], line["if"], line["unless"],
                    (lbase + "_SET") if line["set"] else "0", len(line["set"]),
                    (lbase + "_CLEAR") if line["clear"] else "0", len(line["clear"]),
@@ -1734,7 +1833,8 @@ def emit_dialogues(c, dialogues):
                    cfloat(line["moveSeconds"]),
                    line["faceActor"], line["faceDir"],
                    line["showActor"], line["hideActor"],
-                   line["fadeTo"], cfloat(line["fadeSeconds"])))
+                   line["fadeTo"], cfloat(line["fadeSeconds"]),
+                   line["imageScene"]))
 
         if line_refs:
             c.append("static const DialogueLine %s_LINES[] = {" % base)
@@ -1743,7 +1843,7 @@ def emit_dialogues(c, dialogues):
             c.append("};")
         else:
             c.append("static const DialogueLine %s_LINES[] = { { 0, -1, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, -1, -1, 0, 0, "
-                     "0.0f, 0, 0, 0, 0.0f, -1, -1, 0, 0, 0.0f, -1, 0, -1, -1, 0, 0.0f } };" % base)
+                     "0.0f, 0, 0, 0, 0.0f, -1, -1, 0, 0, 0.0f, -1, 0, -1, -1, 0, 0.0f, -1 } };" % base)
         c.append("")
 
     c.append("const Dialogue DIALOGUES[] = {")
@@ -1879,7 +1979,7 @@ def emit_items(c, items):
     per-item switch is gone."""
     c.append("const ItemConfig ITEMS[] = {")
     for item in items:
-        c.append("    { %s, %s, %d, %d, %d, %d, %d, %s, %s, %s, %d, %s, %s, %s, %d, %d, %d, %d },"
+        c.append("    { %s, %s, %d, %d, %d, %d, %d, %s, %s, %s, %d, %s, %s, %s, %d, %d, %d, %d, %s },"
                  % (cstr(item["name"]), cstr(item["label"]),
                     item["useKind"], item["element"],
                     item["magicCost"], item["bombCost"], item["arrowCost"],
@@ -1892,7 +1992,8 @@ def emit_items(c, items):
                     "true" if item["compass"] else "false",
                     item["upgradeFlagIdx"],
                     item["upgradeSpeed"], item["upgradeDamage"],
-                    item["spawnObjectIdx"]))
+                    item["spawnObjectIdx"],
+                    "true" if item["sword"] else "false"))
     c.append("};")
     c.append("const int ITEM_COUNT = %d;" % len(items))
     c.append("")
@@ -1941,6 +2042,20 @@ def emit_game(c, game, manifest, intro_index):
     # Boot intro: DIALOGUES[] index of the script a fresh game plays over
     # the first room drop (-1 = none; see startNewGame).
     c.append("const int GAME_INTRO = %d;" % intro_index)
+    # Boot sequence cards (game.json "logo" / "title_card"): the company
+    # card plays first (skippable), then the title backdrop holds the
+    # save menu. Scenes resolve through SCENES[]; -1/0 = the piece is
+    # off and the flow skips straight past it.
+    c.append("const int GAME_LOGO_SCENE = %d;" % game.get("logoScene", -1))
+    c.append("const char* const GAME_LOGO_TEXT = %s;"
+             % cstr(game.get("logoText") or ""))
+    c.append("const char* const GAME_LOGO_SFX = %s;"
+             % (cstr(game["logoSfx"]) if game.get("logoSfx") else "0"))
+    c.append("const float GAME_LOGO_SECONDS = %.2ff;" % game.get("logoSeconds", 2.5))
+    c.append("const int GAME_TITLE_SCENE = %d;" % game.get("titleScene", -1))
+    c.append("const char* const GAME_TITLE_MUSIC = %s;"
+             % (cstr(game["titleCardMusic"]) if game.get("titleCardMusic") else "0"))
+    c.append("const float GAME_TITLE_SECONDS = %.2ff;" % game.get("titleCardSeconds", 2.5))
     c.append("")
     c.append("const char* const CUSTOM_BEHAVIOR_NAMES[] = {")
     for name in manifest:
@@ -1996,6 +2111,22 @@ def emit_tilesets(c, tilesets, tile_metas):
     c.append("const int TILE_META_COUNT = %d;" % total)
     c.append("const int TILE_META_OFFSETS[] = { %s };"
              % ", ".join(str(o) for o in offsets))
+    c.append("")
+
+
+def emit_scenes(c, scenes):
+    """Scene pictures (resources/scenes/): the "image" dialogue cue draws
+    one full-bleed over the hidden world. Path + dimensions; the engine
+    loads by baked path, one texture slot at a time."""
+    if scenes:
+        c.append("const SceneConfig SCENES[] = {")
+        c.append("    " + " ".join(
+            "{ %s, %d, %d }," % (cstr(s["path"]), s["width"], s["height"])
+            for s in scenes))
+        c.append("};")
+    else:
+        c.append("const SceneConfig SCENES[] = { { 0, 0, 0 } };")
+    c.append("const int SCENE_COUNT = %d;" % len(scenes))
     c.append("")
 
 
@@ -2915,6 +3046,109 @@ def create_gauge_magic_bitmap(path):
     return True
 
 
+DOOR_WOOD = (150, 104, 52, 255)
+DOOR_WOOD_HI = (188, 138, 84, 255)
+DOOR_WOOD_LO = (100, 66, 30, 255)
+DOOR_TRIM = (60, 40, 22, 255)
+DOOR_STONE = (122, 116, 108, 255)
+DOOR_STONE_HI = (156, 150, 140, 255)
+DOOR_DARK = (12, 10, 20, 255)
+DOOR_STEEL = (120, 124, 138, 255)
+DOOR_STEEL_HI = (168, 172, 186, 255)
+DOOR_STEEL_LO = (70, 72, 84, 255)
+DOOR_GOLD = (216, 178, 74, 255)
+
+
+def create_doors_bitmap(path):
+    """Edge-door chrome (drawDoorways), 40x48 cells: row 0 horizontal
+    doors (N/S walls), row 1 vertical (E/W); columns 0-5 are the open
+    archway and the door kinds in generator order (closed, locked, big,
+    bombable, shutter)."""
+    if os.path.exists(path):
+        return False
+
+    def slab(vertical, keyhole=None, cracks=False, slats=False):
+        image = pix_blank(40, 48)
+        if vertical:
+            pix_rect(image, 8, 0, 24, 48, DOOR_WOOD)
+            pix_rect(image, 8, 0, 2, 48, DOOR_WOOD_HI)
+            pix_rect(image, 30, 0, 2, 48, DOOR_WOOD_LO)
+            for y in range(6, 48, 10):
+                pix_rect(image, 10, y, 20, 1, DOOR_WOOD_LO)
+            pix_rect(image, 8, 0, 24, 1, DOOR_TRIM)
+            pix_rect(image, 8, 47, 24, 1, DOOR_TRIM)
+            kx = 20
+            ky = 22
+        else:
+            pix_rect(image, 0, 12, 40, 24, DOOR_WOOD)
+            pix_rect(image, 0, 12, 40, 2, DOOR_WOOD_HI)
+            pix_rect(image, 0, 34, 40, 2, DOOR_WOOD_LO)
+            for y in range(14, 35, 8):
+                pix_rect(image, 2, y, 36, 1, DOOR_WOOD_LO)
+            pix_rect(image, 0, 12, 40, 1, DOOR_TRIM)
+            pix_rect(image, 0, 35, 40, 1, DOOR_TRIM)
+            kx = 20
+            ky = 24
+        # handle
+        hx, hy = (26, 24) if vertical else (30, 26)
+        pix_rect(image, hx - 2, hy - 2, 4, 4, DOOR_GOLD)
+        if keyhole:
+            r = 3 if keyhole == "small" else 5
+            pix_disc(image, kx, ky, r, DOOR_DARK)
+            pix_rect(image, kx, ky + r, 1, 4 + r, DOOR_DARK)
+        if cracks:
+            for t in range(-12, 13):
+                pix_put(image, kx + t, ky + (t * t) // 14, DOOR_TRIM)
+            for t in range(-8, 9):
+                pix_put(image, kx + t, ky - t, DOOR_TRIM)
+        if slats:
+            if vertical:
+                for y0 in range(2, 48, 6):
+                    pix_rect(image, 8, y0, 24, 4, DOOR_STEEL)
+                    pix_rect(image, 8, y0, 24, 1, DOOR_STEEL_HI)
+                    pix_rect(image, 8, y0 + 3, 24, 1, DOOR_STEEL_LO)
+            else:
+                for y0 in range(12, 36, 6):
+                    pix_rect(image, 0, y0, 40, 4, DOOR_STEEL)
+                    pix_rect(image, 0, y0, 40, 1, DOOR_STEEL_HI)
+                    pix_rect(image, 0, y0 + 3, 40, 1, DOOR_STEEL_LO)
+        return image
+
+    def arch(vertical):
+        image = pix_blank(40, 48)
+        if vertical:
+            pix_rect(image, 4, 0, 4, 48, DOOR_STONE)
+            pix_rect(image, 4, 0, 1, 48, DOOR_STONE_HI)
+            pix_rect(image, 32, 0, 4, 48, DOOR_STONE)
+            pix_rect(image, 8, 0, 24, 48, DOOR_DARK)
+        else:
+            pix_rect(image, 0, 10, 40, 3, DOOR_STONE)
+            pix_rect(image, 0, 10, 40, 1, DOOR_STONE_HI)
+            pix_rect(image, 0, 36, 40, 3, DOOR_STONE)
+            pix_rect(image, 0, 13, 40, 23, DOOR_DARK)
+        return image
+
+    frames = []
+    for vertical in (False, True):
+        frames.append(arch(vertical))
+        frames.append(slab(vertical))
+        frames.append(slab(vertical, keyhole="small"))
+        frames.append(slab(vertical, keyhole="big"))
+        frames.append(slab(vertical, cracks=True))
+        frames.append(slab(vertical, slats=True))
+
+    # Two rows of six 40x48 cells (pix_compose only lays rows out flat).
+    sheet = []
+    for band in range(2):
+        for y in range(48):
+            row = bytearray()
+            for index in range(band * 6, band * 6 + 6):
+                row.extend(frames[index][y])
+            sheet.append(bytes(row))
+    write_png(path, 40 * 6, 96, sheet)
+    return True
+
+
 def create_counters_bitmap(path):
     """Small counter icons (HUD keys, subscreen quantities), 10x10 frames:
     0 rupee, 1 arrow, 2 bomb, 3 small key, 4 big key."""
@@ -3782,6 +4016,51 @@ def create_light_bitmap(path):
     return True
 
 
+def create_scene_bitmap(path):
+    """Placeholder scene picture: a broadcast-style test card (color bars,
+    center crosshair + circle, corner registration marks) at the virtual
+    widescreen aspect, so an image-scene script is testable before the
+    GIMP art lands. Existing files are never overwritten."""
+    if os.path.exists(path):
+        return False
+
+    width, height = 320, 224
+    image = pix_blank(width, height)
+    pix_rect(image, 0, 0, width, height, (34, 30, 44, 255))
+
+    # Color bars across the top (SMPTE-style, engine palette).
+    bars = [
+        (235, 235, 235, 255), (235, 235, 60, 255), (60, 220, 235, 255),
+        (60, 220, 60, 255), (220, 60, 220, 255), (220, 60, 60, 255),
+        (60, 60, 220, 255),
+    ]
+    bar_w = width // (len(bars) + 1)
+    for i, color in enumerate(bars):
+        pix_rect(image, 8 + i * bar_w, 20, bar_w - 4, 28, color)
+    # The eighth cell goes dark (the black bar).
+    pix_rect(image, 8 + len(bars) * bar_w, 20, bar_w - 4, 28, (24, 16, 32, 255))
+
+    # Center crosshair + circles on a mid-gray field.
+    cx, cy = width * 0.5, height * 0.5
+    pix_rect(image, 16, 60, width - 32, height - 76, (52, 52, 64, 255))
+    pix_line(image, int(cx) - 28, int(cy), int(cx) + 28, int(cy), (235, 235, 235, 255))
+    pix_line(image, int(cx), int(cy) - 28, int(cx), int(cy) + 28, (235, 235, 235, 255))
+    for r, color in ((24, (150, 150, 165, 255)), (16, (90, 200, 90, 255))):
+        for a in range(0, 360, 2):
+            rad = math.radians(a)
+            pix_put(image, int(cx + math.cos(rad) * r), int(cy + math.sin(rad) * r), color)
+
+    # Corner registration marks.
+    mark = (235, 235, 60, 255)
+    for x0, y0, dx, dy in ((8, 8, 1, 1), (width - 9, 8, -1, 1),
+                           (8, height - 9, 1, -1), (width - 9, height - 9, -1, -1)):
+        pix_line(image, x0, y0, x0 + 10 * dx, y0, mark)
+        pix_line(image, x0, y0, x0, y0 + 10 * dy, mark)
+
+    write_png(path, width, height, image)
+    return True
+
+
 def create_beam_bitmap(path):
     """Placeholder sword-beam sheet: 4 columns (down, right, left, up) of
     16x16 frames - a glowing bolt per direction."""
@@ -4028,6 +4307,12 @@ def generate(dump_flags=False):
     flags = FlagRegistry()
     dialogues = load_dialogues(flags)
     dialogue_index = {d["name"]: i for i, d in enumerate(dialogues)}
+    for d in dialogues:
+        # Stem keys alongside file names (rooms and scenes accept both;
+        # dialogue references get the same courtesy).
+        stem = d["name"][:-5] if d["name"].endswith(".json") else d["name"]
+        if stem not in dialogue_index:
+            dialogue_index[stem] = dialogue_index[d["name"]]
 
     # Chain targets ("next") resolve once every dialogue is loaded; the
     # endgame script chains into its credits roll this way.
@@ -4041,6 +4326,86 @@ def generate(dump_flags=False):
             warn("dialogue '%s' chains into unknown dialogue '%s'"
                  % (dialogue["name"], name))
             dialogue["nextIndex"] = -1
+
+    # Scene pictures (resources/scenes/): the "image" dialogue cue draws
+    # one full-bleed over the hidden world. Referenced-but-missing art
+    # gets a placeholder test card (like every other placeholder: existing
+    # files are never overwritten), then the line references resolve to
+    # baked indices.
+    scenes = load_scenes()
+
+    def scene_index_of(name):
+        index = scene_lookup(scenes)
+        if name in index:
+            return index[name]
+        if not name.endswith(".png") and (name + ".png") in index:
+            return index[name + ".png"]
+        return -1
+
+    def resolve_scene_card(raw, owner):
+        """A referenced scene picture: the index if it exists, else the
+        usual placeholder test card (created on disk, added to the pool)
+        so missing art still bakes and syncs."""
+        if not raw:
+            return -1
+        index = scene_index_of(raw)
+        if index >= 0:
+            return index
+        filename = raw if raw.endswith(".png") else raw + ".png"
+        path = res("scenes", filename)
+        os.makedirs(res("scenes"), exist_ok=True)
+        if create_scene_bitmap(path):
+            print("created placeholder scene picture: %s"
+                  % os.path.relpath(path, ROOT))
+            width, height = png_size(path)
+            scenes.append({"file": filename, "path": "assets/scenes/" + filename,
+                           "width": width, "height": height})
+            return len(scenes) - 1
+        warn("%s references unknown scene '%s'" % (owner, raw))
+        return -1
+
+    # The boot cards (game.json "logo" / "title_card"): the company card
+    # and the title backdrop resolve through the same scene pool, with
+    # the same placeholder courtesy.
+    game["logoScene"] = resolve_scene_card(game.get("logoImage"),
+                                           "game.json logo")
+    game["titleScene"] = resolve_scene_card(game.get("titleCardImage"),
+                                            "game.json title_card")
+    if game.get("logoSfx") and \
+            not os.path.exists(res("audio", game["logoSfx"])):
+        warn("game.json logo sfx '%s' is not in resources/audio" % game["logoSfx"])
+    if game.get("titleCardMusic") and \
+            not os.path.exists(res("music", game["titleCardMusic"])):
+        warn("game.json title_card music '%s' is not in resources/music"
+             % game["titleCardMusic"])
+
+    for dialogue in dialogues:
+        for line in dialogue["lines"]:
+            raw = line.pop("imageName")
+            if raw is None:
+                line["imageScene"] = -1
+                continue
+            if raw == "":
+                line["imageScene"] = -2  # "" clears the picture
+                continue
+            index = scene_index_of(raw)
+            if index < 0:
+                # Missing art: synthesize the test card now, so the bake
+                # (and the asset sync) carries it.
+                filename = raw if raw.endswith(".png") else raw + ".png"
+                path = res("scenes", filename)
+                os.makedirs(res("scenes"), exist_ok=True)
+                if create_scene_bitmap(path):
+                    print("created placeholder scene picture: %s"
+                          % os.path.relpath(path, ROOT))
+                    width, height = png_size(path)
+                    scenes.append({"file": filename, "path": "assets/scenes/" + filename,
+                                   "width": width, "height": height})
+                    index = len(scenes) - 1
+                else:
+                    warn("dialogue '%s' image references unknown scene '%s'"
+                         % (dialogue["name"], raw))
+            line["imageScene"] = index
 
     # Boot intro (game.json "intro"): a fresh game plays the named script
     # over the first room drop. The auto-registered intro_seen flag banks
@@ -4114,6 +4479,41 @@ def generate(dump_flags=False):
         if len(room["pickupSpawns"]) > 32:
             warn("room '%s' spawns %d pickups; the pool holds 32"
                  % (room["name"], len(room["pickupSpawns"])))
+
+    # Tile-layer conflict guard: solids and hazards don't mix. A tile in
+    # the colliders layer marked cut/pit/deep-water can't behave as
+    # authored (cutTileAt rewrites the decor layer, so a cuttable collider
+    # would leave the wall standing; a hazard collider reads as blocked
+    # AND dangerous), and cuttable decor under a collider cuts in name
+    # only. Layers are the authoring vocabulary; this keeps them honest.
+    for room in rooms:
+        tileset_index = room["tilesetIndex"]
+        if tileset_index < 0 or tileset_index >= len(tile_metas):
+            continue
+        metas = tile_metas[tileset_index]
+        width = room["mapWidth"]
+        colliders = room["colliders"]
+        decor = room["decor"]
+        for index, tile_id in enumerate(colliders):
+            if not tile_id or tile_id > len(metas):
+                continue
+            cflags = metas[tile_id - 1]["flags"]
+            bad = []
+            if cflags & 1: bad.append("a pit")
+            if cflags & 4: bad.append("cuttable")
+            if cflags & 8: bad.append("deep water")
+            if bad:
+                warn("room '%s' (%d,%d): tile %d is a collider but its "
+                     "metadata marks it %s — solids can't cut, fall, or "
+                     "swim" % (room["name"], index % width, index // width,
+                               tile_id, " / ".join(bad)))
+                continue
+            decor_id = decor[index] if index < len(decor) else 0
+            if decor_id and decor_id <= len(metas) \
+                    and (metas[decor_id - 1]["flags"] & 4):
+                warn("room '%s' (%d,%d): cuttable decor sits under a "
+                     "collider — the cut would leave the wall standing"
+                     % (room["name"], index % width, index // width))
     if len(rooms) > 32:
         warn("%d rooms exceed the boss-defeat registry (32); far-room boss"
              " defeats will not be banked" % len(rooms))
@@ -4213,6 +4613,12 @@ def generate(dump_flags=False):
         if creator(target):
             print("created placeholder UI sheet: %s" % os.path.relpath(target, ROOT))
 
+    # Edge-door chrome (see drawDoorways): archways and slabs, six kinds
+    # x two orientations, 40x48 cells — sprite chrome like the rest.
+    doors_path = res("ui", "doors.png")
+    if create_doors_bitmap(doors_path):
+        print("created placeholder door sheet: %s" % os.path.relpath(doors_path, ROOT))
+
     items_path = res("ui", "items.png")
     if create_items_bitmap(items_path, [entry["name"] for entry in items]):
         print("created placeholder item icon sheet: %s"
@@ -4265,6 +4671,13 @@ def generate(dump_flags=False):
     h.append("extern const char* const GAME_TITLE;")
     h.append("extern const char* const GAME_SLUG;")
     h.append("extern const char* const GAME_FONT;")
+    h.append("extern const int GAME_LOGO_SCENE;")
+    h.append("extern const char* const GAME_LOGO_TEXT;")
+    h.append("extern const char* const GAME_LOGO_SFX;")
+    h.append("extern const float GAME_LOGO_SECONDS;")
+    h.append("extern const int GAME_TITLE_SCENE;")
+    h.append("extern const char* const GAME_TITLE_MUSIC;")
+    h.append("extern const float GAME_TITLE_SECONDS;")
     h.append("// Boot intro (game.json \"intro\"): DIALOGUES[] index a fresh game")
     h.append("// plays over the first room drop (-1 = none).")
     h.append("extern const int GAME_INTRO;")
@@ -4320,6 +4733,11 @@ def generate(dump_flags=False):
     h.append("// layers are 1-based frame indices into that room's tileset.")
     h.append("extern const TilesetConfig TILESETS[];")
     h.append("extern const int TILESET_COUNT;")
+    h.append("")
+    h.append("// Scene pictures (resources/scenes/*.png): the \"image\" dialogue cue")
+    h.append("// draws one full-bleed over the hidden world (storybook beats).")
+    h.append("extern const SceneConfig SCENES[];")
+    h.append("extern const int SCENE_COUNT;")
     h.append("")
     h.append("extern const TileMeta TILE_META[];")
     h.append("extern const int TILE_META_COUNT;")
@@ -4419,6 +4837,7 @@ def generate(dump_flags=False):
     emit_items(c, items)
     emit_rooms(c, rooms)
     emit_tilesets(c, tilesets, tile_metas)
+    emit_scenes(c, scenes)
 
     c.append("const char* const WORLD_FLAG_NAMES[] = {")
     for name in flags.names:
@@ -4471,9 +4890,9 @@ def generate(dump_flags=False):
         if room_kb > 128.0:
             warn("room '%s' layers bake ~%.0f KB each (> 128 KB) — "
                  "large rooms multiply the web budget" % (room["name"], room_kb))
-    print("  %d dialogues, %d characters, %d enemies, %d items, %d object types, %d rooms, %d tilesets, %d tile meta entries"
+    print("  %d dialogues, %d characters, %d enemies, %d items, %d object types, %d rooms, %d tilesets, %d scenes, %d tile meta entries"
           % (len(dialogues), len(characters), len(enemies), len(items), len(object_types), len(rooms),
-             len(tilesets), sum(1 for m in tile_metas for m in m if m["flags"] or m["damage"])))
+             len(tilesets), len(scenes), sum(1 for m in tile_metas for m in m if m["flags"] or m["damage"])))
     sync_runtime_assets()
 
     if len(rooms) == 0:

@@ -8,11 +8,18 @@ const COMMANDS = {
   '/api/delete': b => ['delete', { path: b.path }],
   '/api/upload': b => ['upload', { dir: b.dir, name: b.name, data: b.data }],
   '/api/build': () => ['build', {}],
-  '/api/play': b => ['play', { room: b.room, tile: b.tile }],
+  '/api/build_web': b => ['build_web', { serve: !!b.serve }],
+  '/api/stop_web': () => ['stop_web', {}],
+  '/api/build_dreamcast': () => ['build_dreamcast', {}],
+  '/api/play': b => ['play', { room: b.room, tile: b.tile, enemy: b.enemy }],
+  '/api/stop_game': () => ['stop_game', {}],
   '/api/set_project': b => ['set_project', { path: b.path }],
   '/api/new_game': b => ['new_game', { name: b.name }],
   '/api/list_flags': () => ['list_flags', {}],
-  '/api/check_code': b => ['check_code', { file: b.file }]
+  '/api/check_code': b => ['check_code', { file: b.file }],
+  '/api/run_generator': () => ['run_generator', {}],
+  '/api/headless_check': () => ['headless_check', {}],
+  '/api/rename_asset': b => ['rename_asset', { dir: b.dir, from: b.from, to: b.to }]
 };
 
 export async function api(url, body) {

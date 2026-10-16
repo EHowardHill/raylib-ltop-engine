@@ -1,0 +1,11 @@
+{
+    "lines": [
+        {
+            "text": "The Sunken Crypt. The air tastes of drowned bells.",
+            "sfx": "ganon's tower opens.wav",
+            "set": [
+                "entered_crypt"
+            ]
+        }
+    ]
+}

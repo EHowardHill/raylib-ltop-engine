@@ -1,0 +1,51 @@
+{
+    "credits": true,
+    "lines": [
+        {
+            "text": "ENOKI AND THE HOLLOW KING",
+            "music": "gerudo.xm"
+        },
+        {
+            "text": "A valley's tale on the LTOP engine"
+        },
+        {
+            "text": "ENOKI - the forager who went to the crypt"
+        },
+        {
+            "text": "AARON - the friend who watched the road"
+        },
+        {
+            "text": "ELDER ROWAN - the blade that came out of retirement"
+        },
+        {
+            "text": "MARA - storm prices, honest goods"
+        },
+        {
+            "text": "FEN - facts!"
+        },
+        {
+            "text": "THE GROVE KEEPER - dream dust, old deals"
+        },
+        {
+            "text": "THE HOLLOW KING - drowned crown, no refunds"
+        },
+        {
+            "text": "rooms, tiles, sprites, sounds - baked, not parsed"
+        },
+        {
+            "text": "THE END",
+            "wait": 3.5,
+            "set": [
+                "game_complete"
+            ],
+            "show": "hero",
+            "warp": {
+                "room": "01_village",
+                "tile": [
+                    12,
+                    11
+                ]
+            }
+        }
+    ]
+}

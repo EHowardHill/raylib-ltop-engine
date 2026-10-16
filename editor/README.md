@@ -16,8 +16,8 @@ A Tauri (Rust backend + React/Vite frontend) desktop app for configuring `resour
 
 - `src/main.jsx` — the whole UI (React, no component framework), compiled by Vite. Talks to the backend only through `src/api.js`.
 - `src/api.js` — maps the editor's HTTP-shaped API onto Tauri `invoke` commands, and loads `resources/` images as data URLs for the webview.
-- `src-tauri/src/main.rs` — the backend. Commands: `scan`, `save`, `create`, `delete`, `upload`, `read_resource`, `build`, `set_project`. JSON files are written with 4-space indentation to match what's already committed in `resources/`.
-- The backend only reads/writes files under the open project's `resources/`, and only runs `./build-mac.sh` (Mac only) for its Build button.
+- `src-tauri/src/main.rs` — the backend. Commands: `scan`, `save`, `create`, `delete`, `upload`, `rename_asset`, `read_resource`, `build`, `build_web`, `stop_web`, `build_dreamcast`, `play`, `stop_game`, `run_generator`, `headless_check`, `set_project`, `new_game`, `save_slots`, `delete_save`, `list_flags`, `check_code`. JSON files are written with 4-space indentation to match what's already committed in `resources/`.
+- The backend only reads/writes files under the open project's `resources/`, and only runs the build scripts (`build-mac.sh` on Mac, `build-web.sh` elsewhere; the web export and the Dreamcast docker build are surfaced from the Build tab with their logs).
 
 ## Project folder
 
@@ -32,8 +32,15 @@ If none match, the app opens with a folder picker; `Change…` in the nav switch
 
 ## Tools
 
-- **Rooms** — a visual tile map editor. Both layers render at once (colliders get a red tint so solids are obvious); toggle per-layer visibility and pick the active layer for painting. Tile tools: paint (B), erase (E), fill (G), rect (R), pick (I) — right-drag erases. Marker tools: select/drag (V), spawn (S), place instant (N) / interactive (M) encounters. Zoom, grid toggle, room resize, and editing of `default` (hero, spawn, music, walk sfx) and encounter properties (dialogue, repeat). A leftover Tiled `.tmx` is flagged and can be deleted from the UI.
-- **Dialogue** — create/delete dialogue files, edit their lines.
-- **Characters** — graphical animation editor: pick `stand`/`move` frames per direction by clicking tiles on the sprite sheet (orange badges show each tile's position in the sequence), drag-free reordering via the insert-point slot, right-click a sequence slot to remove it, and a live preview that plays at the engine's exact frame rates (stand 2 fps, move 12 fps). Width and raw frame-index lists remain editable as text.
-- **Music & Files** — upload/delete binary assets (music, audio, ui, tiles, characters). Tiles accept `.png` only.
-- **Build** — runs `./build-mac.sh` from the repo root and shows its output (5-minute timeout).
+- **File** — project-level meta actions: open/switch game, new game (a starter folder), game identity (title/slug/intro), save-slot tools, and one-click Build & Play (the launched dev build is tracked: a new launch replaces it, Quit stops it).
+- **Rooms** — a visual tile map editor. Both layers render at once (colliders get a red tint so solids are obvious); toggle per-layer visibility and pick the active layer for painting. Tile tools: paint (B), erase (E), fill (G), rect (R), pick (I) — right-drag erases. Marker tools: select/drag (V), spawn (S), place instant (N) / interactive (M) encounters. Entity tools place objects (O), enemies (K), NPCs (P), and pickups (U). With an NPC or platform selected, its waypoint rail draws on the map: click open ground to extend, drag the circles to shape, right-click to remove. Zoom, grid toggle, room resize, doors/exits/mirror/pit editing, and editing of `default` (hero, spawn, music, walk sfx) and encounter properties (dialogue, repeat, if/unless guards). A leftover Tiled `.tmx` is flagged and can be deleted from the UI.
+- **Dialogue** — create/delete dialogue files, edit their lines: structured line cards over the whole scripting vocabulary (flags, gives, warps, choices, cutscene cues including image-scene picks with thumbnails), a branch-tree view, and a credits/`next` header.
+- **Enemies** — property forms (stats, behaviors, components, drops, frame lists), sheet upload/replace + rename, and a one-click "Test in gauntlet" sandbox (build + boot the gauntlet room with the enemy spawned beside the hero).
+- **Items** — use-action forms over the full vocabulary, plus a subscreen preview rendering the pause grid exactly as the engine draws it.
+- **Tiles** — tileset manager + per-tile behavior editor; sheet upload/replace in place and rename (repointing rooms).
+- **Object Types** — create/edit/delete the `types.json` compositions over the engine's interaction vocabulary.
+- **Characters** — graphical animation frame picker per direction with live preview at the engine's frame rates; sheet upload/replace + rename.
+- **Code** — in-window editing of `resources/code/*.cpp`, compile checks with inline errors, and the Enemy API reference rendered alongside.
+- **Flags** — the baked world-flag registry (via the generator's `--flags` tooling mode) with provenance and save-safety guidance.
+- **Music & Files** — upload/replace into any `resources/` directory (music, audio, ui, tiles, characters, enemies, pickups, effects, objects, fonts, scenes), the placeholder-asset audit (the artist's worklist) with per-row imports, and rename-in-place that rewrites every JSON reference to the renamed asset.
+- **Build** — the platform build with its log, web export (build, host `build/web/`, open the browser), the Dreamcast docker build, and a clickable runbook of the smoke checks (generator warnings, both builds, the `--soak` save round-trip).

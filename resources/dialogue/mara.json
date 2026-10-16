@@ -1,0 +1,39 @@
+{
+    "lines": [
+        {
+            "text": "Mara's goods! Storm prices! What'll it be?",
+            "sfx": "rupee.wav"
+        },
+        {
+            "text": "Take your pick.",
+            "choice": [
+                {
+                    "text": "BOOMERANG - 30 RUPEES",
+                    "cost": 30,
+                    "give": "boomerang",
+                    "sfx": "wallet 1.wav",
+                    "goto": "thanks",
+                    "set": [
+                        "shop_served"
+                    ]
+                },
+                {
+                    "text": "NOT TODAY"
+                }
+            ]
+        },
+        {
+            "text": "A fine pick! It always comes back to you. Eventually. Usually.",
+            "label": "thanks"
+        },
+        {
+            "text": "Tell old Rowan he still owes me for rope.",
+            "if": "shop_served",
+            "unless": "game_complete"
+        },
+        {
+            "text": "Storm's broke! Everything must go! Well - everything on this shelf.",
+            "if": "game_complete"
+        }
+    ]
+}

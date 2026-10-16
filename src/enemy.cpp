@@ -30,7 +30,7 @@ Enemy::Enemy()
       trailCount(0), trailSpacing(0.0f), trailDist(0.0f),
       lastSampleX(0.0f), lastSampleY(0.0f),
       weakX(0.0f), weakY(0.0f), weakW(0.0f), weakH(0.0f),
-      customFn(0)
+      harmless(false), customFn(0)
 {
     for (int i = 0; i < TRAIL_MAX; i++)
     {
@@ -68,6 +68,7 @@ void Enemy::spawn(const EnemyConfig& config, Texture2D spriteSheet, int tileX, i
     }
     weakW = 0.0f;
     weakH = 0.0f;
+    harmless = false;
     for (int i = 0; i < 4; i++) scratch_[i] = 0.0f;
     // Layer-4 seam: game-code behaviors resolve by name at spawn (bake-time
     // linked registry; missing names degrade to the built-in components).
@@ -100,6 +101,25 @@ void Enemy::pickDirection(Rng& rng)
     facing = (Direction)rng.range(DIR_COUNT);
 }
 
+// Hazards (pit holes, deep water) aren't solid for tile-collision but
+// are for enemies: they bump at the lip instead of hovering over the
+// hole or floating on the sea. (Water natives like the zora stand still
+// in it — their behavior never slides.)
+static bool enemyHazardAt(const Room& room, const Rectangle& box)
+{
+    int x0 = (int)(box.x / TILE_SIZE);
+    int y0 = (int)(box.y / TILE_SIZE);
+    int x1 = (int)((box.x + box.width - 0.01f) / TILE_SIZE);
+    int y1 = (int)((box.y + box.height - 0.01f) / TILE_SIZE);
+    for (int ty = y0; ty <= y1; ty++)
+        for (int tx = x0; tx <= x1; tx++)
+        {
+            TileMeta meta = room.tileMetaAt(tx, ty);
+            if (meta.flags & (TILE_FLAG_PIT | TILE_FLAG_WATER_DEEP)) return true;
+        }
+    return false;
+}
+
 bool Enemy::slide(const Room& room, float dx, float dy)
 {
     // Axis-separated tile collision (mirrors the hero), returns whether the
@@ -115,13 +135,13 @@ bool Enemy::slide(const Room& room, float dx, float dy)
     if (dx != 0.0f)
     {
         Rectangle box = { nx + dx + BOX_X, y + BOX_Y, BOX_W, BOX_H };
-        if (!room.solidBox(box)) nx += dx;
+        if (!room.solidBox(box) && !enemyHazardAt(room, box)) nx += dx;
         else blocked = true;
     }
     if (dy != 0.0f)
     {
         Rectangle box = { nx + BOX_X, ny + dy + BOX_Y, BOX_W, BOX_H };
-        if (!room.solidBox(box)) ny += dy;
+        if (!room.solidBox(box) && !enemyHazardAt(room, box)) ny += dy;
         else blocked = true;
     }
 
@@ -477,9 +497,11 @@ void Enemy::update(const Room& room, Vector2 heroCenter, Rng& rng, float dt)
             }
         }
 
-        // Shooter (component: shootPeriod): spit a rock toward the facing
-        // direction on the cadence roll.
-        if (cfg->shootPeriod > 0 && rng.range(cfg->shootPeriod) == 0)
+        // Shooter (component: shootPeriod): the idle beat spits one rock
+        // toward the facing, every cycle — the walk leg lasts
+        // shootPeriod seconds, so the number IS the spit cadence (the
+        // leg plus this idle pause), not a roll of the dice.
+        if (cfg->shootPeriod > 0)
         {
             shotDirX = (facing == DIR_LEFT) ? -1.0f : (facing == DIR_RIGHT) ? 1.0f : 0.0f;
             shotDirY = (facing == DIR_UP) ? -1.0f : (facing == DIR_DOWN) ? 1.0f : 0.0f;
@@ -523,16 +545,32 @@ void Enemy::draw() const
 {
     if (!cfg || !alive()) return;
 
-    // Segmented trail (Moldorm-style worms): shrinking segments behind
-    // the body, oldest (the tail) smallest.
-    for (int i = 0; i < trailCount; i++)
+    // Segmented trail (Moldorm-style worms): the body's own sprite
+    // shrinks down the chain — the smallest segment is the oldest (the
+    // tail, the weak point the behavior arms), growing toward the body.
+    if (trailCount > 0)
     {
-        float t = (trailCount > 1) ? (float)i / (float)(trailCount - 1) : 1.0f;
-        float radius = 2.5f + t * 5.0f;
-        DrawCircle((int)trailX[i], (int)trailY[i], radius,
-                   Color{ 96, 76, 52, 255 });
-        DrawCircle((int)trailX[i], (int)trailY[i] + 1.0f, radius,
-                   Color{ 60, 46, 30, 255 });
+        const DirectionalFrames* bodyFrames = &cfg->move[facing];
+        if (bodyFrames->count <= 0) bodyFrames = &cfg->stand[facing];
+        int frame = bodyFrames->count > 0 ? bodyFrames->frames[0] : 0;
+        int columns = cfg->sheetColumns;
+        if (columns <= 0) columns = 1;
+        if (frame < 0) frame = 0;
+        if (frame >= cfg->frameCount && cfg->frameCount > 0) frame = cfg->frameCount - 1;
+        Rectangle src = { (float)((frame % columns) * TILE_SIZE),
+                          (float)((frame / columns) * TILE_SIZE),
+                          (float)TILE_SIZE, (float)TILE_SIZE };
+        float bodyScale = cfg->boss ? 1.5f : 1.0f;
+        Vector2 origin = { 0.0f, 0.0f };
+        for (int i = 0; i < trailCount; i++)
+        {
+            float t = (trailCount > 1) ? (float)i / (float)(trailCount - 1) : 1.0f;
+            float w = (float)TILE_SIZE * (0.4f + t * 0.5f) * bodyScale;
+            Rectangle dest = { trailX[i] + (float)TILE_SIZE * 0.5f - w * 0.5f,
+                               trailY[i] + (float)TILE_SIZE * 0.5f - w * 0.5f,
+                               w, w };
+            DrawTexturePro(sheet, src, dest, origin, 0.0f, WHITE);
+        }
     }
 
     const DirectionalFrames* frames = (mode == ENEMY_WALK || mode == ENEMY_CHARGE)
@@ -543,13 +581,25 @@ void Enemy::draw() const
     int frame = frames->frames[(int)(animTime * ENEMY_ANIM_FPS) % frames->count];
     int columns = cfg->sheetColumns;
     if (columns <= 0) columns = 1;
-    // Ice block overlay while frozen.
+    // Ice block overlay while frozen (bosses keep their 1.5x scale).
     if (mode == ENEMY_FROZEN)
     {
         Rectangle src = { (float)((frame % columns) * TILE_SIZE),
                          (float)((frame / columns) * TILE_SIZE),
                          (float)TILE_SIZE, (float)TILE_SIZE };
         Vector2 pos = { x, y };
+        if (cfg->boss)
+        {
+            Rectangle dest = { x + (float)TILE_SIZE * 0.5f - (float)TILE_SIZE * 0.75f,
+                               y + (float)TILE_SIZE * 0.5f - (float)TILE_SIZE * 0.75f,
+                               (float)TILE_SIZE * 1.5f, (float)TILE_SIZE * 1.5f };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(sheet, src, dest, origin, 0.0f, Color{ 120, 190, 255, 255 });
+            DrawRectangle((int)(x - 8.0f) + 6, (int)(y - 8.0f) + 6,
+                          (int)(TILE_SIZE * 1.5f) - 12, (int)(TILE_SIZE * 1.5f) - 12,
+                          Color{ 150, 205, 255, 90 });
+            return;
+        }
         DrawTextureRec(sheet, src, pos, Color{ 120, 190, 255, 255 });
         DrawRectangle((int)x + 4, (int)y + 4, TILE_SIZE - 8, TILE_SIZE - 8,
                       Color{ 150, 205, 255, 90 });
@@ -577,13 +627,23 @@ void Enemy::draw() const
             return;
         }
     }
-    // Agitated (bug-net swish): a buzzy yellow flicker while it dithers.
+    // Agitated (bug-net swish): a buzzy yellow flicker while it dithers
+    // (bosses keep their 1.5x scale).
     if (agitateTimer > 0.0f && ((int)(animTime * 24.0f) % 2 == 0)
         && frame >= 0 && (cfg->frameCount <= 0 || frame < cfg->frameCount))
     {
         Rectangle src = { (float)((frame % columns) * TILE_SIZE),
                          (float)((frame / columns) * TILE_SIZE),
                          (float)TILE_SIZE, (float)TILE_SIZE };
+        if (cfg->boss)
+        {
+            Rectangle dest = { x + (float)TILE_SIZE * 0.5f - (float)TILE_SIZE * 0.75f,
+                               y + (float)TILE_SIZE * 0.5f - (float)TILE_SIZE * 0.75f,
+                               (float)TILE_SIZE * 1.5f, (float)TILE_SIZE * 1.5f };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(sheet, src, dest, origin, 0.0f, Color{ 255, 230, 120, 255 });
+            return;
+        }
         Vector2 pos = { x, y };
         DrawTextureRec(sheet, src, pos, Color{ 255, 230, 120, 255 });
         return;

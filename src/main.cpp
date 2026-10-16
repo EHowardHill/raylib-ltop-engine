@@ -376,6 +376,22 @@ static bool compassItemOwned()
     return false;
 }
 
+// The sword button (as data): when a game's items carry the sword passive,
+// swings stay locked until one of them is owned — "starts with nothing"
+// progression, the same seam as the flippers/gloves scans. A game with no
+// sword-carrying item keeps the native blade.
+static bool swordUnlocked()
+{
+    bool gated = false;
+    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
+    {
+        if (!ITEMS[i].hasSword) continue;
+        gated = true;
+        if (inventory.owned[i]) return true;
+    }
+    return !gated;
+}
+
 // World-flag upgrade (silver arrows, magical boomerang): while the item's
 // upgrade flag is set, its use-action runs with the upgraded stats.
 static bool itemUpgraded(const ItemConfig& item)
@@ -561,7 +577,22 @@ struct CutsceneMove
     float t;
     float duration;
 };
-static CutsceneMove cutsceneMove = {};
+
+// Concurrent blocking: one glide slot per actor (the hero + every npc), so
+// simultaneous "move" cues glide their actors together — a re-cue replaces
+// only that actor's glide, never another's. LttP scenes stay serialized by
+// their beats; concurrent glides are the ensemble QoL (two actors walking
+// off together).
+static const int CUTSCENE_MOVE_SLOTS = 1 + MAX_NPCS;
+static CutsceneMove cutsceneMoves[CUTSCENE_MOVE_SLOTS] = {};
+
+// Actor id -> glide slot (0 = the hero, 1+i = npc i), -1 = not an actor.
+static int cutsceneMoveSlot(int actor)
+{
+    if (actor == -2) return 0;
+    if (actor >= 0 && actor < MAX_NPCS) return 1 + actor;
+    return -1;
+}
 
 static int letterboxWanted = 0;  // target state: 1 = bars on
 static float letterboxT = 0.0f;  // eased slide (0..1)
@@ -578,6 +609,74 @@ static float scriptFadeDuration = 0.5f;
 // restore it (a room is never entered hidden).
 static bool heroHidden = false;
 
+// Image scenes (the "image" cue): a full-screen baked picture drawn over
+// the virtual viewport with the world (and HUD) hidden, letterbox optional
+// on top, typewriter text over it — LttP's storybook beats. One texture
+// slot at a time (the console budget): a new cue swaps it, the script
+// closing (or a room change) clears it.
+static Texture2D sceneTexture = {};
+static int sceneTextureIndex = -1;   // SCENES index the texture holds
+
+static bool sceneImageActive()
+{
+    return sceneTextureIndex >= 0;
+}
+
+static void clearSceneImage()
+{
+    if (sceneTexture.id != 0) UnloadTexture(sceneTexture);
+    sceneTexture = Texture2D{};
+    sceneTextureIndex = -1;
+}
+
+static void applySceneImageRequest(int scene)
+{
+    if (scene < 0)
+    {
+        // "" clears the picture (a mid-script cut back to the world).
+        clearSceneImage();
+        return;
+    }
+    if (scene >= SCENE_COUNT) return;
+    if (scene == sceneTextureIndex) return;  // same picture, keep it
+    clearSceneImage();
+    sceneTexture = LoadTexture(SCENES[scene].path);
+    SetTextureFilter(sceneTexture, TEXTURE_FILTER_POINT);
+    sceneTextureIndex = scene;
+}
+
+static void drawSceneImage()
+{
+    if (!sceneImageActive()) return;
+    // A failed load (shouldn't happen — the bake guarantees the file)
+    // still hides the world: black like the credits.
+    if (sceneTexture.id == 0)
+    {
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), BLACK);
+        return;
+    }
+    // Cover-fit: the picture fills the screen, the overflowing axis
+    // center-cropped (scenes authored at the virtual aspect scale clean).
+    float screenW = (float)GetScreenWidth();
+    float screenH = (float)GetScreenHeight();
+    float imageW = (float)sceneTexture.width;
+    float imageH = (float)sceneTexture.height;
+    Rectangle src = { 0.0f, 0.0f, imageW, imageH };
+    if (imageW * screenH > screenW * imageH)
+    {
+        src.width = imageH * screenW / screenH;
+        src.x = (imageW - src.width) * 0.5f;
+    }
+    else
+    {
+        src.height = imageW * screenH / screenW;
+        src.y = (imageH - src.height) * 0.5f;
+    }
+    Rectangle dest = { 0.0f, 0.0f, screenW, screenH };
+    Vector2 origin = { 0.0f, 0.0f };
+    DrawTexturePro(sceneTexture, src, dest, origin, 0.0f, WHITE);
+}
+
 static void updateCutscene(float dt)
 {
     // Camera pan: glide, then hold at the target.
@@ -592,9 +691,12 @@ static void updateCutscene(float dt)
     }
 
     // Actor blocking: hero and npc glides (the world is frozen while the
-    // script runs; the glide animates across it).
-    if (cutsceneMove.active)
+    // script runs; the glides animate across it). One slot per actor, so
+    // concurrent cues run together.
+    for (int slot = 0; slot < CUTSCENE_MOVE_SLOTS; slot++)
     {
+        CutsceneMove& cutsceneMove = cutsceneMoves[slot];
+        if (!cutsceneMove.active) continue;
         cutsceneMove.t += dt;
         float u = (cutsceneMove.duration > 0.0f)
                       ? clampf(cutsceneMove.t / cutsceneMove.duration, 0.0f, 1.0f)
@@ -680,6 +782,9 @@ static void applyCutsceneCameraRequest(int action, int tileX, int tileY, float s
 
 static void applyCutsceneMoveRequest(int actor, int tileX, int tileY, float seconds)
 {
+    int slot = cutsceneMoveSlot(actor);
+    if (slot < 0) return;
+    CutsceneMove& cutsceneMove = cutsceneMoves[slot];
     cutsceneMove.active = false;
     if (actor == -2)
     {
@@ -688,7 +793,7 @@ static void applyCutsceneMoveRequest(int actor, int tileX, int tileY, float seco
         cutsceneMove.fromX = c.x;
         cutsceneMove.fromY = c.y;
     }
-    else if (actor >= 0 && actor < MAX_NPCS && npcs[actor].active)
+    else if (npcs[actor].active)
     {
         cutsceneMove.actor = actor;
         cutsceneMove.fromX = npcs[actor].x + TILE_SIZE * 0.5f;
@@ -778,8 +883,9 @@ static void applyCutsceneHideRequest(int actor)
     }
     if (actor < 0 || actor >= MAX_NPCS) return;
     npcs[actor].active = false;
-    if (cutsceneMove.active && cutsceneMove.actor == actor)
-        cutsceneMove.active = false;
+    // A straggler glide onto it releases.
+    int slot = cutsceneMoveSlot(actor);
+    if (slot >= 0) cutsceneMoves[slot].active = false;
 }
 
 // Scripted fade: to black / back to the world over the given time.
@@ -1518,14 +1624,30 @@ static void saveToFile(int slot)
     SaveFileData(path, &data, sizeof(data));
 }
 
-// --- Game flow: title screen, save slots, save-and-quit -------------------
+// --- Game flow: boot cards, title screen, save slots, save-and-quit --------
 enum GameState
 {
-    STATE_TITLE,
+    STATE_LOGO,    // the company/developer card (game.json "logo")
+    STATE_TITLE,   // the title card + save menu (game.json "title_card")
     STATE_PLAYING
 };
-static int gameState = STATE_TITLE;
+static int gameState = STATE_LOGO;
 static int titleCursor = 0;
+
+// The boot sequence is data: a company card plays first (skippable),
+// then the title card holds the save menu. The title screen has two
+// beats — the card alone (phase 0, auto-advances), then the menu joins
+// it (phase 1). Unconfigured pieces skip past (a game with no logo
+// boots straight to the title, no card means the classic plain menu).
+static const float CARD_FADE = 0.4f;
+static float logoTime = 0.0f;
+static float titleCardTime = 0.0f;
+static int titlePhase = 1;
+
+// Boot flow (the cards are game.json data; see the update/draw pair
+// near the title screen code).
+static void enterLogoScreen();
+static void enterTitleScreen(int phase);
 
 // Fresh session: every piece of process-global state back to defaults
 // (called when starting/continuing a slot so slots don't leak into each
@@ -1547,15 +1669,11 @@ static void resetGameState()
     itemGet.active = false;
     clearWorldSystems();
 
-    // Demo starting inventory: everything owned, boomerang equipped, so
-    // the whole item surface is reachable (chests/item-get sequences
-    // will grant these properly later).
+    // A fresh game starts with nothing: chests, shops, and dialogue gifts
+    // grant the game's tools one by one (the old demo's "everything owned"
+    // starting kit lived here before real game content landed).
     inventory = Inventory();
-    for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++) inventory.give(i);
-    inventory.equippedItem = (ITEM_COUNT > 0) ? ITEM_BOOMERANG : -1;
-    inventory.arrows = 4;
-    inventory.bombs = 4;
-    inventory.magic = inventory.magicMax;
+    inventory.magicMax = 0;  // no magic meter until a grant awakens it
 }
 
 static void startNewGame(int slot)
@@ -1592,11 +1710,13 @@ static void continueGame(int slot)
 static void quitToTitle()
 {
     dialogue.close();  // no half-finished boxes across sessions
+    clearSceneImage();  // nor a lingering storybook picture
     saveToFile(saveSlotInUse);
-    gameState = STATE_TITLE;
-    startMusic(NULL);
     startAmbient(NULL);
     startDangerMusic(NULL);
+    // Straight to the menu beat — the company card plays at boot, not
+    // on every save-and-quit.
+    enterTitleScreen(1);
 }
 
 // Game font (resources/game.json "font"; the raylib default bitmap font
@@ -1636,6 +1756,7 @@ static Texture2D uiBossBarTexture = {};   // frame 124x10 + fill 120x6
 static Texture2D uiMagicBarTexture = {};  // frame 42x8 + fill 40x6
 static Texture2D uiMagicGaugeTexture = {}; // frame 7x42 + fill 3x40
 static Texture2D uiCountersTexture = {};  // 10x10 frames
+static Texture2D uiDoorsTexture = {};     // 40x48 door chrome (see drawDoorways)
 static Texture2D heartsTexture = {};      // 16x16 frames: full/half/empty
 
 // cursor.png frames
@@ -1806,8 +1927,79 @@ static void drawMapOverview(Rectangle area, int birdRoom, bool compassMarks)
     }
 }
 
+// Boot flow entry points. The scene-image slot doubles as the card
+// frame: the company logo and title backdrop are scene pictures, so
+// they ride the same single-texture console budget the storybook cues
+// use.
+static void enterLogoScreen()
+{
+    gameState = STATE_LOGO;
+    logoTime = 0.0f;
+    applySceneImageRequest(GAME_LOGO_SCENE);
+    if (GAME_LOGO_SFX) playNamedSfx(GAME_LOGO_SFX);
+}
+
+static void enterTitleScreen(int phase)
+{
+    gameState = STATE_TITLE;
+    titlePhase = phase;               // 0: the card beat, 1: menu up
+    titleCardTime = 0.0f;
+    if (GAME_TITLE_SCENE >= 0) applySceneImageRequest(GAME_TITLE_SCENE);
+    else clearSceneImage();
+    startMusic(GAME_TITLE_MUSIC);     // 0 stops any lingering track
+}
+
+static void updateLogo()
+{
+    logoTime += frameDt();
+    float total = GAME_LOGO_SECONDS + CARD_FADE * 2.0f;
+    // The card is skippable: a press jumps to the fade-out instead of
+    // past it, so the cut to the title card stays a fade. The hold runs
+    // out on its own the same way.
+    if (actionPressed() && logoTime < total - CARD_FADE)
+        logoTime = total - CARD_FADE;
+    if (logoTime >= total) enterTitleScreen(0);
+}
+
+static void drawLogoScreen()
+{
+    float scale = virtualScale();
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    drawSceneImage();
+    if (GAME_LOGO_TEXT && GAME_LOGO_TEXT[0])
+    {
+        int size = (int)(12 * scale);
+        int width = uiMeasureText(GAME_LOGO_TEXT, size);
+        uiDrawText(GAME_LOGO_TEXT, (sw - width) / 2,
+                   (int)(sh - 34 * scale), size, RAYWHITE);
+    }
+    // Fade in from boot, fade out to the title card.
+    float total = GAME_LOGO_SECONDS + CARD_FADE * 2.0f;
+    float alpha = 1.0f;
+    if (logoTime < CARD_FADE) alpha = logoTime / CARD_FADE;
+    else if (logoTime > total - CARD_FADE) alpha = (total - logoTime) / CARD_FADE;
+    if (alpha < 1.0f)
+    {
+        unsigned char cover = (unsigned char)(255 * (1.0f - alpha));
+        DrawRectangle(0, 0, sw, sh, Color{ 0, 0, 0, cover });
+    }
+}
+
 static void updateTitle()
 {
+    // The card beat: the title plays alone before the menu joins it.
+    if (titlePhase == 0)
+    {
+        titleCardTime += frameDt();
+        if (actionPressed() || titleCardTime >= GAME_TITLE_SECONDS)
+        {
+            titlePhase = 1;
+            PlaySound(sndUiButton);
+        }
+        return;
+    }
+
     bool prev = IsKeyPressed(KEY_UP);
     bool next = IsKeyPressed(KEY_DOWN);
     for (int i = 0; i < 4; i++)
@@ -1837,19 +2029,38 @@ static void drawTitleScreen()
     int sw = GetScreenWidth();
     int sh = GetScreenHeight();
 
-    const char* title = "LTOP ENGINE";
-    int titleSize = (int)(24 * scale);
-    int width = uiMeasureText(title, titleSize);
-    uiDrawText(title, (sw - width) / 2, (int)(34 * scale), titleSize, RAYWHITE);
+    // The backdrop: the configured title card, full-bleed. Without one
+    // the classic plain menu carries on (the engine chrome line + the
+    // game title as its subtitle).
+    bool card = sceneImageActive();
+    if (card) drawSceneImage();
 
-    const char* sub = GAME_TITLE;
-    int subSize = (int)(8 * scale);
-    width = uiMeasureText(sub, subSize);
-    uiDrawText(sub, (sw - width) / 2, (int)(64 * scale), subSize,
-             Color{ 170, 170, 200, 255 });
+    if (card)
+    {
+        // With a card, the game's own title is the headline.
+        const char* title = GAME_TITLE;
+        int titleSize = (int)(20 * scale);
+        int width = uiMeasureText(title, titleSize);
+        uiDrawText(title, (sw - width) / 2, (int)(40 * scale), titleSize, RAYWHITE);
+    }
+    else
+    {
+        const char* title = "LTOP ENGINE";
+        int titleSize = (int)(24 * scale);
+        int width = uiMeasureText(title, titleSize);
+        uiDrawText(title, (sw - width) / 2, (int)(34 * scale), titleSize, RAYWHITE);
+
+        const char* sub = GAME_TITLE;
+        int subSize = (int)(8 * scale);
+        width = uiMeasureText(sub, subSize);
+        uiDrawText(sub, (sw - width) / 2, (int)(64 * scale), subSize,
+                 Color{ 170, 170, 200, 255 });
+    }
 
     // Save slots: sparse text over icons (SNES-style), a summary of
-    // what's inside each.
+    // what's inside each. They join after the card beat.
+    if (titlePhase == 1)
+    {
     float listX = sw * 0.5f - 100.0f * scale;
     float listY = 104.0f * scale;
     for (int slot = 0; slot < SAVE_SLOT_COUNT; slot++)
@@ -1897,12 +2108,27 @@ static void drawTitleScreen()
                         listX / scale + 6.0f, cy / scale - 4.0f, WHITE);
         }
     }
+    }
 
-    const char* hint = "ACTION: START";
+    const char* hint = titlePhase == 0 ? "PRESS ACTION" : "ACTION: START";
     int hintSize = (int)(8 * scale);
-    width = uiMeasureText(hint, hintSize);
+    int width = uiMeasureText(hint, hintSize);
+    // A gentle pulse during the card beat, like the real thing.
+    unsigned char hintAlpha = 255;
+    if (titlePhase == 0)
+        hintAlpha = (unsigned char)(150 + 100 *
+                     (0.5f + 0.5f * sinf((float)GetTime() * 3.0f)));
     uiDrawText(hint, (sw - width) / 2, sh - (int)(16 * scale), hintSize,
-             Color{ 170, 170, 190, 255 });
+             Color{ 170, 170, 190, hintAlpha });
+
+    // The card fades in from the logo's cut.
+    float alpha = 1.0f;
+    if (titleCardTime < CARD_FADE) alpha = titleCardTime / CARD_FADE;
+    if (alpha < 1.0f)
+    {
+        unsigned char cover = (unsigned char)(255 * (1.0f - alpha));
+        DrawRectangle(0, 0, sw, sh, Color{ 0, 0, 0, cover });
+    }
 }
 
 static void spawnExplosion(float x, float y)
@@ -2303,6 +2529,45 @@ static void useBottle()
     inventory.bottleContents[slot] = Inventory::BOTTLE_EMPTY;
 }
 
+// Can this press's use-action actually run? A no-op press — a boomerang
+// already airborne, a chain already out, the flute picker open, a toggle
+// with no magic to burn, a bottle with nothing in it, a mirror with no
+// pair to step through — rattles the error cue, costs nothing, and
+// never replays the use sfx (the costs and cues only pay on a real use).
+static bool bottleReady()
+{
+    int tileX = 0;
+    int tileY = 0;
+    hero.tileUnder(tileX, tileY);
+    if (room.tileMetaAt(tileX, tileY).heal && inventory.firstEmptyBottle() >= 0)
+        return true;
+    int contents = Inventory::BOTTLE_EMPTY;
+    return inventory.firstFilledBottle(contents) >= 0;
+}
+
+static bool itemUseReady(const ItemConfig& item)
+{
+    switch (item.useKind)
+    {
+    case ITEM_USE_BOOMERANG: return !boomer.active;
+    case ITEM_USE_HOOKSHOT: return !hook.active;
+    case ITEM_USE_FLUTE: return !fluteMenu;
+    case ITEM_USE_BYRNA: return !byrnaActive || inventory.magic > 0;
+    case ITEM_USE_CAPE: return !capeActive || inventory.magic > 0;
+    case ITEM_USE_SOMARIA:
+        return item.spawnObject >= 0 && item.spawnObject < OBJECT_COUNT;
+    case ITEM_USE_BOTTLE: return bottleReady();
+    case ITEM_USE_MIRROR:
+    {
+        const RoomConfig& rc = room.config();
+        return rc.mirrorRoom >= 0 && rc.mirrorRoom < ROOM_COUNT
+               && !bossAliveInRoom();
+    }
+    default:
+        return true;  // bow, bombs, bolts, medallions, hammer, shovel, net
+    }
+}
+
 static void useEquippedItem()
 {
     if (inventory.equippedItem < 0 || inventory.equippedItem >= ITEM_COUNT) return;
@@ -2310,6 +2575,11 @@ static void useEquippedItem()
     if (item.useKind == ITEM_USE_NONE)
     {
         PlaySound(sndError);  // passive item (or nothing) equipped
+        return;
+    }
+    if (!itemUseReady(item))
+    {
+        PlaySound(sndError);
         return;
     }
 
@@ -2499,16 +2769,18 @@ static void clearWorldSystems()
     for (int i = 0; i < MAX_BOMBS_LIVE; i++) bombs[i].active = false;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].active = false;
     for (int i = 0; i < MAX_NPCS; i++) npcs[i].active = false;
-    // Cutscene stragglers never survive a room change: pans release, a
-    // blocking glide stops mid-stride, the bars ease back out, a scripted
-    // fade lifts, and a hidden hero steps back into the world.
+    // Cutscene stragglers never survive a room change: pans release, any
+    // blocking glides stop mid-stride, the bars ease back out, a scripted
+    // fade lifts, a hidden hero steps back into the world, and a scene
+    // picture drops with the world it was hiding.
     cutsceneCam.active = false;
     cutsceneCam.panning = false;
-    cutsceneMove.active = false;
+    for (int i = 0; i < CUTSCENE_MOVE_SLOTS; i++) cutsceneMoves[i].active = false;
     letterboxWanted = 0;
     scriptFadeWanted = 0;
     scriptFadeT = 0.0f;
     heroHidden = false;
+    clearSceneImage();
 }
 
 static bool encounterAvailable(const Encounter& encounter)
@@ -4118,7 +4390,12 @@ static void applyChestGrant(int kind, int param)
     case GRANTEFFECT_ADD_RUPEES: inventory.addRupees(param > 0 ? param : 1); break;
     case GRANTEFFECT_ADD_ARROWS: inventory.addArrows(param > 0 ? param : 1); break;
     case GRANTEFFECT_ADD_BOMBS: inventory.addBombs(param > 0 ? param : 1); break;
-    case GRANTEFFECT_ADD_MAGIC: inventory.addMagic(param > 0 ? param : 2); break;
+    case GRANTEFFECT_ADD_MAGIC:
+        // The first magic grant awakens a dormant meter (a fresh game
+        // starts with none — see resetGameState), then fills it.
+        if (inventory.magicMax <= 0) inventory.magicMax = 16;
+        inventory.addMagic(param > 0 ? param : 2);
+        break;
     case GRANTEFFECT_ADD_HEARTS: hero.addMaxHearts(2); break;
     case GRANTEFFECT_ADD_SMALL_KEY: inventory.smallKeys++; break;
     case GRANTEFFECT_ADD_BIG_KEY: inventory.bigKeys++; break;
@@ -4944,7 +5221,10 @@ static void updatePowder()
         }
 
         // Shrine-style awakening: the sprinkle sets its story flag
-        // (aux2 through the shared world-flag registry — it persists).
+        // (aux2 through the shared world-flag registry — it persists),
+        // and an optional reaction dialogue (aux1, baked like a sign's)
+        // plays the moment — the keeper stirs, the witch shrieks, the
+        // stone yawns. Without one the flag + sting speak for themselves.
         if (objInteracts(o, OBJINT_POWDER) && !o.switchActive
             && o.aux2 >= 0 && o.aux2 < WORLD_FLAG_COUNT)
         {
@@ -4953,6 +5233,8 @@ static void updatePowder()
             spawnParticles(o.x + 16.0f, o.y + 12.0f, 12, 170, 230, 140,
                            80.0f, 130.0f);
             playNamedSfx("secret.wav");
+            if (o.aux1 >= 0 && o.aux1 < DIALOGUE_COUNT)
+                dialogue.open(DIALOGUES[o.aux1]);
         }
     }
 }
@@ -5488,8 +5770,9 @@ static void updateEnemies()
         }
 
         // Contact damage: pushed away from the enemy (dashing plows
-        // through without taking damage).
-        if (!dashContact && overlap(enemy.box(), heroBox))
+        // through without taking damage). Behavior-set "harmless" holds
+        // contact off — a submerged zora is scenery until it surfaces.
+        if (!dashContact && !enemy.isHarmless() && overlap(enemy.box(), heroBox))
         {
             float hdx = heroCenter.x - enemyCenter.x;
             float hdy = heroCenter.y - enemyCenter.y;
@@ -5738,11 +6021,15 @@ static void updateBoomerang()
         boomer.y += dy / dist * move;
     }
 
-    // Stun enemies it touches (once per stun period).
+    // Stun enemies it touches — once: an already-stunned (or frozen)
+    // enemy isn't re-stunned, so the cue doesn't rattle every frame and
+    // the timer doesn't stretch while the tool sits on it.
     Rectangle flight = { boomer.x - 8.0f, boomer.y - 8.0f, 16.0f, 16.0f };
     for (int e = 0; e < enemyCount; e++)
     {
         if (!enemies[e].alive()) continue;
+        if (enemies[e].modeState() == Enemy::ENEMY_STUN
+            || enemies[e].modeState() == Enemy::ENEMY_FROZEN) continue;
         if (!overlap(flight, enemies[e].box())) continue;
         enemies[e].stun(1.2f);
         PlaySound(sndBoomerangHit);
@@ -5782,10 +6069,13 @@ static void updateHookshot()
 
     Rectangle head = { hook.x - 6.0f, hook.y - 6.0f, 12.0f, 12.0f };
 
-    // Stun enemies / collect pickups the head passes through.
+    // Stun enemies / collect pickups the head passes through (stuns
+    // dedupe like the boomerang: no re-stun, no cue rattle).
     for (int e = 0; e < enemyCount; e++)
     {
         if (!enemies[e].alive()) continue;
+        if (enemies[e].modeState() == Enemy::ENEMY_STUN
+            || enemies[e].modeState() == Enemy::ENEMY_FROZEN) continue;
         if (!overlap(head, enemies[e].box())) continue;
         enemies[e].stun(1.2f);
         PlaySound(sndBoomerangHit);
@@ -6571,8 +6861,12 @@ static void maybeStartRoomTransition()
 
 static void updateRoomTransition(float dt)
 {
-    // Glide the hero from the off-map start to the entry tile (ease-out);
-    // the camera branch below follows it unclamped until it lands.
+    // Glide the hero from the off-map start to the entry tile (ease-out).
+    // The camera stays on the ordinary clamped hero-follow, so it sits
+    // at the entry band from the first frame of the new room — the hero
+    // strides in at the edge of the frame, and nothing snaps when the
+    // transition ends (following the off-map start unclamped showed
+    // the void past the map and jumped the whole view at the landing).
     roomTransition.t += dt / ROOM_TRANSITION_DURATION;
     if (roomTransition.t >= 1.0f)
     {
@@ -6583,11 +6877,19 @@ static void updateRoomTransition(float dt)
     float nx = roomTransition.startX + (roomTransition.endX - roomTransition.startX) * e;
     float ny = roomTransition.startY + (roomTransition.endY - roomTransition.startY) * e;
     Vector2 c = hero.center();
-    hero.nudge(nx - (c.x - TILE_SIZE * 0.5f), ny - (c.y - TILE_SIZE * 0.5f));
+    float dx = nx - (c.x - TILE_SIZE * 0.5f);
+    float dy = ny - (c.y - TILE_SIZE * 0.5f);
+    hero.nudge(dx, dy);
+    // Legs + footsteps keep ticking while the world is frozen (update()
+    // isn't called): the hero walks in, it doesn't statue-slide in.
+    hero.advanceWalkCycle(room, dt, sqrtf(dx * dx + dy * dy));
 }
 
-// Doors render at their edge midpoint: a dark open archway, or a slab
-// (keyhole / cracks / shutter bars) while closed.
+// Doors render at their edge midpoint as sprite chrome (ui/doors.png):
+// row 0 holds the horizontal doors (N/S walls), row 1 the vertical ones
+// (E/W); columns match the door kinds in order, column 0 the open
+// archway any kind shows once it stands open. Without the sheet the
+// code-drawn shapes stand in (every chrome sprite has a shape story).
 static void drawDoorways()
 {
     const RoomConfig& cfg = room.config();
@@ -6599,7 +6901,6 @@ static void drawDoorways()
         int kind = doorKind(currentRoom, edge);
         if (kind == DOOR_NONE || kind >= DOOR_KIND_COUNT) continue;
         const DoorRule& rule = DOOR_RULES[kind];
-        if (rule.startsOpen) continue;
 
         float cx = mapW * 0.5f;
         float cy = mapH * 0.5f;
@@ -6612,13 +6913,33 @@ static void drawDoorways()
         default: break;
         }
 
+        bool open = doorIsOpen(currentRoom, edge);
+
+        if (uiDoorsTexture.id != 0)
+        {
+            // 40x48 cells; horizontal doors ride the middle band,
+            // vertical doors the middle columns, so both center on the
+            // wall midpoint. Columns: open archway, then the kinds in
+            // generator order (closed, locked, big, bombable, shutter).
+            int frame = (edge <= 1 ? 0 : 6) + (open ? 0 : kind);
+            Rectangle src = { (float)((frame % 6) * 40),
+                              (float)((frame / 6) * 48), 40.0f, 48.0f };
+            Rectangle dest = { cx - 20.0f, cy - 24.0f, 40.0f, 48.0f };
+            Vector2 origin = { 0.0f, 0.0f };
+            DrawTexturePro(uiDoorsTexture, src, dest, origin, 0.0f, WHITE);
+            continue;
+        }
+
         float w = 32.0f;
         float h = 48.0f;
         // Slabs run along the wall; archways open along the walk direction.
         if (edge <= 1) { w = 40.0f; h = 24.0f; }
         Rectangle slab = { cx - w * 0.5f, cy - h * 0.5f, w, h };
 
-        if (doorIsOpen(currentRoom, edge))
+        // "Open" doors draw as archways too (doorIsOpen returns true for
+        // startsOpen rules) — an open gate should look like a doorway,
+        // not bare wall.
+        if (open)
         {
             // Open: dark archway with a frame.
             DrawRectangleRec(slab, Color{ 10, 10, 20, 255 });
@@ -6695,6 +7016,16 @@ static void updateAndDraw(void)
         jingleDucking = false;
         if (musicLoaded) ResumeMusicStream(music);
         if (dangerLoaded) ResumeMusicStream(dangerMusic);
+    }
+
+    if (gameState == STATE_LOGO)
+    {
+        updateLogo();
+        BeginDrawing();
+        ClearBackground(BLACK);
+        drawLogoScreen();
+        EndDrawing();
+        return;
     }
 
     if (gameState == STATE_TITLE)
@@ -6793,6 +7124,10 @@ static void updateAndDraw(void)
             float fadeSeconds = 0.0f;
             if (dialogue.takeFadeRequest(fadeTo, fadeSeconds))
                 applyCutsceneFadeRequest(fadeTo, fadeSeconds);
+
+            int imageScene = -1;
+            if (dialogue.takeImageRequest(imageScene))
+                applySceneImageRequest(imageScene);
         }
     }
     else if (!paused && !fluteWasOpen)
@@ -6836,6 +7171,7 @@ static void updateAndDraw(void)
 
             updateDashSmash();  // pegasus boots shatter pots/bushes pre-move
             hero.setCanSwim(swimItemOwned());
+            hero.setSwordEnabled(swordUnlocked());
             updatePlatforms(frameDt());  // rafts glide + carry before the walk
             hero.update(room, frameDt());
             // Pit-landing: a completed fall-through warps the hero into
@@ -6926,6 +7262,10 @@ static void updateAndDraw(void)
         {
             dialogue.open(DIALOGUES[nextDialogue]);
         }
+
+        // A script that fully finished (no chain pending — the open above
+        // happens in the same frame) drops its scene picture with the box.
+        if (!dialogue.isActive()) clearSceneImage();
     }
 
     // The item-get sequence ends when its description dialogue closes.
@@ -6996,16 +7336,22 @@ static void updateAndDraw(void)
     }
     camera.target = Vector2{ camX, camY };
 
-    if (roomTransition.active)
-    {
-        // Scroll-in: follow the gliding hero unclamped (it starts a tile
-        // off-map); it converges to the clamped position as it lands.
-        camera.target = hero.center();
-    }
+    // Scroll-in glides ride the same clamped follow above: the entry
+    // landing sits at a map edge, inside the clamp band, so the camera
+    // holds still through the whole glide and hands off seamlessly.
 
     BeginDrawing();
     ClearBackground(BLACK);
 
+    // Image scenes: the picture replaces the world (and the HUD) while the
+    // cue holds — fades/flash still wash over it (the cuts), letterbox and
+    // dialogue text still draw on top.
+    if (sceneImageActive())
+    {
+        drawSceneImage();
+    }
+    else
+    {
     BeginMode2D(camera);
     room.draw(roomTilesetTexture(), camera);
     drawFloorObjects();
@@ -7026,6 +7372,7 @@ static void updateAndDraw(void)
     // Ambient tint and weather layers, under the HUD like the lightmap.
     drawTint();
     drawWeather();
+    }
 
     // Scripted screen fade (the "fade" cue): the whole world dips to
     // black and back on the cutscene's clock (under the HUD, bars, and
@@ -7067,7 +7414,8 @@ static void updateAndDraw(void)
         DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), c);
     }
 
-    drawHud();
+    // The HUD hides under a scene picture (like the credits' black).
+    if (!sceneImageActive()) drawHud();
     drawToasts();
     drawPauseOverlay();
     drawFluteMenu();
@@ -7106,6 +7454,9 @@ static void updateAndDraw(void)
                       (int)barH + 1, BLACK);
     }
 
+    // The box skips its credits-black when the scene picture already is
+    // the backdrop (the storybook roll composes the "image" cue).
+    dialogue.setSceneBackdrop(sceneImageActive());
     dialogue.draw();
 
     EndDrawing();
@@ -7181,6 +7532,7 @@ int main(int argc, char** argv)
         { uiMagicBarTexture, "assets/ui/bar_magic.png" },
         { uiMagicGaugeTexture, "assets/ui/gauge_magic.png" },
         { uiCountersTexture, "assets/ui/counters.png" },
+        { uiDoorsTexture, "assets/ui/doors.png" },
     };
     for (UiSheetLoad& sheet : uiSheets)
     {
@@ -7268,14 +7620,25 @@ int main(int argc, char** argv)
     }
 #endif
 
-    // Title screen: the chosen slot starts (or continues) the game.
-    gameState = STATE_TITLE;
+    // Boot sequence: the company card (game.json "logo") plays first,
+    // then the title card holds the save menu ("title_card"). A logo
+    // needs a picture or a studio line; without either the boot lands
+    // straight on the title. (--room below overrides into a test
+    // session regardless.)
+    if (GAME_LOGO_SCENE >= 0 || (GAME_LOGO_TEXT && GAME_LOGO_TEXT[0]))
+        enterLogoScreen();
+    else
+        enterTitleScreen(GAME_TITLE_SCENE >= 0 ? 0 : 1);
 
     // Test-from-here (editor hook): --room <name|stem> [--tile x,y] jumps
-    // straight into that room — a fresh demo start (full hearts, the demo
-    // inventory) with saving suppressed, skipping the title.
+    // straight into that room — a fresh start (full hearts, the test
+    // session carries the game's blade so gated-sword games stay
+    // testable) with saving suppressed, skipping the title.
+    // --enemy <name> (with --room) additionally spawns that enemy beside
+    // the drop tile — the editor's one-click tuning sandbox.
     {
         const char* testRoom = 0;
+        const char* testEnemy = 0;
         int testTileX = -1;
         int testTileY = -1;
         for (int i = 1; i < argc; i++)
@@ -7294,6 +7657,10 @@ int main(int argc, char** argv)
                     testTileY = ty;
                 }
             }
+            else if (strcmp(argv[i], "--enemy") == 0 && i + 1 < argc)
+            {
+                testEnemy = argv[++i];
+            }
         }
         if (testRoom && testRoom[0])
         {
@@ -7302,8 +7669,39 @@ int main(int argc, char** argv)
             {
                 testMode = true;
                 resetGameState();
+                // A test session carries the game's blade: the sword is
+                // item-gated data now, and a sandbox hero with no way to
+                // swing helps nobody.
+                for (int i = 0; i < ITEM_COUNT && i < Inventory::MAX_ITEMS; i++)
+                    if (ITEMS[i].hasSword) inventory.give(i);
                 loadRoom(roomIndex_, -1, testTileX, testTileY);
                 gameState = STATE_PLAYING;
+                if (testEnemy && testEnemy[0] && enemyCount < 16)
+                {
+                    // Tuning sandbox: the named enemy drops in two tiles
+                    // from the hero (clamped inside the map). The sheet
+                    // pool holds 16 textures, like the room spawner.
+                    int enemyIndex_ = enemyIndex(testEnemy);
+                    if (enemyIndex_ >= 0 && enemyIndex_ < 16)
+                    {
+                        Vector2 heroTile = { floorf(hero.center().x / TILE_SIZE),
+                                             floorf(hero.center().y / TILE_SIZE) };
+                        const RoomConfig& rc = room.config();
+                        int ex = (int)heroTile.x + 2;
+                        int ey = (int)heroTile.y + 2;
+                        if (ex > rc.mapWidth - 1) ex = rc.mapWidth - 1;
+                        if (ey > rc.mapHeight - 1) ey = rc.mapHeight - 1;
+                        if (ex < 0) ex = 0;
+                        if (ey < 0) ey = 0;
+                        enemies[enemyCount].spawn(ENEMIES[enemyIndex_],
+                                                   enemySheets[enemyIndex_], ex, ey);
+                        enemyCount++;
+                    }
+                    else
+                    {
+                        fprintf(stderr, "test enemy: unknown enemy '%s'\n", testEnemy);
+                    }
+                }
             }
             else
             {
@@ -7358,6 +7756,7 @@ int main(int argc, char** argv)
     }
     shutdownNamedSfx();
     UnloadTexture(lightGradient);
+    if (sceneTexture.id != 0) UnloadTexture(sceneTexture);
     if (lightRT.texture.id != 0) UnloadRenderTexture(lightRT);
 
     CloseAudioDevice();

@@ -1,0 +1,49 @@
+{
+    "lines": [
+        {
+            "text": "So. The rain woke you, and Aaron woke your courage.",
+            "unless_item": "sword"
+        },
+        {
+            "text": "Listen well: the Hollow King took the Heartstone below the ridge, into the Sunken Crypt.",
+            "unless_item": "sword"
+        },
+        {
+            "text": "My adventuring days are done. Take my old blade from the chest.",
+            "unless_item": "sword"
+        },
+        {
+            "text": "Press X to swing it. Hold X to charge a spin. Z lifts things. ENTER rests and saves.",
+            "unless_item": "sword"
+        },
+        {
+            "text": "That blade's yours now. A sword's a promise - keep it sharp.",
+            "if_item": "sword",
+            "unless": "entered_crypt"
+        },
+        {
+            "text": "The Crypt's stair waits on the ridge north of the meadow. Bomb the cracked walls.",
+            "if_item": "sword",
+            "unless": "entered_crypt"
+        },
+        {
+            "text": "Green dust wakes the sleeping. It matters below - trust an old man.",
+            "if_item": "sword",
+            "unless": "entered_crypt"
+        },
+        {
+            "text": "The old signs down there still give true hints. Read them all.",
+            "if": "entered_crypt",
+            "unless": "game_complete"
+        },
+        {
+            "text": "If you meet a wizard who laughs at your sword... hit him with his own magic.",
+            "if": "entered_crypt",
+            "unless": "game_complete"
+        },
+        {
+            "text": "The Heartstone hums again, and the rain's gone. You've repaid us all, child.",
+            "if": "game_complete"
+        }
+    ]
+}

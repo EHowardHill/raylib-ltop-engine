@@ -1,0 +1,57 @@
+{
+    "lines": [
+        {
+            "text": "Enoki! You're awake! Thank the fields.",
+            "unless_item": "sword"
+        },
+        {
+            "text": "The Heartstone is gone and the storm won't quit. Elder Rowan is asking for you.",
+            "unless_item": "sword"
+        },
+        {
+            "text": "His house is the one with the lantern - go on, I'll watch the road.",
+            "unless_item": "sword",
+            "set": [
+                "aaron_sent"
+            ]
+        },
+        {
+            "text": "That's Rowan's old blade! Heh, look at you.",
+            "if_item": "sword",
+            "unless": "entered_crypt"
+        },
+        {
+            "text": "The meadow north of here hides bombs in the grass caves. You'll want those.",
+            "if_item": "sword",
+            "unless": "entered_crypt"
+        },
+        {
+            "text": "And watch the ridge - the storm up there bites. The Crypt's old stair is the only way in.",
+            "if_item": "sword",
+            "unless": "entered_crypt"
+        },
+        {
+            "text": "You found the Crypt's stair? Don't go dying down there, you hear?",
+            "if": "entered_crypt",
+            "unless": "game_complete"
+        },
+        {
+            "text": "Mara restocks her stall if you need anything. Fen keeps an eye out for bees.",
+            "if": "entered_crypt",
+            "unless": "game_complete"
+        },
+        {
+            "text": "Look at that - the sky's letting up! You actually did it, Enoki.",
+            "if": "game_complete"
+        },
+        {
+            "text": "The Heartstone hums in the shrine like it never left. Village owes you a festival.",
+            "if": "game_complete"
+        },
+        {
+            "text": "Rain's done! Done! I'm going puddle-jumping!",
+            "sfx": "cucco.wav",
+            "if": "game_complete"
+        }
+    ]
+}

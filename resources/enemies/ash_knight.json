@@ -1,0 +1,47 @@
+{
+    "width": 4,
+    "color": [
+        180,
+        50,
+        50
+    ],
+    "stand": {
+        "down": [
+            0
+        ],
+        "right": [
+            1
+        ],
+        "left": [
+            2
+        ],
+        "up": [
+            3
+        ]
+    },
+    "move": {
+        "down": [
+            0,
+            4
+        ],
+        "right": [
+            1,
+            5
+        ],
+        "left": [
+            2,
+            6
+        ],
+        "up": [
+            3,
+            7
+        ]
+    },
+    "stats": {
+        "hp": 12,
+        "speed": 55,
+        "damage": 3,
+        "behavior": "boss",
+        "sight": 260
+    }
+}

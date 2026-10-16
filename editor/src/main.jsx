@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useContext, createContext } from 'react';
+import { useState, useEffect, useRef, useCallback, useContext, createContext, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { api, resourceUrl, resourceText } from './api.js';
@@ -159,6 +159,11 @@ function FileTab({ scan, refresh }) {
             : (result.output || 'Build failed.'));
     };
 
+    const quitGame = async () => {
+        const result = await api('/api/stop_game');
+        setPlayStatus(result.wasRunning ? 'Quit the running game.' : 'No game running.');
+    };
+
     return (
         <div>
             <h1>File</h1>
@@ -204,6 +209,9 @@ function FileTab({ scan, refresh }) {
                     <button className="btn primary" onClick={makeAndPlay} disabled={playing}>
                         {playing ? 'Building…' : 'Build & Play'}
                     </button>
+                    <button className="btn" onClick={quitGame}
+                        title="Quit the running dev build (a new launch replaces it anyway)">
+                        Quit game</button>
                 </div>
                 {playStatus && <p className="dim" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>{playStatus}</p>}
             </div>
@@ -234,7 +242,7 @@ const TOOL_HINTS = {
     fill: 'Click to flood-fill a region of the active layer. Right-click fills with empty.',
     rect: 'Drag a rectangle to fill it on the active layer. Right-drag fills with empty.',
     pick: 'Click a tile to grab it into the palette.',
-    select: 'Click or drag the spawn / encounter / entity markers to move them. Del removes the selection.',
+    select: 'Click or drag the spawn / encounter / entity markers to move them. Del removes the selection. With an NPC or platform selected: click open ground to add a path waypoint, drag the numbered circles to shape the rail, right-click one to remove it (Esc deselects).',
     spawn: 'Click a tile to place the hero spawn.',
     instant: 'Click a tile to add an instant encounter.',
     interactive: 'Click a tile to add an interactive (action-button) encounter.',
@@ -304,6 +312,7 @@ function RoomEditor({ room, scan, onSaved }) {
     const [hover, setHover] = useState(null);
     const [rectStart, setRectStart] = useState(null);
     const [selected, setSelected] = useState(null);
+    const [wpSel, setWpSel] = useState(null);   // waypoint index in the selected entity's path
     const [img, setImg] = useState(null);
     const [newW, setNewW] = useState(room.mapWidth);
     const [newH, setNewH] = useState(room.mapHeight);
@@ -357,15 +366,15 @@ function RoomEditor({ room, scan, onSaved }) {
             const key = e.key.toLowerCase();
             const keys = { b: 'paint', e: 'erase', g: 'fill', r: 'rect', i: 'pick', v: 'select', s: 'spawn', n: 'instant', m: 'interactive', o: 'object', k: 'enemy', p: 'npc', u: 'pickup' };
             if (keys[key]) { setTool(keys[key]); return; }
-            if (key === 'escape') { setSelected(null); setRectStart(null); return; }
+            if (key === 'escape') { setSelected(null); setWpSel(null); setRectStart(null); return; }
             if ((key === 'delete' || key === 'backspace') && selected && selected !== 'spawn') {
-                removeEntity(selected);
-                setSelected(null);
+                if (wpSel != null) removeWaypoint(selected, wpSel);
+                else { removeEntity(selected); setSelected(null); }
             }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [selected]);
+    }, [selected, wpSel]);
 
     // ---- rendering -------------------------------------------------------
 
@@ -481,7 +490,40 @@ function RoomEditor({ room, scan, onSaved }) {
                 ctx.fillText(label.toUpperCase(), x + ts / 2, y + ts / 2 + 1);
             });
         }
-    }, [img, layers, vis, def, enc, objects, enemies, npcs, pickups, hover, tool, rectStart, selected, showGrid, zoom, W, H]);
+
+        // The selected NPC/platform's waypoint path: a connected rail of
+        // numbered circles (the engine walks them in a loop).
+        {
+            const pathEntry = pathOf(selected);
+            if (pathEntry && pathEntry.path && pathEntry.path.length) {
+                const pts = pathEntry.path.filter(p => p);
+                const color = selected.kind === 'npc' ? ENTITY_COLORS.npc : ENTITY_COLORS.object;
+                const loc = pathEntry.location || [0, 0];
+                ctx.globalAlpha = 0.5;
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(loc[0] * ts + ts / 2, loc[1] * ts + ts / 2);
+                pts.forEach(p => ctx.lineTo(p[0] * ts + ts / 2, p[1] * ts + ts / 2));
+                if (pts.length > 1) ctx.lineTo(pts[0][0] * ts + ts / 2, pts[0][1] * ts + ts / 2);
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+                pts.forEach((p, i) => {
+                    const cx = p[0] * ts + ts / 2, cy = p[1] * ts + ts / 2;
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, 8, 0, Math.PI * 2);
+                    ctx.fillStyle = color;
+                    ctx.fill();
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = i === wpSel ? '#fff' : 'rgba(0,0,0,0.5)';
+                    ctx.stroke();
+                    ctx.fillStyle = '#fff';
+                    ctx.font = 'bold 10px sans-serif';
+                    ctx.fillText(String(i), cx, cy + 1);
+                });
+            }
+        }
+    }, [img, layers, vis, def, enc, objects, enemies, npcs, pickups, hover, tool, rectStart, selected, wpSel, showGrid, zoom, W, H]);
 
     // ---- map interaction -------------------------------------------------
 
@@ -541,6 +583,66 @@ function RoomEditor({ room, scan, onSaved }) {
         else if (kind === 'enemy') setEnemies(value);
         else if (kind === 'npc') setNpcs(value);
         else setPickups(value);
+    };
+
+    // A fresh entity selection starts with no waypoint picked.
+    useEffect(() => { setWpSel(null); }, [selected]);
+
+    // ---- waypoint paths (NPC walks / platform rails) ----------------------
+    // Both are [[x,y], ...] tile lists. With their entity selected, the
+    // waypoints render as numbered circles: click open ground to extend,
+    // drag to shape, right-click (or Del) to remove.
+    const platformTypes = new Set(
+        (scan.objectTypes || [])
+            .filter(t => (t.interactions || []).includes('platform'))
+            .map(t => t.name));
+
+    const pathOf = marker => {
+        if (!marker || marker === 'spawn') return null;
+        if (marker.kind === 'npc') return npcs[marker.index] || null;
+        if (marker.kind === 'object') {
+            const entry = objects[marker.index];
+            if (entry && platformTypes.has(entry.type)) return entry;
+        }
+        return null;
+    };
+
+    const patchPath = (marker, mutator) => {
+        setEntityList(marker.kind, entityList(marker.kind).map((entry, j) =>
+            j === marker.index ? mutator(entry) : entry));
+        setDirty(true);
+    };
+
+    const waypointAt = tile => {
+        const entry = pathOf(selected);
+        if (!entry || !entry.path || !tile) return null;
+        for (let i = entry.path.length - 1; i >= 0; i--) {
+            const p = entry.path[i];
+            if (p && p[0] === tile[0] && p[1] === tile[1]) return i;
+        }
+        return null;
+    };
+
+    const moveWaypoint = (marker, wp, tile) => {
+        patchPath(marker, entry => {
+            if (!entry.path || entry.path[wp] == null) return entry;
+            const path = entry.path.slice();
+            path[wp] = tile.slice();
+            return { ...entry, path };
+        });
+    };
+
+    const removeWaypoint = (marker, wp) => {
+        patchPath(marker, entry => entry.path
+            ? { ...entry, path: entry.path.filter((_, k) => k !== wp) }
+            : entry);
+        setWpSel(null);
+    };
+
+    const appendWaypoint = (marker, tile) => {
+        const entry = pathOf(marker);
+        patchPath(marker, e => ({ ...e, path: [...(e.path || []), tile.slice()] }));
+        setWpSel((entry && entry.path ? entry.path.length : 0));
     };
 
     const removeEntity = marker => {
@@ -651,7 +753,23 @@ function RoomEditor({ room, scan, onSaved }) {
             setSelected({ kind: 'pickup', index: pickups.length });
             setDirty(true);
         } else if (tool === 'select') {
+            // Waypoints of the selected NPC/platform first, so a waypoint
+            // sitting on its owner's tile drags the path, not the marker.
+            if (selected && selected !== 'spawn' && pathOf(selected)) {
+                const wp = waypointAt(tile);
+                if (wp != null) {
+                    setWpSel(wp);
+                    drag.current = { type: 'waypoint', marker: selected, wp };
+                    return;
+                }
+            }
             const marker = markerAt(tile);
+            if (!marker && selected && selected !== 'spawn' && pathOf(selected)) {
+                // Open ground with a path entity selected: extend its rail.
+                appendWaypoint(selected, tile);
+                return;
+            }
+            setWpSel(null);
             setSelected(marker);
             if (marker) drag.current = { type: 'marker', marker };
         }
@@ -670,6 +788,7 @@ function RoomEditor({ room, scan, onSaved }) {
         if (!drag.current) return;
         if (drag.current.type === 'stroke') setTile(tile[1] * W + tile[0], drag.current.value);
         else if (drag.current.type === 'marker') moveMarker(drag.current.marker, tile);
+        else if (drag.current.type === 'waypoint') moveWaypoint(drag.current.marker, drag.current.wp, tile);
     };
 
     const up = () => {
@@ -679,6 +798,16 @@ function RoomEditor({ room, scan, onSaved }) {
             if (rectStart && hover) applyRect(rectStart, hover, d.value);
             setRectStart(null);
         }
+    };
+
+    // Right-click on a waypoint removes it (select tool).
+    const contextMenu = e => {
+        e.preventDefault();
+        if (tool !== 'select' || !selected || selected === 'spawn') return;
+        if (!pathOf(selected)) return;
+        const tile = tileFromEvent(e);
+        const wp = tile ? waypointAt(tile) : null;
+        if (wp != null) removeWaypoint(selected, wp);
     };
 
     // ---- panels ----------------------------------------------------------
@@ -716,7 +845,11 @@ function RoomEditor({ room, scan, onSaved }) {
             interactive: (prev.interactive || []).map(e => ({ ...e, location: clampLoc(e.location || [0, 0]) }))
         }));
         for (const kind of ENTITY_KINDS) {
-            setEntityList(kind, entityList(kind).map(e => ({ ...e, location: clampLoc(e.location || [0, 0]) })));
+            setEntityList(kind, entityList(kind).map(e => {
+                const clamped = { ...e, location: clampLoc(e.location || [0, 0]) };
+                if (e.path) clamped.path = e.path.map(p => clampLoc(p || [0, 0]));
+                return clamped;
+            }));
         }
         setSize({ w, h });
         setDirty(true);
@@ -858,7 +991,7 @@ function RoomEditor({ room, scan, onSaved }) {
                             style={{ width: W * ts * zoom, imageRendering: 'pixelated', cursor: 'crosshair', display: 'block' }}
                             onMouseDown={down} onMouseMove={move} onMouseUp={up}
                             onMouseLeave={() => { up(); if (hover) setHover(null); }}
-                            onContextMenu={e => e.preventDefault()} />
+                            onContextMenu={contextMenu} />
                     </div>
 
                     <div className="statusBar">
@@ -1137,6 +1270,16 @@ function EntityFields({ kind, entry, scan, patch }) {
                     <label><input type="checkbox" checked={!!entry.wander}
                         onChange={e => patch('wander', e.target.checked || undefined)} /> wander</label>
                 </div>
+                <div className="field"><label>Path <span className="dim">({(entry.path || []).length} waypoints)</span></label>
+                    <input placeholder="x,y x,y … — or draw on the map" title="Tile waypoints, walked in a loop (beats the wander flag). With this NPC selected, click open ground on the map to add waypoints; drag the circles to shape the rail"
+                        value={(entry.path || []).map(p => (p || []).join(',')).join(' ')}
+                        onChange={e => {
+                            const text = e.target.value.trim();
+                            patch('path', text
+                                ? text.split(/\s+/).map(pair => pair.split(',').map(Number))
+                                : undefined);
+                        }} />
+                </div>
                 <div className="field"><label>Present if flag</label>
                     <input placeholder="(always)" value={entry.if || ''}
                         onChange={e => patch('if', e.target.value || undefined)} />
@@ -1285,7 +1428,7 @@ function EntityFields({ kind, entry, scan, patch }) {
 
             {has('platform') && (
                 <div className="field"><label>Rail path</label>
-                    <input placeholder="x,y x,y …" title="Tile waypoints, glided in a loop"
+                    <input placeholder="x,y x,y …" title="Tile waypoints, glided in a loop — or draw them: select the platform, click open ground, drag the circles"
                         value={(entry.path || []).map(p => (p || []).join(',')).join(' ')}
                         onChange={e => {
                             const text = e.target.value.trim();
@@ -1675,6 +1818,43 @@ function SheetUpload({ dir, file, onUploaded }) {
     );
 }
 
+// Rename-in-place for a definition's canonical sheet (characters/enemies
+// rename the paired .json with it; tiles rename the per-sheet metadata).
+// Every JSON reference to the old name is rewritten by the backend, so a
+// GIMP export landing under a new name never breaks a bake.
+function AssetRename({ dir, file, onRenamed }) {
+    const [open, setOpen] = useState(false);
+    const [name, setName] = useState(file.replace(/\.png$/, ''));
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState('');
+
+    const submit = async () => {
+        const to = name.trim() + '.png';
+        if (!name.trim() || to === file) { setOpen(false); setError(''); return; }
+        setBusy(true);
+        const result = await api('/api/rename_asset', { dir, from: file, to });
+        setBusy(false);
+        if (result.error) { setError(result.error); return; }
+        setError('');
+        setOpen(false);
+        onRenamed(result, to);
+    };
+
+    if (!open) {
+        return <button className="btn" onClick={() => { setName(file.replace(/\.png$/, '')); setOpen(true); }}>Rename…</button>;
+    }
+    return (
+        <span className="row" style={{ margin: 0 }}>
+            <input value={name} style={{ width: 110 }} autoFocus
+                onChange={e => setName(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') setOpen(false); }} />
+            <button className="tool" disabled={busy} onClick={submit}>{busy ? '…' : 'OK'}</button>
+            <button className="tool" onClick={() => { setOpen(false); setError(''); }}>cancel</button>
+            {error && <span className="fail">{error}</span>}
+        </span>
+    );
+}
+
 function EnemyEditor({ enemy, scan, onSaved }) {
     const [data, setData] = useState(enemy.data);
     const [status, setStatus] = useState('');
@@ -1745,6 +1925,21 @@ function EnemyEditor({ enemy, scan, onSaved }) {
         onSaved();
     };
 
+    // Tuning sandbox: build, then boot into the gauntlet room with this
+    // enemy spawned beside the drop tile (the engine's --enemy flag; a
+    // throwaway session — saving suppressed). Games without a gauntlet
+    // room fall back to the first room.
+    const testInGauntlet = async () => {
+        const gauntlet = (scan.rooms || []).find(r => stem(r.file) === 'gauntlet');
+        const room = gauntlet ? 'gauntlet' : ((scan.rooms || [])[0] ? stem(scan.rooms[0].file) : '');
+        if (!room) return setStatus('No rooms to test in yet.');
+        setStatus('Building + launching the sandbox…');
+        const result = await api('/api/play', { room, enemy: enemy.name });
+        if (result && result.error) setStatus(result.error);
+        else if (result && result.ok) setStatus('Launched into ' + room + ' with a ' + enemy.name + ' (saving off)');
+        else setStatus('Build failed — see the Build tab output');
+    };
+
     const numberField = (label, value, onSet) => (
         <div className="field"><label>{label}</label>
             <input type="number" value={value == null ? 0 : value}
@@ -1759,6 +1954,13 @@ function EnemyEditor({ enemy, scan, onSaved }) {
             <h2>Sheet & Stats</h2>
             <div className="row">
                 <SheetUpload dir="enemies" file={enemy.file} onUploaded={() => setSheetVersion(v => v + 1)} />
+                {enemy.png && (
+                    <AssetRename dir="enemies" file={enemy.data.image || (stem(enemy.file) + '.png')}
+                        onRenamed={r => {
+                            setStatus('Renamed — ' + (r.updated || []).length + ' referencing file(s) updated');
+                            onSaved();
+                        }} />
+                )}
                 {sheet
                     ? <img className="sheet" src={sheet} style={{ maxHeight: 56 }} alt="" />
                     : <span className="dim">no sheet yet — the bake draws a placeholder from the color</span>}
@@ -1851,6 +2053,9 @@ function EnemyEditor({ enemy, scan, onSaved }) {
 
             <div className="row" style={{ marginTop: 16 }}>
                 <button className="btn primary" onClick={save}>Save Enemy</button>
+                <button className="btn" onClick={testInGauntlet}
+                    title="Build, then boot into the gauntlet room with this enemy spawned beside the hero (a throwaway test session — nothing saves)">
+                    Test in gauntlet</button>
                 <span className="dim">{status}</span>
             </div>
         </div>
@@ -1885,11 +2090,144 @@ function ItemIcon({ index, count, size = 32 }) {
         }} />;
 }
 
+// Any resources/ui sheet, cropped to one frame. Frames are single-row
+// strips in these sheets (the engine's drawUiFrame: src.x = frame * fw).
+const sheetUrlCache = {};
+const uiSheetUrl = rel => {
+    if (!sheetUrlCache[rel]) sheetUrlCache[rel] = resourceUrl(rel);
+    return sheetUrlCache[rel];
+};
+
+function UiSprite({ path, frame, fw, fh, scale = 1, title, style, sx, sw }) {
+    const [url, setUrl] = useState(null);
+    useEffect(() => {
+        let alive = true;
+        uiSheetUrl(path).then(u => { if (alive) setUrl(u); }).catch(() => {});
+        return () => { alive = false; };
+    }, [path]);
+    // `sx`/`sw` crop an arbitrary source rect (the magic-bar fill sits at
+    // x=44 in its sheet, not on a frame boundary); otherwise frame*fw.
+    const srcX = sx != null ? sx : frame * fw;
+    const srcW = sw != null ? sw : fw;
+    const w = srcW * scale, h = fh * scale;
+    if (url == null) return <div title={title} style={{ width: w, height: h, flex: 'none', ...(style || {}) }} />;
+    return <div title={title}
+        style={{
+            width: w, height: h, flex: 'none',
+            backgroundImage: `url(${url})`,
+            // The sheet is one strip: slide left by the source rect, scaled.
+            backgroundSize: `auto ${h}px`,
+            backgroundPosition: `${-srcX * scale}px 0`,
+            imageRendering: 'pixelated',
+            ...(style || {}),
+        }} />;
+}
+
+// The pause subscreen as the engine renders it (drawPauseOverlay): the
+// item grid (one 16x16 cell per item id, six per row, frame = id in
+// items.png), quantities column, bottles row, and magic bar, framed by
+// the border.png nine-patch. Values mirror the demo session start
+// (everything owned, boomerang equipped, 4 arrows / 4 bombs) so item
+// authoring matches the player's view.
+function SubscreenPreview({ scan }) {
+    const [borderUrl, setBorderUrl] = useState(null);
+    useEffect(() => {
+        let alive = true;
+        resourceUrl('resources/ui/border.png').then(u => { if (alive) setBorderUrl(u); }).catch(() => {});
+        return () => { alive = false; };
+    }, []);
+
+    const PX = 2;                       // virtual px -> preview px
+    const screenW = 256 * PX, screenH = 224 * PX;
+    const panelW = 200 * PX, panelH = 120 * PX;
+    const panelX = (screenW - panelW) / 2, panelY = (screenH - panelH) / 2;
+
+    const items = scan.items || [];
+    const perRow = 6, cell = 16 * PX;
+    const gridX = 8 * PX, gridY = 26 * PX;
+    const qX = 112 * PX, qY = 26 * PX;
+    const equipped = items.findIndex(it => it.name === 'boomerang');
+
+    const quantities = [
+        { icon: 0, text: '0' },         // rupees (demo start)
+        { icon: 1, text: '4/10' },      // arrows
+        { icon: 2, text: '4/10' },      // bombs
+        { icon: 3, text: '0' },         // small keys
+    ];
+
+    return (
+        <div style={{ marginBottom: 16, paddingLeft: 16, borderLeft: '1px solid #e4e4e4', maxWidth: 580 }}>
+            <h2>Subscreen preview <span className="dim">(the pause grid as the engine draws it)</span></h2>
+            <div style={{ position: 'relative', width: screenW, height: screenH, background: '#14141c',
+                         overflow: 'hidden', borderRadius: 4 }}>
+                {borderUrl && (
+                    <div style={{
+                        position: 'absolute', left: panelX, top: panelY, width: panelW, height: panelH,
+                        borderImageSource: `url(${borderUrl})`,
+                        borderImageSlice: '8 fill',
+                        borderImageWidth: 16,
+                        imageRendering: 'pixelated',
+                    }} />
+                )}
+                {/* panel content, positioned like drawPauseOverlay */}
+                <div style={{ position: 'absolute', left: panelX, top: panelY, width: panelW, height: panelH }}>
+                    <UiSprite path="resources/ui/misc.png" frame={4} fw={18} fh={18} scale={PX}
+                        title="items tab icon" style={{ position: 'absolute', left: 8 * PX, top: 4 * PX }} />
+                    <div style={{ position: 'absolute', right: 8 * PX, top: 8 * PX, fontSize: 8 * PX,
+                                 color: '#aaaabe' }}>SWORD: SWITCH</div>
+
+                    {items.slice(0, 24).map((it, i) => (
+                        <div key={it.name} style={{ position: 'absolute',
+                            left: gridX + (i % perRow) * cell, top: gridY + Math.floor(i / perRow) * cell }}
+                            title={it.name + ' — cell ' + i + ', items.png frame ' + i}>
+                            <ItemIcon index={i} count={items.length} size={cell} />
+                            {i === equipped && (
+                                <UiSprite path="resources/ui/misc.png" frame={0} fw={18} fh={18} scale={PX}
+                                    title="equipped (the demo start equips the boomerang)"
+                                    style={{ position: 'absolute', left: 4 * PX, top: 4 * PX }} />
+                            )}
+                        </div>
+                    ))}
+                    {/* cursor: the engine's pause cursor rests on item 0 at open */}
+                    <UiSprite path="resources/ui/misc.png" frame={7} fw={18} fh={18} scale={PX} title="selection frame"
+                        style={{ position: 'absolute', left: gridX - PX, top: gridY - PX }} />
+
+                    {quantities.map((q, r) => (
+                        <div key={r} style={{ position: 'absolute', left: qX, top: qY + r * 12 * PX,
+                            display: 'flex', alignItems: 'center', gap: 4 * PX }}>
+                            <UiSprite path="resources/ui/counters.png" frame={q.icon} fw={10} fh={10} scale={PX} />
+                            <span style={{ fontSize: 10 * PX, color: '#f5f5f0', lineHeight: 1 }}>{q.text}</span>
+                        </div>
+                    ))}
+
+                    {/* magic bar: icon + frame + full fill, at the engine's offsets */}
+                    <UiSprite path="resources/ui/misc.png" frame={2} fw={18} fh={18} scale={PX}
+                        title="magic icon" style={{ position: 'absolute', left: qX, top: qY + 62 * PX }} />
+                    <UiSprite path="resources/ui/bar_magic.png" frame={0} fw={42} fh={8} scale={PX}
+                        title="magic bar frame"
+                        style={{ position: 'absolute', left: qX + 20 * PX, top: qY + 67 * PX }} />
+                    <UiSprite path="resources/ui/bar_magic.png" fw={40} fh={6} scale={PX} sx={44}
+                        title="magic fill (full at the demo start)"
+                        style={{ position: 'absolute', left: qX + 21 * PX, top: qY + 68 * PX }} />
+
+                    <div style={{ position: 'absolute', left: 8 * PX, top: (panelH / PX - 11) * PX,
+                        fontSize: 8 * PX, color: '#aaaabe' }}>ACTION:EQUIP&nbsp;&nbsp;DASH:SAVE+QUIT&nbsp;&nbsp;START:CLOSE</div>
+                </div>
+            </div>
+            <p className="dim">Cells are item ids in filename order (six per row); the icon is items.png frame = id.
+                Equipped badge on the boomerang (the demo start), cursor on cell 0, quantities at the demo start
+                (4 arrows / 4 bombs, full magic). Bottles appear as slots are collected. Replace resources/ui/items.png
+                to restyle the icons.</p>
+        </div>
+    );
+}
+
 function ItemsTab({ scan, refresh }) {
     const confirm = useConfirm();
     const [sel, setSel] = useState(0);
     const [name, setName] = useState('');
     const [error, setError] = useState('');
+    const [showPreview, setShowPreview] = useState(false);
     const item = scan.items[sel];
 
     const create = async () => {
@@ -1923,9 +2261,16 @@ function ItemsTab({ scan, refresh }) {
                     <button className="btn" onClick={create}>Create</button>
                 </div>
                 {error && <p className="fail">{error}</p>}
+                <button className={'btn' + (showPreview ? ' primary' : '')} style={{ width: '100%', marginTop: 10 }}
+                    onClick={() => setShowPreview(!showPreview)}
+                    title="Render the pause grid as the engine will (owned cells, quantities)">
+                    {showPreview ? 'Hide subscreen preview' : 'Subscreen preview'}</button>
             </div>
             {item
-                ? <ItemEditor key={item.name} item={item} index={sel} scan={scan} onSaved={refresh} />
+                ? <div style={{ flex: 1, minWidth: 0 }}>
+                    {showPreview && <SubscreenPreview scan={scan} />}
+                    <ItemEditor key={item.name} item={item} index={sel} scan={scan} onSaved={refresh} />
+                </div>
                 : <p className="dim">No items. Create one on the left.</p>}
         </div>
     );
@@ -2035,6 +2380,8 @@ function ItemEditor({ item, index, scan, onSaved }) {
                     onChange={e => patchPassive('lift', e.target.checked || undefined)} /> lift</label>
                 <label title="Map marks chests/bosses"><input type="checkbox" checked={!!passive.compass}
                     onChange={e => patchPassive('compass', e.target.checked || undefined)} /> compass</label>
+                <label title="Owning one unlocks the sword button (a game with no sword item keeps it native)"><input type="checkbox" checked={!!passive.sword}
+                    onChange={e => patchPassive('sword', e.target.checked || undefined)} /> sword</label>
             </div>
 
             <h2>Upgrade <span className="dim">(flag-gated stats)</span></h2>
@@ -2365,6 +2712,14 @@ function TilesTab({ scan, refresh }) {
                 <div className="row">
                     <SheetUpload dir="tiles" file={tileset.file || 'texture.png'}
                         onUploaded={() => { setImgVersion(v => v + 1); refresh(); }} />
+                    {tileset.file && (
+                        <AssetRename dir="tiles" file={tileset.file}
+                            onRenamed={(r, to) => {
+                                setStatus('Renamed — ' + (r.updated || []).length + ' room reference(s) updated');
+                                setPending(to);
+                                refresh();
+                            }} />
+                    )}
                     <span className="dim">
                         {tileset.file
                             ? 'shared by ' + scan.rooms.filter(r => (r.raw.tileset || ((tilesets[scan.defaultTileset] || {}).file || '')) === tileset.file).length
@@ -2659,6 +3014,8 @@ function DialogueEditor({ dialogue, scan, onSaved }) {
                             onClick={() => insertLine({ text: '', wait: 2 })}>+ Beat</button>
                         <button className="btn" title="A cutscene cue: bars, camera pan, actor blocking"
                             onClick={() => insertLine({ text: '', letterbox: true, camera: { pan: [0, 0], time: 1 }, wait: 2 })}>+ Cutscene</button>
+                        <button className="btn" title="A storybook beat: a full-screen scene picture with typewriter text over it"
+                            onClick={() => insertLine({ text: '', letterbox: true, image: (scan.scenes && scan.scenes[0]) || undefined, wait: 2 })}>+ Image scene</button>
                     </div>
 
                     {lines.map((line, i) => (
@@ -2803,7 +3160,7 @@ function DialogueEditor({ dialogue, scan, onSaved }) {
                                         </>}
                                     </div>
                                     <div className="row">
-                                        <div className="field" title="Actor blocking: glide the hero or an npc to a tile">
+                                        <div className="field" title="Actor blocking: glide the hero or an npc to a tile. Concurrent cues glide together (one slot per actor); a re-cue replaces only that actor's glide">
                                             <label>Move</label>
                                             <select value={line.move ? String(line.move.actor) : ''}
                                                 onChange={e => {
@@ -2902,6 +3259,22 @@ function DialogueEditor({ dialogue, scan, onSaved }) {
                                                     onChange={e => setLine(i, 'fade', { ...line.fade, time: +e.target.value })} />
                                             </div>
                                         </>}
+                                        <div className="field" title="Image scene: draw a full-screen scene picture over the hidden world; '' clears it back to the world">
+                                            <label>Image</label>
+                                            <select value={line.image == null ? '' : (line.image === '' ? '__clear' : line.image)}
+                                                onChange={e => {
+                                                    const v = e.target.value;
+                                                    if (v === '') dropKey(i, 'image');
+                                                    else setLine(i, 'image', v === '__clear' ? '' : v);
+                                                }}>
+                                                <option value="">(no picture)</option>
+                                                <option value="__clear">(clear — back to the world)</option>
+                                                {(scan.scenes || []).map(s => <option key={s} value={s}>{s}</option>)}
+                                                {line.image && line.image !== '' && !(scan.scenes || []).includes(line.image) &&
+                                                    <option value={line.image}>{line.image} (missing — placeholder at bake)</option>}
+                                            </select>
+                                        </div>
+                                        {line.image && line.image !== '' && <SceneThumb name={line.image} />}
                                     </div>
 
                                     <h2 style={{ marginTop: 8 }}>Choices <span className="dim">(action opens the list; the pick decides where the script goes)</span></h2>
@@ -2949,6 +3322,23 @@ function DialogueEditor({ dialogue, scan, onSaved }) {
 // Branch/choice tree: a read-only control-flow map of the script. Nodes
 // stack vertically in line order; edges show the flow — default advance
 // (gray), goto jumps (blue), choice splits (orange, one per option).
+function SceneThumb({ name }) {
+    const [url, setUrl] = useState(null);
+    const [missing, setMissing] = useState(false);
+    const file = name.endsWith('.png') ? name : name + '.png';
+    useEffect(() => {
+        let alive = true;
+        resourceUrl('resources/scenes/' + file).then(u => { if (alive) setUrl(u); })
+            .catch(() => { if (alive) setMissing(true); });
+        return () => { alive = false; };
+    }, [file]);
+    if (missing) return <span className="dim">no file yet — a test card is baked in its place</span>;
+    if (!url) return null;
+    return <img src={url} alt="" title={'resources/scenes/' + file}
+        style={{ maxHeight: 84, maxWidth: 150, imageRendering: 'pixelated',
+                 border: '1px solid #999', background: '#333', flex: 'none' }} />;
+}
+
 function DialogueTree({ lines, labels }) {
     const NODE_H = 54, NODE_W = 300, GAP = 10, X = 130;
     const height = lines.length * (NODE_H + GAP) + 20;
@@ -3030,6 +3420,7 @@ const summaryBits = line => {
     if (line.show != null) bits.push('show');
     if (line.hide != null) bits.push('hide');
     if (line.fade) bits.push('fade ' + line.fade.to);
+    if (line.image != null) bits.push(line.image === '' ? 'image off' : 'image ' + line.image);
     if (line.warp) bits.push('warp');
     if (line.music != null) bits.push('music');
     if (line.sfx) bits.push('sfx');
@@ -3307,6 +3698,13 @@ function CharacterEditor({ character, onSaved }) {
             <div className="row">
                 <SheetUpload dir="characters" file={character.file}
                     onUploaded={() => { setImgVersion(v => v + 1); onSaved(); }} />
+                {character.png && (
+                    <AssetRename dir="characters" file={stem(character.file) + '.png'}
+                        onRenamed={r => {
+                            setStatus('Renamed — ' + (r.updated || []).length + ' referencing file(s) updated');
+                            onSaved();
+                        }} />
+                )}
                 {img && <img className="sheet" src={img.src} style={{ maxHeight: 56 }} alt="" />}
             </div>
             <div className="field"><label>Width (tiles)</label>
@@ -3401,6 +3799,7 @@ function FilesTab({ scan, refresh }) {
     const confirm = useConfirm();
     const [dir, setDir] = useState('music');
     const [status, setStatus] = useState('');
+    const scenes = scan.scenes || [];
 
     const upload = e => {
         const file = e.target.files[0];
@@ -3415,23 +3814,62 @@ function FilesTab({ scan, refresh }) {
         reader.readAsDataURL(file);
     };
 
-    const FileList = ({ title, dirName, files }) => (
-        <div>
-            <h2>{title}</h2>
-            {files.length === 0 && <p className="dim">(empty)</p>}
-            {files.map(f => (
-                <div className="row" key={f}>
-                    <span style={{ minWidth: 200 }}>{f}</span>
-                    <button className="delete" onClick={async () => {
-                        if (await confirm('Delete ' + dirName + '/' + f + '?')) {
-                            await api('/api/delete', { path: 'resources/' + dirName + '/' + f });
-                            refresh();
-                        }
-                    }}>×</button>
-                </div>
-            ))}
-        </div>
-    );
+    // Rename-in-place: renames the file and rewrites every JSON reference
+    // to it (enemy image overrides, sfx/music in rooms and dialogue, …),
+    // so replacing art from GIMP never breaks a bake.
+    const RenameForm = ({ dirName, file }) => {
+        const [name, setName] = useState(file);
+        const [busy, setBusy] = useState(false);
+        const submit = async () => {
+            const target = name.trim();
+            if (!target || target === file) return;
+            setBusy(true);
+            const result = await api('/api/rename_asset', { dir: dirName, from: file, to: target });
+            setBusy(false);
+            if (result.error) { setStatus(result.error); return; }
+            const touched = (result.updated || []).length;
+            setStatus(`Renamed to ${target}` + (touched ? ` — ${touched} referencing file(s) updated` : ''));
+            refresh();
+        };
+        return (
+            <span className="row" style={{ margin: 0 }}>
+                <input value={name} style={{ width: 150 }}
+                    onChange={e => setName(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
+                <button className="tool" disabled={busy} onClick={submit}>OK</button>
+            </span>
+        );
+    };
+
+    const FileList = ({ title, dirName, files, renamable = true }) => {
+        const [renaming, setRenaming] = useState(null);
+        return (
+            <div>
+                <h2>{title}</h2>
+                {files.length === 0 && <p className="dim">(empty)</p>}
+                {files.map(f => (
+                    <div className="row" key={f}>
+                        {renaming === f
+                            ? <RenameForm dirName={dirName} file={f} />
+                            : <span style={{ minWidth: 200 }}>{f}</span>}
+                        {renaming !== f && renamable && (
+                            <button className="tool" title="Rename this asset and update every reference to it"
+                                onClick={() => setRenaming(f)}>rename</button>
+                        )}
+                        {renaming === f && (
+                            <button className="tool" onClick={() => setRenaming(null)}>cancel</button>
+                        )}
+                        <button className="delete" onClick={async () => {
+                            if (await confirm('Delete ' + dirName + '/' + f + '?')) {
+                                await api('/api/delete', { path: 'resources/' + dirName + '/' + f });
+                                refresh();
+                            }
+                        }}>×</button>
+                    </div>
+                ))}
+            </div>
+        );
+    };
 
     // The artist's worklist: everything the generator would synthesize a
     // placeholder for (it never overwrites real files). Importing a real
@@ -3447,6 +3885,18 @@ function FilesTab({ scan, refresh }) {
     if (!scan.pickups.some(f => f.startsWith('pickups'))) audit.push(['pickups', 'pickups.png', 'placeholder pickup frames']);
     for (const f of ['beam.png', 'boomerang.png']) if (!scan.effects.includes(f)) audit.push(['effects', f, 'placeholder effect frames']);
     if (!scan.music.length) audit.push(['music', '(any .xm/.mod/.wav)', 'no music yet — the rooms pick tracks by name']);
+    // Scene pictures referenced by dialogue "image" cues but not shipped
+    // yet: the bake synthesizes a test card (whatever the generator would
+    // placeholder, the audit lists).
+    for (const d of (scan.dialogues || [])) {
+        for (const line of ((d.data || {}).lines || [])) {
+            const ref = line && line.image;
+            if (ref == null || ref === '') continue;
+            const file = ref.endsWith('.png') ? ref : ref + '.png';
+            if (!scenes.includes(file) && !audit.some(a => a[0] === 'scenes' && a[1] === file))
+                audit.push(['scenes', file, 'placeholder test card (color bars) — the "' + (stem(d.file)) + '" image cue']);
+        }
+    }
     const AuditRow = ({ d, file, note }) => (
         <div className="row" style={{ marginBottom: 4 }}>
             <span className="dim" style={{ width: 90 }}>resources/{d}/</span>
@@ -3483,6 +3933,7 @@ function FilesTab({ scan, refresh }) {
                     <option value="effects">resources/effects</option>
                     <option value="objects">resources/objects</option>
                     <option value="fonts">resources/fonts</option>
+                    <option value="scenes">resources/scenes</option>
                 </select>
                 <input type="file" onChange={upload} />
                 <span className="dim">{status}</span>
@@ -3495,10 +3946,12 @@ function FilesTab({ scan, refresh }) {
             <FileList title="Music (resources/music)" dirName="music" files={scan.music} />
             <FileList title="Audio (resources/audio)" dirName="audio" files={scan.audio} />
             <FileList title="UI (resources/ui)" dirName="ui" files={scan.ui} />
+            <FileList title="Scenes (resources/scenes)" dirName="scenes" files={scenes} />
             <FileList title="Pickups (resources/pickups)" dirName="pickups" files={scan.pickups} />
             <FileList title="Effects (resources/effects)" dirName="effects" files={scan.effects} />
             <FileList title="Objects (resources/objects)" dirName="objects" files={scan.objects} />
             <FileList title="Fonts (resources/fonts)" dirName="fonts" files={scan.fonts} />
+            <p className="dim">Rename updates every JSON reference (rooms' music/sfx/tileset/hero, dialogue cues, enemy image overrides), so art from GIMP never breaks a bake. Character and enemy sheets rename their paired .json too.</p>
         </div>
     );
 }
@@ -3518,6 +3971,20 @@ function GameIdentity({ scan, onSaved }) {
         onSaved();
     };
 
+    // Boot-sequence cards: the nested "logo" / "title_card" objects.
+    const patchCard = (card, key, value) => {
+        setData(prev => ({
+            ...prev,
+            [card]: { ...(prev[card] || {}), [key]: value === '' ? undefined : value }
+        }));
+        setDirty(true);
+    };
+    const patchSeconds = (card, value) => {
+        const parsed = parseFloat(value);
+        patchCard(card, 'seconds', isNaN(parsed) || parsed <= 0 ? undefined : parsed);
+    };
+    const cardSeconds = card => (data[card] && data[card].seconds) || '';
+
     return (
         <div className="panel" style={{ maxWidth: 480 }}>
             <h2>Game Identity {dirty && <span className="fail">(unsaved)</span>}</h2>
@@ -3534,6 +4001,58 @@ function GameIdentity({ scan, onSaved }) {
                     {(scan.dialogues || []).map(d => <option key={d.file} value={d.file}>{d.file}</option>)}
                 </select>
             </div>
+
+            <h2 style={{ marginTop: 16 }}>Company Logo <span className="dim">(the boot splash)</span></h2>
+            <p className="dim">Plays first on boot, skippable with the action button, then the title card.</p>
+            <div className="field"><label>Card image <span className="dim">(a scene picture — drop files in resources/scenes/)</span></label>
+                <select value={(data.logo && data.logo.image) || ''}
+                    onChange={e => patchCard('logo', 'image', e.target.value)}>
+                    <option value="">(no logo card)</option>
+                    {(scan.scenes || []).map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+            </div>
+            <div className="field"><label>Studio line <span className="dim">(drawn at the bottom of the card)</span></label>
+                <input value={(data.logo && data.logo.text) || ''}
+                    onChange={e => patchCard('logo', 'text', e.target.value)}
+                    placeholder="e.g. WILLOWDOWN GAMES" />
+            </div>
+            <div className="row">
+                <div className="field" style={{ flex: 1 }}><label>Sting <span className="dim">(assets/audio)</span></label>
+                    <select value={(data.logo && data.logo.sfx) || ''}
+                        onChange={e => patchCard('logo', 'sfx', e.target.value)}>
+                        <option value="">(silent)</option>
+                        {(scan.audio || []).map(a => <option key={a} value={a}>{a}</option>)}
+                    </select>
+                </div>
+                <div className="field" style={{ width: 120 }}><label>Hold (s)</label>
+                    <input type="number" step="0.1" min="0.2" value={cardSeconds('logo')}
+                        onChange={e => patchSeconds('logo', e.target.value)} />
+                </div>
+            </div>
+
+            <h2 style={{ marginTop: 16 }}>Title Card</h2>
+            <p className="dim">The title screen backdrop. It plays alone for the hold, then the save menu joins it — with music, like the real thing.</p>
+            <div className="field"><label>Card image <span className="dim">(a scene picture)</span></label>
+                <select value={(data.title_card && data.title_card.image) || ''}
+                    onChange={e => patchCard('title_card', 'image', e.target.value)}>
+                    <option value="">(no card — plain menu)</option>
+                    {(scan.scenes || []).map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+            </div>
+            <div className="row">
+                <div className="field" style={{ flex: 1 }}><label>Music <span className="dim">(assets/music, starts on the title screen)</span></label>
+                    <select value={(data.title_card && data.title_card.music) || ''}
+                        onChange={e => patchCard('title_card', 'music', e.target.value)}>
+                        <option value="">(no music)</option>
+                        {(scan.music || []).map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                </div>
+                <div className="field" style={{ width: 120 }}><label>Hold (s)</label>
+                    <input type="number" step="0.1" min="0.2" value={cardSeconds('title_card')}
+                        onChange={e => patchSeconds('title_card', e.target.value)} />
+                </div>
+            </div>
+
             <div className="row">
                 <button className="btn" onClick={save}>Save</button>
                 <span className="dim">{status}</span>
@@ -3543,6 +4062,46 @@ function GameIdentity({ scan, onSaved }) {
 }
 
 // ---- game code (resources/code/*.cpp) ---------------------------------------
+
+// The Enemy API cheat sheet (mirrors include/enemy.h — the header is the
+// authority; this is the rendered-at-a-glance version for the Code tab).
+const ENEMY_API = [
+    ['Modes & clocks', [
+        ['setMode(Enemy::ENEMY_WALK)', 'switch the AI state (IDLE / WALK / PAUSE / CHARGE are yours to drive; STUN / FROZEN / HURT are engine-owned recovery)'],
+        ['modeState()', 'the current mode (switch on it — the scaffold skeleton)'],
+        ['modeElapsed()', 'seconds since the mode was entered'],
+        ['aiTimer() / setAiTimer(s)', 'your countdown clock (shoot periods, pause lengths)'],
+    ]],
+    ['Movement', [
+        ['slide(room, dx, dy)', 'move by a delta with tile collision — false when blocked'],
+        ['faceVector(dx, dy)', 'face along a vector'],
+        ['pickDirection(rng)', 'face a random cardinal (the engine Rng)'],
+        ['setFacing(dir) / facingDirection()', 'turn / read the facing (DIR_DOWN…DIR_UP)'],
+        ['setPosition(px, py)', 'teleport (pixels)'],
+    ]],
+    ['Attacking', [
+        ['queueShot(dirX, dirY)', 'fire one projectile; the room drains it next frame'],
+    ]],
+    ['Segmented bodies (Moldorm-style)', [
+        ['enableTrail(count, spacing)', 'record a distance-sampled trail; the engine draws the segments (count ≤ 12)'],
+        ['tailPosition(x, y)', 'read the oldest sample (the tail)'],
+        ['setWeakPointAt(x, y, w, h)', 'arm the only-hittable sub-box — re-arm every frame; everything else bounces'],
+    ]],
+    ['Private state', [
+        ['scratch(0..3)', 'four per-instance floats, zeroed at spawn — headings, timers, sentinels'],
+    ]],
+    ['Read-only context', [
+        ['config()', 'the baked EnemyConfig (stats, components, drops)'],
+        ['health() / maxHealth()', 'hp bookkeeping'],
+        ['box() / center()', 'the hitbox / its center (pixels)'],
+        ['contactDamage()', 'what touching costs the hero'],
+        ['heroCenter', 'the behavior\'s heroCenter parameter — sight checks'],
+    ]],
+    ['Engine-owned (never call these from AI)', [
+        ['stun / freeze / agitate / despawn', 'reactions the engine applies around your behavior'],
+        ['tryHit(...)', 'sword resolution (single hit per swing id)'],
+    ]],
+];
 
 // Game-code behaviors, editable in the window: the file list and editor
 // live here (scaffolding and per-enemy references stay on the Enemies
@@ -3555,6 +4114,7 @@ function CodeTab({ scan, refresh }) {
     const [error, setError] = useState('');
     const [dirty, setDirty] = useState(false);
     const [pending, setPending] = useState(null);
+    const [showRef, setShowRef] = useState(true);
     const files = scan.codeFiles || [];
     const file = files[Math.min(sel, files.length - 1)];
 
@@ -3607,15 +4167,50 @@ function CodeTab({ scan, refresh }) {
                     <button className="btn" onClick={create}>Scaffold</button>
                 </div>
                 {error && <p className="fail">{error}</p>}
+                <button className={'btn' + (showRef ? ' primary' : '')} style={{ width: '100%', marginTop: 10 }}
+                    onClick={() => setShowRef(!showRef)}
+                    title="The Enemy API (include/enemy.h) rendered beside the editor">
+                    {showRef ? 'Hide API reference' : 'API reference'}</button>
                 <p className="dim" style={{ marginTop: 10 }}>
                     Compiled into the binary; enemies reference them as
                     <code>custom:&lt;name&gt;</code>. Registered behaviors:
                     {(scan.behaviors || []).map(b => ' ' + b).toString() || ' none'}
                 </p>
             </div>
-            {file
-                ? <CodeEditor key={file} file={file} dirty={dirty} onSaved={refresh} onDirty={setDirty} />
-                : <p className="dim">Scaffold a behavior to start writing game code.</p>}
+            <div style={{ display: 'flex', flex: 1, minWidth: 0, alignItems: 'flex-start' }}>
+                {file
+                    ? <CodeEditor key={file} file={file} dirty={dirty} onSaved={refresh} onDirty={setDirty} />
+                    : <p className="dim">Scaffold a behavior to start writing game code.</p>}
+                {showRef && <BehaviorReference />}
+            </div>
+        </div>
+    );
+}
+
+// The Enemy API cheat sheet: a sticky column beside the code editor so
+// behaviors can be written without reading engine headers.
+function BehaviorReference() {
+    return (
+        <div className="charSide" style={{ position: 'sticky', top: 8, maxHeight: 'calc(100vh - 40px)',
+            overflowY: 'auto', width: 290 }}>
+            <h2>Enemy API <span className="dim">(include/enemy.h)</span></h2>
+            {ENEMY_API.map(([section, entries]) => (
+                <div key={section} style={{ marginBottom: 8 }}>
+                    <div className="dim" style={{ fontWeight: 600, margin: '6px 0 2px' }}>{section}</div>
+                    {entries.map(([sig, note]) => (
+                        <div key={sig} style={{ marginBottom: 3 }}>
+                            <code style={{ fontSize: 11 }}>{sig}</code>
+                            <div className="dim" style={{ fontSize: 11, marginTop: 1 }}>{note}</div>
+                        </div>
+                    ))}
+                </div>
+            ))}
+            <div className="dim" style={{ fontSize: 11, marginTop: 8 }}>
+                Signature: <code style={{ fontSize: 10 }}>void name(Enemy&amp;, const Room&amp;, Vector2 heroCenter, Rng&amp;, float dt)</code>.
+                Rules: frameDt() for timing, the passed engine Rng for randomness (never raw random),
+                fixed arrays, no file I/O, no exceptions/RTTI (the Dreamcast toolchain). Registered at
+                static init via <code style={{ fontSize: 10 }}>gamecodeRegisterEnemyBehavior</code>.
+            </div>
         </div>
     );
 }
@@ -3706,6 +4301,8 @@ function CodeEditor({ file, dirty, onSaved, onDirty }) {
 
 function BuildTab({ scan, refresh }) {
     const [state, setState] = useState({ running: false, output: '', ok: null });
+    const [web, setWeb] = useState({ running: false, output: '', ok: null, url: '' });
+    const [dc, setDc] = useState({ running: false, output: '', ok: null });
     const isMac = scan.platform === 'darwin';
     const script = isMac ? './build-mac.sh' : './build-web.sh';
 
@@ -3713,6 +4310,72 @@ function BuildTab({ scan, refresh }) {
         setState({ running: true, output: 'Running ' + script + ' ...', ok: null });
         const result = await api('/api/build');
         setState({ running: false, output: (result.output || '') + (result.error ? '\n' + result.error : ''), ok: result.ok });
+    };
+
+    // Web export: the editor is the whole toolchain — build, host build/web
+    // over http (browsers refuse file:// wasm), and open it in the browser.
+    const runWeb = async serve => {
+        setWeb({ running: true, output: 'Running ./build-web.sh ...', ok: null, url: '' });
+        const result = await api('/api/build_web', { serve });
+        setWeb({
+            running: false,
+            output: (result.output || '') + (result.error ? '\n' + result.error : ''),
+            ok: result.ok,
+            url: result.url || '',
+        });
+    };
+
+    const stopWeb = async () => {
+        const result = await api('/api/stop_web');
+        setWeb(prev => ({ ...prev, url: result.wasRunning ? '' : prev.url }));
+    };
+
+    const runDreamcast = async () => {
+        setDc({ running: true, output: 'Running ./build-dreamcast.sh (Docker) ...', ok: null });
+        const result = await api('/api/build_dreamcast');
+        setDc({ running: false, output: (result.output || '') + (result.error ? '\n' + result.error : ''), ok: result.ok });
+    };
+
+    // ---- runbook: the per-feature smoke checklist (NOTES.md "Testing"),
+    // each step one click away ------------------------------------------
+    const [steps, setSteps] = useState({});
+    const setStep = (key, value) => setSteps(prev => ({ ...prev, [key]: value }));
+
+    const runStep = async key => {
+        setStep(key, { running: true });
+        if (key === 'gen') {
+            const result = await api('/api/run_generator');
+            // The audio-budget notices on placeholder loops are known and fine.
+            const real = (result.warnings || []).filter(w => !w.startsWith('warning: audio/'));
+            setStep(key, { ok: !!result.ok && real.length === 0, running: false,
+                detail: real.length ? real.join('\n') : ((result.warnings || []).length + ' known audio-budget warning(s)') });
+        } else if (key === 'native') {
+            const result = await api('/api/build');
+            setStep(key, { ok: !!result.ok, running: false, detail: result.ok ? '' : (result.output || 'failed').slice(-600) });
+        } else if (key === 'web') {
+            const result = await api('/api/build_web', { serve: false });
+            setStep(key, { ok: !!result.ok, running: false, detail: result.ok ? '' : (result.output || 'failed').slice(-600) });
+        } else if (key === 'soak') {
+            const result = await api('/api/headless_check');
+            setStep(key, { ok: !!result.ok, running: false,
+                detail: result.ok ? 'fresh game → save → reload → re-save: byte-identical'
+                    : ((result.problems || []).join('\n') || (result.output || 'failed').slice(-600)) });
+        } else if (key === 'editor') {
+            const step = steps.editor || {};
+            setStep('editor', { ok: !step.ok, running: false, detail: 'manual — save a room and a dialogue, confirm unedited keys survive' });
+        }
+    };
+
+    const StepRow = ({ id, label, hint, button }) => {
+        const step = steps[id] || {};
+        return (
+            <div className="row" style={{ marginBottom: 6 }}>
+                <span style={{ width: 22 }}>{step.running ? '…' : step.ok === true ? '✓' : step.ok === false ? '✗' : '☐'}</span>
+                <span style={{ width: 300 }}>{label}</span>
+                <button className="btn" disabled={!!step.running} onClick={() => runStep(id)}>{button || 'Run'}</button>
+                <span className="dim" style={{ flex: 1 }}>{step.detail || hint}</span>
+            </div>
+        );
     };
 
     return (
@@ -3725,6 +4388,45 @@ function BuildTab({ scan, refresh }) {
             {!isMac && <p className="dim">Non-Mac hosts build the web package (needs emcc on PATH; its errors show below).</p>}
             {state.ok === false && <p className="fail">Build failed.</p>}
             {state.output && <pre className="build">{state.output}</pre>}
+
+            <div className="panel" style={{ maxWidth: 720, marginTop: 20 }}>
+                <h2>Web export <span className="dim">(ship without a terminal)</span></h2>
+                <p className="dim">Runs build-web.sh, then hosts build/web/ on a local port and opens it in the default browser (browsers refuse file:// wasm).</p>
+                <div className="row">
+                    <button className="btn primary" onClick={() => runWeb(true)} disabled={web.running}>
+                        {web.running ? 'Building…' : 'Build & Play in browser'}</button>
+                    <button className="btn" onClick={() => runWeb(false)} disabled={web.running}>Compile only</button>
+                    <button className="btn" onClick={stopWeb}>Stop server</button>
+                    {web.url && <span className="dim">hosting at {web.url}</span>}
+                </div>
+                {web.ok === false && <p className="fail">Web build failed (needs emcc on PATH).</p>}
+                {web.output && <pre className="build" style={{ maxHeight: 260 }}>{web.output}</pre>}
+            </div>
+
+            <div className="panel" style={{ maxWidth: 720, marginTop: 20 }}>
+                <h2>Dreamcast image</h2>
+                <p className="dim">Runs build-dreamcast.sh — cross-compiles inside Docker (a working daemon, e.g. OrbStack, is the only host requirement). The first run builds the toolchain image, so it takes a while; output lands in build/dreamcast/ (ltop.elf + ltop.cdi).</p>
+                <div className="row">
+                    <button className="btn primary" onClick={runDreamcast} disabled={dc.running}>
+                        {dc.running ? 'Building (this can take minutes)…' : 'Build .cdi'}</button>
+                </div>
+                {dc.ok === false && <p className="fail">Dreamcast build failed.</p>}
+                {dc.output && <pre className="build" style={{ maxHeight: 260 }}>{dc.output}</pre>}
+            </div>
+
+            <div className="panel" style={{ maxWidth: 860, marginTop: 20 }}>
+                <h2>Runbook <span className="dim">(the per-feature smoke checklist)</span></h2>
+                <StepRow id="gen" label="Generator bakes with zero warnings"
+                    hint="the audio-budget notices on placeholder loops are known and fine" />
+                <StepRow id="native" label="Native build compiles clean" hint="-Wall -Wextra" />
+                <StepRow id="web" label="Web build compiles clean" hint="emscripten" />
+                <StepRow id="soak" label="Headless boot + save soak" button="Run --soak"
+                    hint="fresh game → save → reload → re-save, byte-identical" />
+                <StepRow id="editor" label="Editor round-trips" button="Mark done"
+                    hint="room + dialogue saves preserve unedited keys (manual)" />
+                <p className="dim" style={{ marginTop: 8 }}>Keyboard + gamepad paths for new inputs, and the Dreamcast docker build for anything touching game code, round out the NOTES.md checklist.</p>
+            </div>
+
             <p className="dim" style={{ marginTop: 20 }}>Game identity and save slots live on the File tab.</p>
         </div>
     );

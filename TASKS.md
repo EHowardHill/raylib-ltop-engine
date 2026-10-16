@@ -31,7 +31,9 @@ tabs)**, that owns every project-level meta action:
 - [done] **Build & Launch** — build for the host platform and run the game
   (full, from title). The Build tab keeps the detailed log/output view; the
   File tab gets a one-click "Make & Play".
-- [todo] **Quit / restart dev build** (optional, QoL).
+- [done] **Quit / restart dev build** (optional, QoL) — the launched game is
+  tracked: a new launch replaces the running session (restart), and a Quit
+  button stops it.
 
 ---
 
@@ -64,9 +66,10 @@ tabs)**, that owns every project-level meta action:
 - [done] Per-tile behavior editor: pit/ice/heal/dig flags, water depth,
   ledge direction, cuttable + result, bombable + result, push current,
   contact damage.
-- [todo] **Tileset preview niceties** — hover magnifier/click-to-paint from
-  the tileset into the room is functional; keep parity as sheets are replaced
-  with real GIMP art (sheet dimensions read live from the PNG).
+- [done] **Tileset preview niceties** — hover magnifier/click-to-paint from
+  the tileset into the room is functional; parity holds as sheets are
+  replaced with real GIMP art (the scan reads sheet dimensions live from
+  the PNG, so the palette and map re-derive on every replace).
 
 ## 4. Characters & NPCs
 
@@ -76,8 +79,11 @@ tabs)**, that owns every project-level meta action:
   animation preview at engine frame rates.
 - [done] NPC placement in rooms with property forms (character, dialogue,
   wander, path waypoints, `if`/`unless` flag gates).
-- [todo] **NPC path waypoint editing on the room canvas** — the form takes
-  `[[x,y],...]`; let waypoints be dragged as markers like platform rails.
+- [done] **NPC path waypoint editing on the room canvas** — the form takes
+  `[[x,y],...]`; with the NPC (or platform) selected, its rail renders as a
+  connected line of numbered circles — click open ground to extend, drag
+  the circles to shape, right-click one to remove (Del removes the selected
+  waypoint, Esc deselects).
 
 ## 5. Enemies
 
@@ -88,8 +94,10 @@ tabs)**, that owns every project-level meta action:
   shoot period, component checkboxes (boss / mini_boss / strike_immune /
   catchable) with mover knobs, drop tables, frame lists per direction.
 - [done] Game-code behavior scaffolding entry point + manifest validation.
-- [todo] **Enemy test sandbox** — "play from here" drops into the room, but a
-  one-click "spawn this enemy in the gauntlet room" would speed up tuning.
+- [done] **Enemy test sandbox** — "Test in gauntlet" on the Enemies tab:
+  build, then boot the gauntlet room with the enemy spawned beside the
+  drop tile (the engine's `--enemy <name>` boot flag, a save-suppressed
+  session); games without a gauntlet room fall back to the first room.
 
 ## 6. Objects
 
@@ -108,8 +116,9 @@ tabs)**, that owns every project-level meta action:
   pick, passives (light/swim/lift/compass), flag-gated upgrades.
 - [done] Item icon/sprite management — items reference sheets the engine
   reads; upload/replace stays in Files.
-- [todo] **Item subscreen layout preview** — render the pause grid as the
-  engine will (owned cells, quantities) so item authoring matches the
+- [done] **Item subscreen layout preview** — render the pause grid as the
+  engine will (owned cells, quantities, magic bar, the border nine-patch;
+  values mirror the demo session start) so item authoring matches the
   player's view.
 
 ## 8. Dialogue & scripting
@@ -131,10 +140,10 @@ tabs)**, that owns every project-level meta action:
 
 - [done] Code tab: file list + in-window editor, scaffolded registration
   boilerplate, manifest append, compile check w/ inline errors.
-- [todo] **Behavior reference/cheat-sheet panel** — the `Enemy` API
+- [done] **Behavior reference/cheat-sheet panel** — the `Enemy` API
   (`setMode`, `slide`, `scratch(i)`, trail/weak-point vocabulary) rendered
-  alongside the editor so behaviors can be written without reading engine
-  headers.
+  alongside the editor (a sticky column on the Code tab) so behaviors can
+  be written without reading engine headers.
 
 ## 11. Asset import (the GIMP / MilkyTrader seam)
 
@@ -146,10 +155,13 @@ No pixel or note editing — import/replace only:
 - [done] **Full directory coverage** — upload/replace anywhere in
   `resources/`: music, audio, ui, tiles, characters, enemies, pickups,
   effects, objects, fonts.
-- [todo] **Replace-in-place with rename** — upload `foo.png` over an existing
+- [done] **Replace-in-place with rename** — upload `foo.png` over an existing
   name, or rename an existing asset and update its referencing JSON
   (character sheet name, enemy `image` override, sfx/music names in rooms
-  and dialogue) so replacing art from GIMP never breaks a bake.
+  and dialogue, item use sfx, `game.json`'s font, room tileset/hero/npc/enemy
+  references, dialogue `image` cues) so replacing art from GIMP never breaks
+  a bake. Character/enemy/tileset sheet renames carry their paired `.json`
+  (definition / per-sheet metadata) with them.
 - [done] **Asset audit** — a view listing every path the generator would
   synthesize a placeholder for (character/enemy/object sheets, UI bitmaps,
   pickups, effects, empty music), with an Import button per row. This is the
@@ -161,14 +173,17 @@ No pixel or note editing — import/replace only:
 
 - [done] Build tab: host build, output log, errors surfaced.
 - [done] Test-from-here sessions, save-suppressed.
-- [todo] **Web build export from the editor** — one button: run
-  `build-web.sh`, then open `build/web/` in the default browser (or serve
-  it). The editor is the whole toolchain; "ship" shouldn't need a terminal.
-- [todo] **Dreamcast image build** (`build-dreamcast.sh`) as a File/Build
-  action (Docker is a host requirement; just surface the command + log).
-- [todo] **Runbook panel** — the per-feature smoke checklist from NOTES.md
-  (generator zero warnings, both builds clean, headless boot clean, editor
-  round-trips) as a visible checklist with links to trigger each step.
+- [done] **Web build export from the editor** — one button: run
+  `build-web.sh`, then host `build/web/` on a local port and open it in the
+  default browser (browsers refuse file:// wasm; a compile-only variant and
+  a server stopper ride along). The editor is the whole toolchain; "ship"
+  doesn't need a terminal.
+- [done] **Dreamcast image build** (`build-dreamcast.sh`) as a Build action
+  (Docker is a host requirement; the command + log are surfaced, with the
+  long first-run toolchain build in mind).
+- [done] **Runbook panel** — the per-feature smoke checklist from NOTES.md
+  (generator zero warnings, both builds clean, headless boot/`--soak` clean,
+  editor round-trips) as a visible checklist with one click per step.
 
 ---
 
@@ -205,25 +220,31 @@ the Dialogue tab forms — all in place:
   one-shot memory, `repeat`, `if`/`unless` flag guards (a failed guard never
   consumes the shot); boss rooms auto-register `boss_defeated_<room>`.
 
-Image scenes (the missing flavor — none of this exists yet):
+Image scenes (the missing flavor — none of this existed yet):
 
-- [todo] **`"image"` line cue** — `"image": "<file>"`: a `DialogueLine.image`
+- [done] **`"image"` line cue** — `"image": "<file>"`: a `DialogueLine.image`
   field + a `takeImageRequest()` drain in `DialogueBox` (the pattern every
-  cue uses); the game draws the picture full-bleed over the virtual viewport
-  with the world hidden (like credits' black), letterbox optional on top,
-  typewriter text below/over it. Composes with `wait` beats, `music`
-  stingers, `next` chains — and with `"credits"` for a storybook roll.
-- [todo] **Scene asset bake** — generator reads a new `resources/scenes/`
+  cue uses); the game draws the picture full-bleed (cover-fit) over the
+  virtual viewport with the world hidden (like credits' black), letterbox
+  optional on top, typewriter text below/over it. Composes with `wait`
+  beats, `music` stingers, `next` chains — and with `"credits"` for a
+  storybook roll. `"image": ""` clears it; the script closing or a room
+  change drops it. One texture slot at a time (the console budget).
+- [done] **Scene asset bake** — generator reads a new `resources/scenes/`
   directory into a `SCENES[]` table (path + dimensions), syncs files to
-  `assets/scenes/`, and synthesizes a placeholder test card for missing art
-  the same way it does `resources/ui` bitmaps (existing files never
-  overwritten). The binary keeps loading by baked path; no parsing.
-- [todo] **Editor: scene image upload/replace** — `resources/scenes/` joins
+  `assets/scenes/` (the mirror already carries it), and synthesizes a
+  placeholder test card (color bars, crosshair, registration marks) for
+  art referenced by `"image"` cues but missing — the same way it does
+  `resources/ui` bitmaps (existing files never overwritten). The binary
+  keeps loading by baked path; no parsing.
+- [done] **Editor: scene image upload/replace** — `resources/scenes/` is in
   the Files upload-target list and shows up as asset-audit rows (the audit
-  lists whatever the generator would placeholder).
-- [todo] **Editor: image cue in the Dialogue line cards** — scene picker
-  from the scan + thumbnail preview, next to the existing cutscene cue
-  fields.
+  lists whatever the generator would placeholder — image-cue references
+  with no file behind them).
+- [done] **Editor: image cue in the Dialogue line cards** — scene picker
+  from the scan + thumbnail preview + a clear option, next to the existing
+  cutscene cue fields, plus a "+ Image scene" insert button. Demo ships a
+  wired pair (`10.json` → `11.json` behind the legend sign in room 01).
 
 In-world gaps (the blocking niceties LttP cutscenes lean on):
 
@@ -248,10 +269,10 @@ In-world gaps (the blocking niceties LttP cutscenes lean on):
 - [done] **Editor forms for the new cues** — face/show/hide/fade fields in
   the cutscene cue card once the vocabulary lands (the actor picker is
   already an index into the room's npc list).
-- [todo] **(optional) Concurrent blocking** — one `CutsceneMove`/
-  `CutsceneCamera` instance each; a `move` line overwrites a running glide.
-  LttP scenes are mostly serialized (beats between moves), so a move queue
-  is QoL, not a blocker.
+- [done] **(optional) Concurrent blocking** — one glide slot per actor (the
+  hero + every npc): simultaneous `move` cues glide their actors together,
+  and a re-cue replaces only that actor's glide, never another's. LttP
+  scenes stay serialized by their beats; the ensemble glides are the QoL.
 
 Smoke path for the whole feature: boot intro from a fresh slot (no re-run on
 continue or after the flag banks), an image scene (image + text + stinger +

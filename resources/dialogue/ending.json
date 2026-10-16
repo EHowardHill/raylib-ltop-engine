@@ -1,0 +1,48 @@
+{
+    "lines": [
+        {
+            "text": "The Hollow King comes apart like smoke in wind...",
+            "letterbox": true,
+            "face": {
+                "actor": "hero",
+                "dir": "up"
+            },
+            "sfx": "boss dies.wav",
+            "wait": 1.2
+        },
+        {
+            "text": "and the Heartstone rolls out of his crown, still humming.",
+            "wait": 2.6
+        },
+        {
+            "camera": {
+                "pan": [
+                    10,
+                    6
+                ],
+                "time": 2.0
+            },
+            "wait": 2.2
+        },
+        {
+            "text": "Enoki lifts it, and the storm forgets why it was angry.",
+            "wait": 2.6
+        },
+        {
+            "fade": {
+                "to": "black",
+                "time": 0.9
+            },
+            "hide": "hero",
+            "wait": 1.1
+        },
+        {
+            "text": "Over Willowdown, the clouds finally part.",
+            "image": "ending.png",
+            "letterbox": true,
+            "sfx": "life refill.wav",
+            "wait": 3.4
+        }
+    ],
+    "next": "credits.json"
+}

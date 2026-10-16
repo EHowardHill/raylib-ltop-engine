@@ -47,6 +47,10 @@ public:
 
     void tileUnder(int& tileX, int& tileY) const;
     Vector2 center() const;
+    // Room-transition glide (main drives the position through nudge()):
+    // tick the walk cycle + footstep cadence so the hero strides in —
+    // update() stays parked while the world is frozen.
+    void advanceWalkCycle(const Room& room, float dt, float movedDist);
 
     // Pit-landing: arm the room+tile a fall-through warps to (room < 0 =
     // the usual safe-tile respawn); main arms it at room load from the
@@ -73,6 +77,10 @@ public:
     // Shield passively blocks projectiles arriving from the faced direction
     // while the hero is free to move (walk/idle).
     bool shielding() const { return state_ == HERO_IDLE || state_ == HERO_WALK; }
+    // The sword button (X / gamepad face-left) only swings while unlocked:
+    // a game whose items carry the sword passive gates it behind owning one
+    // (main recomputes it every frame, like the swim/protect flags).
+    void setSwordEnabled(bool enabled) { swordEnabled_ = enabled; }
     // Active shield (held button): raised while free to move, slowing the
     // walk and blocking a wider arc of projectiles.
     bool guarding() const { return guarding_; }
@@ -189,10 +197,16 @@ private:
     bool slideWithCollision(const Room& room, float dx, float dy);
     void updateFootsteps(const Room& room, float movedDist, const char* overrideSfx = 0);
     void drawFrame(int frame, float scaleX, float scaleY, float yOff = 0.0f) const;
+    // Tool sprite (hammer/shovel/net/shield from effects/tools.png):
+    // drawn rotated around the handle-base pivot at (px, py) so one
+    // frame serves every facing; the shield centers on its cell.
+    void drawTool(int frame, float px, float py, float angle,
+                  bool centered = false) const;
 
     const CharacterConfig* cfg;
     Texture2D sheet;
     Texture2D swordSheet;
+    Texture2D toolSheet;   // effects/tools.png (hammer/shovel/net/shield)
     // Sfx decode lazily through the shared cache (memory-conscious: no
     // per-room re-decode, nothing decodes until first heard).
     LazySound swordSfx;
@@ -288,4 +302,7 @@ private:
     float hookFromY;
     float hookToX;
     float hookToY;
+    // Sword unlock (see setSwordEnabled): false while the game's
+    // sword-carrying item is unowned.
+    bool swordEnabled_;
 };

@@ -1,6 +1,17 @@
 {
-    "title": "A LINK TO THE PAST-STYLE ENGINE DEMO",
-    "slug": "ltop",
+    "title": "ENOKI AND THE HOLLOW KING",
+    "slug": "enoki",
     "font": "fonts/dialogue.otf",
-    "intro": "09.json"
+    "intro": "intro",
+    "logo": {
+        "image": "company_logo.png",
+        "text": "WILLOWDOWN GAMES",
+        "sfx": "sword shine 2.wav",
+        "seconds": 2.4
+    },
+    "title_card": {
+        "image": "title_card.png",
+        "music": "zel1laby.xm",
+        "seconds": 2.4
+    }
 }

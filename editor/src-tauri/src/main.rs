@@ -20,8 +20,20 @@ use tauri::{AppHandle, Manager, State};
 
 const DIRECTIONS: [&str; 4] = ["down", "right", "left", "up"];
 const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+// First-run toolchain builds (raylib for emcc, the KOS docker image) run
+// long; the shipped builds just compile.
+const WEB_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+const DREAMCAST_BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 struct ProjectState(Mutex<Option<PathBuf>>);
+
+// The launched game (Build & Play / Play from here / the enemy sandbox):
+// one tracked child so the editor can quit it, and a new launch replaces
+// the previous session instead of stacking windows.
+static GAME_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+// The web-export static server (build/web over http; browsers refuse
+// file:// wasm). One server at a time; a new export re-hosts.
+static WEB_SERVER: Mutex<Option<std::process::Child>> = Mutex::new(None);
 
 // ---- project root ---------------------------------------------------------
 
@@ -533,6 +545,12 @@ fn scan(state: State<ProjectState>) -> Result<Value, String> {
         "effects": list_files(&res, "effects"),
         "objects": list_files(&res, "objects"),
         "fonts": list_files(&res, "fonts"),
+        // Scene pictures (the dialogue "image" cue): the picker and the
+        // asset audit read this list.
+        "scenes": list_files(&res, "scenes")
+            .into_iter()
+            .filter(|f| f.ends_with(".png"))
+            .collect::<Vec<_>>(),
         "objectTypes": object_types,
         "enemies": enemies,
         "items": items,
@@ -774,6 +792,7 @@ fn upload(state: State<ProjectState>, dir: String, name: String, data: String) -
         ("effects", &[".png"]),
         ("objects", &[".png"]),
         ("fonts", &[".png", ".ttf", ".otf"]),
+        ("scenes", &[".png"]),
     ];
     let root = project_root(&state)?;
     let res = root.join("resources");
@@ -816,26 +835,21 @@ fn read_resource(state: State<ProjectState>, path: String) -> Result<Value, Stri
     }))
 }
 
-fn run_build(engine: PathBuf, root: PathBuf) -> Result<Value, String> {
-    // Build button parity: the script follows the host (Mac: the native
-    // build; everything else: the web build — the non-darwin path — with
-    // emmc's own errors surfacing in the output). Builds run at the
-    // engine root; a project that isn't the engine repo bakes its game
-    // folder through LTOP_GAME.
-    let script = if cfg!(target_os = "macos") {
-        "./build-mac.sh"
-    } else {
-        "./build-web.sh"
-    };
+fn run_script(
+    engine: &Path,
+    root: &Path,
+    script: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
     let mut child = std::process::Command::new("/bin/bash")
         .arg(script)
-        .current_dir(&engine)
-        .envs(build_env(&engine, &root))
+        .current_dir(engine)
+        .envs(build_env(engine, root))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{}: {}", script, e))?;
 
     let output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     spawn_pipe_reader(child.stdout.take(), output.clone());
@@ -846,7 +860,7 @@ fn run_build(engine: PathBuf, root: PathBuf) -> Result<Value, String> {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {
-                if start.elapsed() >= BUILD_TIMEOUT {
+                if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -862,6 +876,20 @@ fn run_build(engine: PathBuf, root: PathBuf) -> Result<Value, String> {
         "code": code,
         "output": output.lock().unwrap().clone(),
     }))
+}
+
+fn run_build(engine: PathBuf, root: PathBuf) -> Result<Value, String> {
+    // Build button parity: the script follows the host (Mac: the native
+    // build; everything else: the web build — the non-darwin path — with
+    // emmc's own errors surfacing in the output). Builds run at the
+    // engine root; a project that isn't the engine repo bakes its game
+    // folder through LTOP_GAME.
+    let script = if cfg!(target_os = "macos") {
+        "./build-mac.sh"
+    } else {
+        "./build-web.sh"
+    };
+    run_script(&engine, &root, script, BUILD_TIMEOUT)
 }
 
 fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>, out: Arc<Mutex<String>>) {
@@ -887,12 +915,214 @@ async fn build(state: State<'_, ProjectState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+// ---- web export & dreamcast (the ship targets) ------------------------------
+
+// An OS-assigned free localhost port (bound then released; the tiny race
+// is fine for a dev server).
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()?
+        .local_addr()
+        .ok()?
+        .port()
+        .into()
+}
+
+fn open_in_browser(url: &str) {
+    #[allow(unused_variables)]
+    let command = if cfg!(target_os = "macos") {
+        Some(("open", vec![url.to_string()]))
+    } else if cfg!(target_os = "linux") {
+        Some(("xdg-open", vec![url.to_string()]))
+    } else if cfg!(target_os = "windows") {
+        Some(("cmd", vec!["/C".to_string(), "start".to_string(), url.to_string()]))
+    } else {
+        None
+    };
+    if let Some((program, args)) = command {
+        let _ = std::process::Command::new(program)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+// Stop the web-export server (one server at a time; a new export re-hosts).
+#[tauri::command]
+fn stop_web() -> Result<Value, String> {
+    if let Ok(mut guard) = WEB_SERVER.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(json!({ "ok": true, "wasRunning": true }));
+        }
+    }
+    Ok(json!({ "ok": true, "wasRunning": false }))
+}
+
+// Web build export: run build-web.sh (the editor is the whole toolchain —
+// shipping shouldn't need a terminal). With `serve`, host build/web/ over
+// http (browsers refuse file:// wasm) and open it in the default browser;
+// a previous server is re-hosted on a fresh port.
+#[tauri::command]
+async fn build_web(
+    state: State<'_, ProjectState>,
+    serve: bool,
+) -> Result<Value, String> {
+    let root = project_root(&state)?;
+    let engine = engine_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_script(&engine, &root, "./build-web.sh", WEB_BUILD_TIMEOUT)?;
+        if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) || !serve {
+            return Ok(result);
+        }
+        let web_dir = engine.join("build").join("web");
+        if !web_dir.join("index.html").is_file() {
+            let mut failed = result;
+            failed["ok"] = json!(false);
+            failed["error"] = json!("build-web.sh reported success but build/web/index.html is missing");
+            return Ok(failed);
+        }
+
+        // Re-host: stop any previous server, then start a fresh one.
+        if let Ok(mut guard) = WEB_SERVER.lock() {
+            if let Some(mut old) = guard.take() {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+        }
+        let port = free_port().ok_or("No free port for the web server")?;
+        let child = std::process::Command::new(root_env_python(&root))
+            .arg("-m").arg("http.server")
+            .arg(port.to_string())
+            .arg("--bind").arg("127.0.0.1")
+            .arg("--directory").arg(&web_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("http.server: {}", e))?;
+        if let Ok(mut guard) = WEB_SERVER.lock() {
+            *guard = Some(child);
+        }
+
+        let url = format!("http://127.0.0.1:{}/", port);
+        open_in_browser(&url);
+        let mut served = result;
+        served["url"] = json!(url);
+        Ok(served)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// Dreamcast disc image (build-dreamcast.sh): cross-compiles inside Docker
+// (a working daemon is the only host requirement — its errors surface in
+// the output). The first run builds the toolchain image, so the timeout
+// is long.
+#[tauri::command]
+async fn build_dreamcast(state: State<'_, ProjectState>) -> Result<Value, String> {
+    let root = project_root(&state)?;
+    let engine = engine_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_script(&engine, &root, "./build-dreamcast.sh", DREAMCAST_BUILD_TIMEOUT)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---- runbook smoke steps -----------------------------------------------------
+
+// Generator run, warnings parsed out: the bake must be warning-free (the
+// audio-budget notices on placeholder loops are known and fine).
+#[tauri::command]
+async fn run_generator(state: State<'_, ProjectState>) -> Result<Value, String> {
+    let root = project_root(&state)?;
+    let engine = engine_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = std::process::Command::new(root_env_python(&root))
+            .arg("scripts/generate_assets.py")
+            .current_dir(&engine)
+            .envs(build_env(&engine, &root))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let warnings: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("warning:"))
+            .map(str::to_string)
+            .collect();
+        Ok(json!({
+            "ok": output.status.success(),
+            "warnings": warnings,
+            "output": format!("{}{}", stdout, stderr),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// Headless boot + save soak: ./main --soak runs fresh game -> save ->
+// reload -> re-save headlessly and exits by itself (exit 0 = every
+// persisted byte round-tripped). WARNING/ERROR lines are surfaced.
+#[tauri::command]
+async fn headless_check(state: State<'_, ProjectState>) -> Result<Value, String> {
+    let root = project_root(&state)?;
+    let engine = engine_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let binary = engine.join("main");
+        if !binary.is_file() {
+            return Ok(json!({
+                "ok": false,
+                "output": "no ./main binary — run a native build first (Mac host)".to_string(),
+            }));
+        }
+        let output = std::process::Command::new(&binary)
+            .arg("--soak")
+            .current_dir(&engine)
+            .envs(build_env(&engine, &root))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let problems: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("WARNING: IMAGE") || l.contains("ERROR"))
+            .collect();
+        Ok(json!({
+            "ok": output.status.success() && problems.is_empty(),
+            "problems": problems,
+            "output": text,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // Test-from-here: build (the game data is baked into the binary, so the
 // build must run for edits to show up), then launch the built binary
 // straight into a room at a tile — a throwaway session with saving
-// suppressed (see the engine's --room/--tile handling).
+// suppressed (see the engine's --room/--tile handling). An optional enemy
+// name spawns that enemy beside the drop tile (the tuning sandbox; the
+// engine's --enemy flag). The launched game is tracked: a new session
+// replaces the old one, and stop_game quits it.
 #[tauri::command]
-async fn play(state: State<'_, ProjectState>, room: String, tile: Option<String>) -> Result<Value, String> {
+async fn play(
+    state: State<'_, ProjectState>,
+    room: String,
+    tile: Option<String>,
+    enemy: Option<String>,
+) -> Result<Value, String> {
     let root = project_root(&state)?;
     let engine = engine_root(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -914,16 +1144,43 @@ async fn play(state: State<'_, ProjectState>, room: String, tile: Option<String>
             if let Some(t) = &tile {
                 command.arg("--tile").arg(t);
             }
+            if let Some(e) = &enemy {
+                if !e.trim().is_empty() {
+                    command.arg("--enemy").arg(e.trim());
+                }
+            }
         }
         command.current_dir(&engine)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        command.spawn().map_err(|e| e.to_string())?;
+        let child = command.spawn().map_err(|e| e.to_string())?;
+
+        // Replace any previous session (restart semantics), then track.
+        if let Ok(mut guard) = GAME_CHILD.lock() {
+            if let Some(mut old) = guard.take() {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+            *guard = Some(child);
+        }
         Ok(json!({ "ok": true }))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// Quit the running dev build (Build & Play / Play from here sessions).
+#[tauri::command]
+fn stop_game() -> Result<Value, String> {
+    if let Ok(mut guard) = GAME_CHILD.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(json!({ "ok": true, "wasRunning": true }));
+        }
+    }
+    Ok(json!({ "ok": true, "wasRunning": false }))
 }
 
 // Compile-error surfacing for game code: a fast syntax-only pass over one
@@ -1083,6 +1340,254 @@ fn delete_save(state: State<'_, ProjectState>, slot: i64) -> Result<Value, Strin
     Ok(json!({ "ok": true }))
 }
 
+// ---- replace-in-place with rename -------------------------------------------
+//
+// Renaming an asset (a GIMP/Tracker export landing under a new name, or a
+// content rename) must never break a bake: the rename updates every JSON
+// reference to the old name — enemy "image" overrides, sfx/music names in
+// rooms and dialogue (and items' use sfx, game.json's font), room
+// tileset/hero/npc/enemy stem references when a paired sheet+json renames
+// together, and dialogue "image" scene cues.
+
+// Recursively replace exact string values (the old file name) in a value.
+fn replace_string_values(value: &mut Value, from: &str, to: &str) -> bool {
+    let mut changed = false;
+    match value {
+        Value::String(s) => {
+            if s == from {
+                *s = to.to_string();
+                changed = true;
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                if replace_string_values(item, from, to) {
+                    changed = true;
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                if replace_string_values(v, from, to) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+// Bare-stem references, patched only inside the containers that carry
+// them (a bare stem matched anywhere else would be a false positive).
+fn patch_stem_refs(data: &mut Value, old: &str, fresh: &str, dir: &str) -> bool {
+    let mut changed = false;
+    if dir == "characters" {
+        if let Some(default) = data.get_mut("default").and_then(Value::as_object_mut) {
+            if default.get("hero").and_then(Value::as_str) == Some(old) {
+                default.insert("hero".into(), json!(fresh));
+                changed = true;
+            }
+        }
+        if let Some(list) = data.get_mut("npcs").and_then(Value::as_array_mut) {
+            for entry in list.iter_mut() {
+                if entry.get("character").and_then(Value::as_str) == Some(old) {
+                    entry["character"] = json!(fresh);
+                    changed = true;
+                }
+            }
+        }
+    } else if dir == "enemies" {
+        if let Some(list) = data.get_mut("enemies").and_then(Value::as_array_mut) {
+            for entry in list.iter_mut() {
+                if entry.get("name").and_then(Value::as_str) == Some(old) {
+                    entry["name"] = json!(fresh);
+                    changed = true;
+                }
+            }
+        }
+    } else if dir == "tiles" {
+        if data.get("tileset").and_then(Value::as_str) == Some(old) {
+            data["tileset"] = json!(fresh);
+            changed = true;
+        }
+    }
+    changed
+}
+
+// game.json's boot cards ("logo" / "title_card") take their image by
+// file name or stem, like the dialogue image cues; patch the stem form
+// right on the fields so renaming a splash never orphans it.
+fn patch_game_card_stems(data: &mut Value, old: &str, fresh: &str) -> bool {
+    let mut changed = false;
+    for card in ["logo", "title_card"] {
+        if let Some(image) = data.get_mut(card)
+            .and_then(Value::as_object_mut)
+            .and_then(|o| o.get_mut("image"))
+        {
+            if image.as_str() == Some(old) {
+                *image = json!(fresh);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// Dialogue "image" cues accept the file name or the stem; the stem form
+// only ever means a scene reference, so patch it right on the field.
+fn patch_dialogue_scene_stems(data: &mut Value, old: &str, fresh: &str) -> bool {
+    let mut changed = false;
+    if let Some(lines) = data.get_mut("lines").and_then(Value::as_array_mut) {
+        for line in lines.iter_mut() {
+            if line.get("image").and_then(Value::as_str) == Some(old) {
+                line["image"] = json!(fresh);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+#[tauri::command]
+fn rename_asset(
+    state: State<ProjectState>,
+    dir: String,
+    from: String,
+    to: String,
+) -> Result<Value, String> {
+    const ASSET_DIRS: &[&str] = &["music", "audio", "ui", "tiles", "characters",
+        "enemies", "pickups", "effects", "objects", "fonts", "scenes"];
+    if !ASSET_DIRS.contains(&dir.as_str()) {
+        return Err("Invalid directory".to_string());
+    }
+    let root = project_root(&state)?;
+    let res = root.join("resources");
+
+    let plain_name = |n: &str| {
+        Path::new(n).file_name().and_then(|f| f.to_str()).map(|f| f == n) == Some(true)
+    };
+    if !plain_name(&from) || !plain_name(&to) {
+        return Err("Names must be plain file names".to_string());
+    }
+
+    let from_path = res.join(&dir).join(&from);
+    let to_path = res.join(&dir).join(&to);
+    if !from_path.is_file() {
+        return Err(format!("{}/{} not found", dir, from));
+    }
+    if to_path.exists() {
+        return Err(format!("{}/{} already exists", dir, to));
+    }
+
+    let ext_of = |n: &str| {
+        Path::new(n)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+    };
+    if ext_of(&from) != ext_of(&to) {
+        return Err("Rename must keep the same file type".to_string());
+    }
+    let stem_of = |n: &str| {
+        Path::new(n)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let old_stem = stem_of(&from);
+    let new_stem = stem_of(&to);
+    if !valid_name(&new_stem) {
+        return Err("Invalid name (letters, numbers, spaces, _ and - only)".to_string());
+    }
+
+    // Paired sheet+json (characters/enemies/tiles): the definition (or
+    // the per-sheet tile metadata) rides along with the sheet, keeping
+    // the canonical same-name pairing intact.
+    let mut renamed_pair = false;
+    if (dir == "characters" || dir == "enemies" || dir == "tiles")
+        && ext_of(&from) == "png"
+    {
+        let json_from = res.join(&dir).join(format!("{}.json", old_stem));
+        let json_to = res.join(&dir).join(format!("{}.json", new_stem));
+        if json_from.is_file() && !json_to.exists() {
+            fs::rename(&json_from, &json_to).map_err(|e| e.to_string())?;
+            renamed_pair = true;
+        }
+    }
+
+    fs::rename(&from_path, &to_path).map_err(|e| e.to_string())?;
+
+    // Reference updates, across the families that can point at the asset.
+    let mut updated: Vec<String> = Vec::new();
+
+    for file in list_files(&res, "rooms")
+        .into_iter()
+        .filter(|f| f.ends_with(".json"))
+    {
+        let path = res.join("rooms").join(&file);
+        let mut data = read_json(&path)?;
+        let mut changed = replace_string_values(&mut data, &from, &to);
+        changed |= patch_stem_refs(&mut data, &old_stem, &new_stem, &dir);
+        if changed {
+            fs::write(&path, pretty4(&data)).map_err(|e| e.to_string())?;
+            updated.push(format!("rooms/{}", file));
+        }
+    }
+
+    for file in list_files(&res, "dialogue")
+        .into_iter()
+        .filter(|f| f.ends_with(".json"))
+    {
+        let path = res.join("dialogue").join(&file);
+        let mut data = read_json(&path)?;
+        let mut changed = replace_string_values(&mut data, &from, &to);
+        if dir == "scenes" {
+            changed |= patch_dialogue_scene_stems(&mut data, &old_stem, &new_stem);
+        }
+        if changed {
+            fs::write(&path, pretty4(&data)).map_err(|e| e.to_string())?;
+            updated.push(format!("dialogue/{}", file));
+        }
+    }
+
+    for (sub, name) in [("items", None::<String>), ("enemies", None), ("objects", Some("types.json".to_string())), ("", Some("game.json".to_string()))] {
+        // items/enemies: every json in the folder; objects/game: the one file.
+        let files: Vec<String> = match &name {
+            Some(single) => {
+                let path = if sub.is_empty() { res.join(single) } else { res.join(sub).join(single) };
+                if path.is_file() {
+                    vec![single.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            None => list_files(&res, sub)
+                .into_iter()
+                .filter(|f| f.ends_with(".json"))
+                .collect(),
+        };
+        for file in files {
+            let path = if sub.is_empty() { res.join(&file) } else { res.join(sub).join(&file) };
+            let Ok(mut data) = read_json(&path) else { continue };
+            let mut changed = replace_string_values(&mut data, &from, &to);
+            if sub.is_empty() && dir == "scenes" {
+                // game.json's boot cards, stem form (the file-name form
+                // is covered by the exact match above).
+                changed |= patch_game_card_stems(&mut data, &old_stem, &new_stem);
+            }
+            if changed {
+                fs::write(&path, pretty4(&data)).map_err(|e| e.to_string())?;
+                updated.push(if sub.is_empty() { file.clone() } else { format!("{}/{}", sub, file) });
+            }
+        }
+    }
+
+    Ok(json!({ "ok": true, "updated": updated, "renamedPair": renamed_pair }))
+}
+
 // ---- boot -----------------------------------------------------------------
 
 fn main() {
@@ -1120,14 +1625,21 @@ fn main() {
             delete,
             upload,
             build,
+            build_web,
+            stop_web,
+            build_dreamcast,
             play,
+            stop_game,
             read_resource,
             set_project,
             new_game,
             save_slots,
             delete_save,
             list_flags,
-            check_code
+            check_code,
+            run_generator,
+            headless_check,
+            rename_asset
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

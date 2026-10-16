@@ -1,89 +1,24 @@
 {
     "tiles": {
-        "43": {
-            "pit": true
-        },
-        "44": {
-            "damage": 1
-        },
-        "45": {
-            "cuttable": true,
-            "cut_result": 46
-        },
-        "46": {
-            "dig": true
-        },
-        "59": {
-            "water": "deep",
-            "anim": [
-                59,
-                73,
-                74
-            ]
-        },
-        "60": {
-            "water": "shallow",
-            "heal": true,
-            "anim": [
-                60,
-                75,
-                76
-            ]
-        },
-        "61": {
-            "ice": true
-        },
-        "62": {
-            "push": [
-                48,
-                0
-            ]
-        },
-        "63": {
-            "push": [
-                -48,
-                0
-            ]
-        },
-        "64": {
-            "push": [
-                0,
-                48
-            ]
-        },
-        "65": {
-            "push": [
-                0,
-                -48
-            ]
-        },
-        "66": {
-            "water": "shallow",
-            "push": [
-                0,
-                32
-            ],
-            "anim": [
-                66,
-                77,
-                78
-            ]
-        },
-        "67": {
-            "ledge": "down"
-        },
-        "68": {
-            "ledge": "up"
-        },
-        "69": {
-            "ledge": "left"
-        },
-        "70": {
-            "ledge": "right"
-        },
-        "72": {
-            "bombable": true,
-            "bomb_result": 0
-        }
+        "5": {"cuttable": true, "cut_result": 1},
+        "10": {"water": "deep", "anim": [10, 11, 12]},
+        "13": {"water": "shallow", "anim": [13, 14, 15]},
+        "16": {"water": "shallow", "heal": true, "anim": [16, 17, 18]},
+        "19": {"ice": true},
+        "20": {"pit": true},
+        "21": {"damage": 1},
+        "22": {"dig": true},
+        "24": {"water": "shallow", "push": [48, 0]},
+        "25": {"water": "shallow", "push": [-48, 0]},
+        "26": {"water": "shallow", "push": [0, 48]},
+        "27": {"water": "shallow", "push": [0, -48]},
+        "28": {"ledge": "down"},
+        "29": {"ledge": "up"},
+        "30": {"ledge": "left"},
+        "31": {"ledge": "right"},
+        "32": {"bombable": true, "bomb_result": 0},
+        "50": {"bombable": true, "bomb_result": 0},
+        "51": {"pit": true},
+        "52": {"damage": 1}
     }
 }

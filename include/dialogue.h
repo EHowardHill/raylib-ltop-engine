@@ -27,6 +27,11 @@ public:
 
     bool isActive() const { return current != 0; }
 
+    // The game draws the scene picture (the "image" cue); this tells the
+    // box a full-bleed backdrop is already up, so the credits roll skips
+    // its own black (the picture is the backdrop — the storybook roll).
+    void setSceneBackdrop(bool up) { sceneBackdrop = up; }
+
     // Scripting drains (the game polls these once per frame after update).
     // Returns true/pointer once per queued request.
     const char* takeMusicRequest();   // 0 = none; "" = stop the bgm
@@ -42,6 +47,8 @@ public:
     bool takeHideRequest(int& actor);
     bool takeFadeRequest(int& to, float& seconds);
     bool takeNextRequest(int& dialogue);
+    // Image scene cue: -2 = clear the picture, else a SCENES index.
+    bool takeImageRequest(int& scene);
 
 private:
     struct Row
@@ -74,6 +81,8 @@ private:
     float reveal;
     Row rows[8];
     int rowCount;
+    int rowOffset;  // first wrapped row of the visible page (long lines
+                    // paginate: three rows draw, action turns the page)
 
     bool choiceActive;
     int choiceCursor;
@@ -110,6 +119,9 @@ private:
     bool fadePending;
     int fadeTo;
     float fadeSeconds;
+    bool imagePending;
+    int imageScene;
+    bool sceneBackdrop;  // set per-frame by the game (see setSceneBackdrop)
     int nextDialogue;
     bool nextPending;
     float waitTimer;  // auto-advance beat: counts past the full reveal

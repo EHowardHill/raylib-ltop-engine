@@ -1,0 +1,47 @@
+{
+    "lines": [
+        {
+            "text": "Ahh... the dust of green dreams. Long years, little forager.",
+            "sfx": "prayer 1.wav",
+            "face": {
+                "actor": "hero",
+                "dir": "up"
+            }
+        },
+        {
+            "move": {
+                "actor": 0,
+                "tile": [
+                    12,
+                    5
+                ],
+                "time": 1.4
+            },
+            "wait": 1.6
+        },
+        {
+            "text": "You walk toward the Hollow King. You will need to walk where the sun is thinner.",
+            "face": {
+                "actor": 0,
+                "dir": "down"
+            }
+        },
+        {
+            "text": "Take my glass. It steps between the world and its shadow.",
+            "sfx": "secret.wav",
+            "give": "mirror"
+        },
+        {
+            "text": "Use it in the grove: the Hollow mirrors this place. What is lost here sleeps there."
+        },
+        {
+            "text": "The Hollow is thick with his soldiers. The cape and the gloves you need are there.",
+            "if": "mirror",
+            "unless": "game_complete"
+        },
+        {
+            "text": "The grove sings again! Go home, child. The rain has.",
+            "if": "game_complete"
+        }
+    ]
+}

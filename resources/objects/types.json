@@ -74,6 +74,13 @@
             ]
         },
         {
+            "name": "door_warp",
+            "interactions": [
+                "floor",
+                "warp"
+            ]
+        },
+        {
             "name": "stair",
             "interactions": [
                 "floor",
